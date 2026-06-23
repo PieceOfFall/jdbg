@@ -88,16 +88,19 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
             Response::ok(id, CommandResponse { result, stderr: None, note: None })
         }
         Command::Kill => {
-            let session_id = req.session.as_deref();
-            match session_id {
-                Some(sid) => match mgr.kill(sid) {
-                    Ok(()) => Response::ok(id, CommandResponse {
-                        result: CommandResult::Raw { text: format!("session {sid} killed") },
-                        stderr: None, note: None,
-                    }),
-                    Err(e) => Response::err(id, e.exit_code(), e.to_string()),
-                },
-                None => Response::err(id, 400, "specify --session for kill"),
+            // 解析目标会话（None = 唯一存活会话），与其它命令的 --session 默认行为一致。
+            match mgr.get(req.session.as_deref()) {
+                Ok(session) => {
+                    let sid = session.meta.id.clone();
+                    match mgr.kill(&sid) {
+                        Ok(()) => Response::ok(id, CommandResponse {
+                            result: CommandResult::Raw { text: format!("session {sid} killed") },
+                            stderr: None, note: None,
+                        }),
+                        Err(e) => Response::err(id, e.exit_code(), e.to_string()),
+                    }
+                }
+                Err(e) => Response::err(id, e.exit_code(), e.to_string()),
             }
         }
         Command::Status => {
