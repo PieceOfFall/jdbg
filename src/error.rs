@@ -28,6 +28,10 @@ pub enum Error {
     #[error("jdb session is not alive: {0}")]
     SessionDead(String),
 
+    /// 找不到指定（或默认）会话。
+    #[error("session not found: {0}")]
+    SessionNotFound(String),
+
     /// jdb 报告连接 / 启动错误（§5：`Unable to attach`、`java.io.IOException`、`Input stream closed`）。
     #[error("jdb connection/launch failed: {0}")]
     Connection(String),
@@ -48,6 +52,7 @@ impl Error {
             Error::JdbNotFound { .. } => 3,
             Error::Spawn { .. } => 4,
             Error::SessionDead(_) => 5,
+            Error::SessionNotFound(_) => 5,
             Error::Connection(_) => 6,
             Error::Timeout { .. } => 7,
             Error::Io(_) => 1,

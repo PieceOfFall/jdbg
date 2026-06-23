@@ -116,7 +116,7 @@ impl Session {
             mode: SessionMode::Launch,
             target: config.main_class.clone(),
             jdb_pid,
-            created_at: None,
+            created_at: Some(jiff::Zoned::now().to_string()),
         };
         Ok(Session {
             meta,
