@@ -1,22 +1,20 @@
-//! `jdbg` 入口。
-//!
-//! 两种运行模式：
-//! - `jdbg __daemon`：作为后台 daemon 运行（隐藏子命令，CLI 自动拉起）。
-//! - `jdbg <subcommand> …`：CLI client——构造 Request 发给 daemon，打印 Response。
-//!
-//! 本阶段（roadmap 4）用最简手动 arg 解析验证 IPC 链路；
-//! 完整 clap 命令面 + 文本/JSON 渲染留到 roadmap 6（cli.rs + output.rs）。
+//! `jdbg` 入口——用 clap 解析命令行，分发到 daemon 模式或 client 模式。
 
 use std::process::ExitCode;
 
+use clap::Parser;
+
+use java_agent_debugger::cli::{Cli, Commands, DaemonAction};
+use java_agent_debugger::client;
 use java_agent_debugger::daemon;
-use java_agent_debugger::protocol::{Command, Request, Response};
+use java_agent_debugger::output;
+use java_agent_debugger::protocol::*;
 
 fn main() -> ExitCode {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let cli = Cli::parse();
 
     // 隐藏的 daemon 模式。
-    if args.first().map(String::as_str) == Some("__daemon") {
+    if matches!(cli.command, Commands::Daemon_) {
         if let Err(e) = daemon::run_daemon() {
             eprintln!("daemon error: {e}");
             return ExitCode::from(1);
@@ -24,130 +22,105 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    run_client(&args).unwrap_or_else(|e| {
-        eprintln!("error: {e}");
-        ExitCode::from(1)
-    })
+    match run_client(cli) {
+        Ok(code) => code,
+        Err(e) => {
+            eprintln!("error: {e}");
+            ExitCode::from(1)
+        }
+    }
 }
 
-/// CLI client 流程：解析 args → Command → 发送 → 打印。
-fn run_client(args: &[String]) -> anyhow::Result<ExitCode> {
-    let Some(sub) = args.first() else {
-        print_usage();
-        return Ok(ExitCode::from(2));
-    };
-
-    // 解析全局 --session / --json（极简版）。
-    let mut session: Option<String> = None;
-    let mut json = false;
-    let mut positional: Vec<String> = Vec::new();
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--session" => {
-                i += 1;
-                session = args.get(i).cloned();
-            }
-            "--json" => json = true,
-            "--classpath" | "--sourcepath" => {
-                // 收集为 positional 形式 key=value，供 Launch 解析。
-                let key = args[i].clone();
-                i += 1;
-                if let Some(v) = args.get(i) {
-                    positional.push(format!("{key}={v}"));
+fn run_client(cli: Cli) -> anyhow::Result<ExitCode> {
+    // Daemon control shortcuts (不需要 session，先于 build_command 处理)。
+    if let Commands::Daemon { action } = &cli.command {
+        return match action {
+            DaemonAction::Stop => { daemon::stop_daemon()?; Ok(ExitCode::SUCCESS) }
+            DaemonAction::Start => { daemon::spawn_daemon_detached()?; println!("Daemon started."); Ok(ExitCode::SUCCESS) }
+            DaemonAction::Status => {
+                let req = Request::new(Command::DaemonStatus, None);
+                let resp = client::send_request(&req)?;
+                if let Some(result) = resp.result.as_ref() {
+                    println!("{}", output::render(result, cli.json));
                 }
+                Ok(ExitCode::SUCCESS)
             }
-            other => positional.push(other.to_string()),
-        }
-        i += 1;
+        };
     }
 
-    let cmd = build_command(sub, &positional)?;
+    let cmd = build_command(&cli)?;
+    let req = Request::new(cmd, cli.session.clone());
+    let resp = client::send_request(&req)?;
 
-    // daemon 控制命令特殊处理（stop 不需要 session）。
-    let req = Request::new(cmd, session);
-    let resp = java_agent_debugger::client::send_request(&req)?;
-    print_response(&resp, json);
-
-    Ok(if resp.ok { ExitCode::SUCCESS } else { ExitCode::from(1) })
-}
-
-/// 把子命令 + 参数构造成 Command（极简映射，覆盖验证所需）。
-fn build_command(sub: &str, pos: &[String]) -> anyhow::Result<Command> {
-    let get_opt = |key: &str| -> Option<String> {
-        pos.iter()
-            .find_map(|s| s.strip_prefix(&format!("{key}=")).map(|v| v.to_string()))
-    };
-    let bare: Vec<&String> = pos.iter().filter(|s| !s.contains('=')).collect();
-
-    let cmd = match sub {
-        "launch" => {
-            let main_class = bare.first().map(|s| s.to_string())
-                .ok_or_else(|| anyhow::anyhow!("launch needs <MainClass>"))?;
-            Command::Launch {
-                main_class,
-                classpath: get_opt("--classpath").into_iter().collect(),
-                sourcepath: get_opt("--sourcepath").into_iter().collect(),
-                app_args: vec![],
-                jdb_args: vec![],
-                name: None,
-                jdb_path: None,
-            }
-        }
-        "status" => Command::Status,
-        "list" => Command::List,
-        "kill" => Command::Kill,
-        "break-at" => Command::BreakAt {
-            class: bare.first().map(|s| s.to_string()).ok_or_else(|| anyhow::anyhow!("break-at <Class> <line>"))?,
-            line: bare.get(1).and_then(|s| s.parse().ok()).ok_or_else(|| anyhow::anyhow!("break-at needs <line>"))?,
-        },
-        "break-in" => Command::BreakIn {
-            class: bare.first().map(|s| s.to_string()).ok_or_else(|| anyhow::anyhow!("break-in <Class> <method>"))?,
-            method: bare.get(1).map(|s| s.to_string()).ok_or_else(|| anyhow::anyhow!("break-in needs <method>"))?,
-            args: None,
-        },
-        "run" => Command::Run,
-        "cont" => Command::Cont,
-        "step" => Command::Step,
-        "next" => Command::Next,
-        "step-out" => Command::StepOut,
-        "where" => Command::Where { all: false },
-        "locals" => Command::Locals,
-        "print" => Command::Print { expr: bare.first().map(|s| s.to_string()).ok_or_else(|| anyhow::anyhow!("print <expr>"))? },
-        "threads" => Command::Threads,
-        "list-source" => Command::ListSource { line: bare.first().and_then(|s| s.parse().ok()) },
-        "raw" => Command::Raw { command: bare.iter().map(|s| s.as_str()).collect::<Vec<_>>().join(" ") },
-        "daemon-status" => Command::DaemonStatus,
-        "daemon-stop" => Command::DaemonStop,
-        other => anyhow::bail!("unknown subcommand: {other}"),
-    };
-    Ok(cmd)
-}
-
-/// 打印响应（本阶段直接 JSON；roadmap 6 接 output.rs 做文本渲染）。
-fn print_response(resp: &Response, _json: bool) {
     if resp.ok {
         if let Some(result) = &resp.result {
-            println!("{}", serde_json::to_string_pretty(result).unwrap());
-        } else {
-            println!("ok");
+            if cli.json {
+                println!("{}", serde_json::to_string_pretty(result).unwrap());
+            } else {
+                println!("{}", output::render(result, false));
+            }
         }
-    } else if let Some(e) = &resp.error {
-        eprintln!("[{}] {}", e.code, e.message);
+        Ok(ExitCode::SUCCESS)
+    } else {
+        if let Some(e) = &resp.error {
+            eprintln!("[{}] {}", e.code, e.message);
+        }
+        Ok(ExitCode::from(1))
     }
 }
 
-fn print_usage() {
-    eprintln!(
-        "jdbg — Java debugger CLI\n\n\
-         USAGE:\n  \
-         jdbg launch <MainClass> [--classpath CP] [--sourcepath SP]\n  \
-         jdbg break-at <Class> <line> | break-in <Class> <method>\n  \
-         jdbg run | cont | step | next | step-out\n  \
-         jdbg where | locals | print <expr> | threads | list-source [line]\n  \
-         jdbg status | list | kill [--session ID]\n  \
-         jdbg raw <jdb command...>\n  \
-         jdbg daemon-status | daemon-stop\n\n\
-         GLOBAL: --session <id>  --json"
-    );
+/// 把 clap Commands 转换为 protocol Command。
+fn build_command(cli: &Cli) -> anyhow::Result<Command> {
+    let cmd = match &cli.command {
+        Commands::Launch { main_class, classpath, sourcepath, app_args, jdb_args, name } => {
+            Command::Launch {
+                main_class: main_class.clone(),
+                classpath: classpath.as_deref().map(|s| vec![s.to_string()]).unwrap_or_default(),
+                sourcepath: sourcepath.as_deref().map(|s| vec![s.to_string()]).unwrap_or_default(),
+                app_args: app_args.clone(),
+                jdb_args: jdb_args.clone(),
+                name: name.clone(),
+                jdb_path: cli.jdb_path.clone(),
+            }
+        }
+        Commands::Attach { host, port, sourcepath, name } => {
+            Command::Attach {
+                host: host.clone(),
+                port: *port,
+                sourcepath: sourcepath.as_deref().map(|s| vec![s.to_string()]).unwrap_or_default(),
+                name: name.clone(),
+                jdb_path: cli.jdb_path.clone(),
+            }
+        }
+        Commands::Status => Command::Status,
+        Commands::List => Command::List,
+        Commands::Kill => Command::Kill,
+        Commands::BreakAt { class, line } => Command::BreakAt { class: class.clone(), line: *line },
+        Commands::BreakIn { class, method, args } => {
+            Command::BreakIn { class: class.clone(), method: method.clone(), args: args.clone() }
+        }
+        Commands::Catch { exception, mode } => {
+            Command::Catch { exception: exception.clone(), mode: mode.clone() }
+        }
+        Commands::Breakpoints => Command::Breakpoints,
+        Commands::Clear { spec } => Command::Clear { spec: spec.clone() },
+        Commands::Run => Command::Run,
+        Commands::Cont => Command::Cont,
+        Commands::Step => Command::Step,
+        Commands::Next => Command::Next,
+        Commands::StepOut => Command::StepOut,
+        Commands::Where { all } => Command::Where { all: *all },
+        Commands::Locals => Command::Locals,
+        Commands::Print { expr } => Command::Print { expr: expr.clone() },
+        Commands::Dump { expr } => Command::Dump { expr: expr.clone() },
+        Commands::Eval { expr } => Command::Eval { expr: expr.clone() },
+        Commands::Threads => Command::Threads,
+        Commands::Thread { id } => Command::Thread { id: id.clone() },
+        Commands::Frame { direction, n } => Command::Frame { direction: direction.clone(), n: *n },
+        Commands::ListSource { line } => Command::ListSource { line: *line },
+        Commands::Raw { command } => Command::Raw { command: command.join(" ") },
+        Commands::Daemon { .. } => unreachable!("handled above"),
+        Commands::Daemon_ => unreachable!("handled above"),
+    };
+    Ok(cmd)
 }

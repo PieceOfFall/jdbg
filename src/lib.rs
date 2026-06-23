@@ -13,11 +13,13 @@
 //! - [`client`]：CLI 端连接 daemon 的 RPC 客户端。
 //! - bin (`src/main.rs`)：CLI / daemon 入口，仅依赖本库的公共 API。
 
+pub mod cli;
 pub mod client;
 pub mod daemon;
 pub mod error;
 pub mod jdb;
 pub mod jdkpath;
+pub mod output;
 pub mod protocol;
 pub mod registry;
 pub mod session;
