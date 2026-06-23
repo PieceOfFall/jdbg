@@ -1,1 +1,7 @@
 /target
+
+# Java 编译产物（fixtures/Main.java 是源，.class 由 javac -g 生成，不入库）
+*.class
+
+# IDE
+.idea/

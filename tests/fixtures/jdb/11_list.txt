@@ -1,0 +1,7 @@
+5            int sum = 0;
+6            for (int i = 0; i < count; i++) {
+7                sum += i;
+8            }
+9 =>         System.out.println(label + " sum=" + sum);
+10        }
+11    }

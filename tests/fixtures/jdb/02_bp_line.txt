@@ -1,0 +1,2 @@
+Deferring breakpoint Main:9.
+It will be set after the class is loaded.

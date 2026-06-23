@@ -3,4 +3,17 @@ name = "java-agent-debugger"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "java_agent_debugger"
+path = "src/lib.rs"
+
+[[bin]]
+name = "jdbg"
+path = "src/main.rs"
+
 [dependencies]
+anyhow = "1"
+regex = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"

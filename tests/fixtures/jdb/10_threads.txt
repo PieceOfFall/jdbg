@@ -1,0 +1,7 @@
+Group system:
+  (java.lang.ref.Reference$ReferenceHandler)0x181 Reference Handler cond. waiting
+  (java.lang.ref.Finalizer$FinalizerThread)0x180  Finalizer         cond. waiting
+  (java.lang.Thread)0x17f                         Signal Dispatcher running
+  (java.lang.Thread)0x17e                         Attach Listener   running
+Group main:
+  (java.lang.Thread)0x1                           main              running (at breakpoint)

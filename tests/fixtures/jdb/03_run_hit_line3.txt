@@ -1,0 +1,9 @@
+run Main
+Set uncaught java.lang.Throwable
+Set deferred uncaught java.lang.Throwable
+> 
+VM Started: Set deferred breakpoint Main:9
+Set deferred breakpoint Main.main
+
+Breakpoint hit: "thread=main", Main.main(), line=3 bci=0
+3            int count = 3;

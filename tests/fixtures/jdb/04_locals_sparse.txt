@@ -1,0 +1,3 @@
+Method arguments:
+args = instance of java.lang.String[0] (id=430)
+Local variables:
