@@ -233,9 +233,11 @@ impl PromptReader {
         // thread-prompt 总是代表停下；裸 prompt 只有 Normal 模式才算完成。
         let done = is_thread_prompt || (is_bare_prompt && mode == ReadMode::Normal);
         if done {
+            // thread-prompt（如 `main[1] `）携带当前线程名，供无 thread= 的事件 banner（异常）回填。
+            let prompt_thread = is_thread_prompt.then(|| thread_from_prompt(last_line)).flatten();
             let cut = self.text.len() - last_line.len();
             let output = self.text[..cut].trim_end_matches('\n').to_string();
-            let event = detect_event(&output);
+            let event = detect_event(&output, prompt_thread.as_deref());
             let _ = self.take_text();
             return Some(ReadOutcome::Prompt { output, event });
         }
@@ -246,7 +248,8 @@ impl PromptReader {
 }
 
 /// 在 `output` 文本里检测事件 banner。
-fn detect_event(output: &str) -> Option<DetectedEvent> {
+/// `prompt_thread`：尾部 thread-prompt 推断出的线程名（异常 banner 不含 thread= 时回填）。
+fn detect_event(output: &str, prompt_thread: Option<&str>) -> Option<DetectedEvent> {
     if let Some(c) = RE_BREAKPOINT_OR_STEP.captures(output) {
         let thread = c["thread"].to_string();
         let class = c["class"].to_string();
@@ -260,15 +263,22 @@ fn detect_event(output: &str) -> Option<DetectedEvent> {
         });
     }
     if let Some(c) = RE_EXCEPTION.captures(output) {
-        // Exception banner 格式不含 thread=，但通常紧跟在 thread-prompt 后。
-        // 这里用空字符串做占位，session 层可从当前 thread-prompt 推断。
+        // Exception banner 不含 thread=；从尾部 thread-prompt 推断当前线程（否则留空）。
         return Some(DetectedEvent::Exception {
-            thread: String::new(),
+            thread: prompt_thread.unwrap_or("").to_string(),
             exception: c["exc"].to_string(),
             caught: &c["caught"] == "caught",
         });
     }
     None
+}
+
+/// 从 thread-prompt 行（如 `main[1] `）提取线程名（`[` 之前的部分）。
+fn thread_from_prompt(line: &str) -> Option<String> {
+    if !RE_THREAD_PROMPT.is_match(line) {
+        return None;
+    }
+    line.split('[').next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
 }
 
 /// 取出 `text` 中包含字节偏移 `pos` 的那一整行。

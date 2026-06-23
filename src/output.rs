@@ -92,6 +92,25 @@ fn render_result(result: &CommandResult) -> String {
                 }
             }).collect::<Vec<_>>().join("\n")
         }
+        CommandResult::ThreadStackTrace { threads } => {
+            let mut lines = Vec::new();
+            for ts in threads {
+                lines.push(format!("{}:", ts.thread));
+                if ts.frames.is_empty() {
+                    lines.push("  (no frames)".into());
+                }
+                for f in &ts.frames {
+                    let loc = &f.location;
+                    let file = loc.file.as_deref().unwrap_or("?");
+                    if f.is_native {
+                        lines.push(format!("  [{}] {}.{} (native)", f.index, loc.class, loc.method));
+                    } else {
+                        lines.push(format!("  [{}] {}.{} ({file}:{})", f.index, loc.class, loc.method, loc.line));
+                    }
+                }
+            }
+            lines.join("\n")
+        }
         CommandResult::Locals { vars } => {
             if vars.is_empty() {
                 return "No local variables.".into();

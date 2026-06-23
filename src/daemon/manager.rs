@@ -8,7 +8,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::error::{Error, Result};
-use crate::jdb::process::LaunchConfig;
+use crate::jdb::process::{AttachConfig, LaunchConfig};
 use crate::jdkpath;
 use crate::protocol::{CommandResult, RunState, SessionInfo};
 use crate::registry::{Registry, SessionRecord};
@@ -36,6 +36,15 @@ pub struct LaunchParams {
     pub sourcepath: Vec<String>,
     pub app_args: Vec<String>,
     pub jdb_args: Vec<String>,
+    pub name: Option<String>,
+    pub jdb_path: Option<String>,
+}
+
+/// `create_attach` 的参数包。
+pub struct AttachParams {
+    pub host: String,
+    pub port: u16,
+    pub sourcepath: Vec<String>,
     pub name: Option<String>,
     pub jdb_path: Option<String>,
 }
@@ -68,6 +77,34 @@ impl SessionManager {
 
         let id = gen_session_id();
         let session = Session::launch(&jdb_path, &config, id.clone(), params.name)?;
+        let session = Arc::new(session);
+
+        let mut map = self.sessions.lock().expect("sessions mutex poisoned");
+        map.insert(id, Arc::clone(&session));
+        drop(map);
+
+        self.persist_sessions();
+        Ok(session)
+    }
+
+    /// 创建 attach 会话（连接已运行 JVM 的 JDWP 端口）。
+    pub fn create_attach(&self, params: AttachParams) -> Result<Arc<Session>> {
+        let jdb_path = match params.jdb_path {
+            Some(ref p) => {
+                let path = PathBuf::from(p);
+                jdkpath::find_jdb(Some(&path))?
+            }
+            None => jdkpath::find_jdb(None)?,
+        };
+
+        let config = AttachConfig {
+            host: params.host,
+            port: params.port,
+            sourcepath: params.sourcepath.into_iter().map(PathBuf::from).collect(),
+        };
+
+        let id = gen_session_id();
+        let session = Session::attach(&jdb_path, &config, id.clone(), params.name)?;
         let session = Arc::new(session);
 
         let mut map = self.sessions.lock().expect("sessions mutex poisoned");

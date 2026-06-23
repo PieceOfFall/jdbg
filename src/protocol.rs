@@ -25,6 +25,13 @@ pub struct StackFrame {
     pub is_native: bool,
 }
 
+/// 单个线程的调用栈（`where all` 按线程分组）。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ThreadStack {
+    pub thread: String,
+    pub frames: Vec<StackFrame>,
+}
+
 /// 局部变量 / 对象字段绑定。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VarBinding {
@@ -143,6 +150,10 @@ pub enum CommandResult {
     StackTrace {
         frames: Vec<StackFrame>,
     },
+    /// `where all` 的多线程栈，按线程分组。
+    ThreadStackTrace {
+        threads: Vec<ThreadStack>,
+    },
     Locals {
         vars: Vec<VarBinding>,
     },
@@ -227,6 +238,9 @@ pub struct Request {
     /// 目标会话 id（None = 默认唯一会话）。
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
+    /// 本命令超时（秒），覆盖默认值；None 用默认。对应 CLI 的 `--timeout`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
     /// 具体命令。
     pub cmd: Command,
 }
@@ -342,7 +356,13 @@ impl Request {
             .take(8)
             .map(char::from)
             .collect();
-        Self { v: 1, id, session, cmd }
+        Self { v: 1, id, session, timeout: None, cmd }
+    }
+
+    /// 设置超时（秒）。
+    pub fn with_timeout(mut self, timeout: Option<u64>) -> Self {
+        self.timeout = timeout;
+        self
     }
 }
 

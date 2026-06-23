@@ -63,6 +63,26 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
                 Err(e) => Response::err(id, e.exit_code(), e.to_string()),
             }
         }
+        Command::Attach { host, port, sourcepath, name, jdb_path } => {
+            match mgr.create_attach(super::manager::AttachParams {
+                host: host.clone(),
+                port: *port,
+                sourcepath: sourcepath.clone(),
+                name: name.clone(),
+                jdb_path: jdb_path.clone(),
+            }) {
+                Ok(session) => {
+                    let result = CommandResult::SessionCreated {
+                        session: session.meta.id.clone(),
+                        mode: session.meta.mode,
+                        target: session.meta.target.clone(),
+                        state: session.state(),
+                    };
+                    Response::ok(id, CommandResponse { result, stderr: None, note: None })
+                }
+                Err(e) => Response::err(id, e.exit_code(), e.to_string()),
+            }
+        }
         Command::List => {
             let result = mgr.list();
             Response::ok(id, CommandResponse { result, stderr: None, note: None })
@@ -122,11 +142,14 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
         Err(e) => return Response::err(id, e.exit_code(), e.to_string()),
     };
 
+    // 本请求的超时覆盖（CLI `--timeout`），None = 用各命令默认值。
+    let t = req.timeout;
+
     let result = match &req.cmd {
         // Breakpoints
-        Command::BreakAt { class, line } => session.stop_at(class, *line),
+        Command::BreakAt { class, line } => session.stop_at(class, *line, t),
         Command::BreakIn { class, method, args } => {
-            session.stop_in(class, method, args.as_deref())
+            session.stop_in(class, method, args.as_deref(), t)
         }
         Command::Catch { exception, mode } => {
             let cmd = match mode.as_str() {
@@ -134,52 +157,51 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
                 "uncaught" => format!("catch uncaught {exception}"),
                 _ => format!("catch {exception}"),
             };
-            session.execute(&cmd, CommandKind::normal(CommandHint::BreakpointSet))
+            session.execute(&cmd, CommandKind::normal(CommandHint::BreakpointSet).with_timeout_secs(t))
         }
         Command::Breakpoints => {
-            session.execute("clear", CommandKind::normal(CommandHint::Breakpoints))
+            session.execute("clear", CommandKind::normal(CommandHint::Breakpoints).with_timeout_secs(t))
         }
         Command::Clear { spec } => {
-            session.execute(&format!("clear {spec}"), CommandKind::normal(CommandHint::Other))
+            session.execute(&format!("clear {spec}"), CommandKind::normal(CommandHint::Other).with_timeout_secs(t))
         }
 
         // Execution control
-        Command::Run => session.run(),
-        Command::Cont => session.cont(),
-        Command::Step => session.step(),
-        Command::Next => session.next(),
-        Command::StepOut => session.step_out(),
+        Command::Run => session.run(t),
+        Command::Cont => session.cont(t),
+        Command::Step => session.step(t),
+        Command::Next => session.next(t),
+        Command::StepOut => session.step_out(t),
 
         // Inspection
         Command::Where { all } => {
-            let cmd = if *all { "where all" } else { "where" };
-            session.execute(cmd, CommandKind::normal(CommandHint::Where))
+            let (cmd, hint) = if *all {
+                ("where all", CommandHint::WhereAll)
+            } else {
+                ("where", CommandHint::Where)
+            };
+            session.execute(cmd, CommandKind::normal(hint).with_timeout_secs(t))
         }
-        Command::Locals => session.locals(),
-        Command::Print { expr } => session.print(expr),
+        Command::Locals => session.locals(t),
+        Command::Print { expr } => session.print(expr, t),
         Command::Dump { expr } => {
-            session.execute(&format!("dump {expr}"), CommandKind::normal(CommandHint::Dump))
+            session.execute(&format!("dump {expr}"), CommandKind::normal(CommandHint::Dump).with_timeout_secs(t))
         }
         Command::Eval { expr } => {
-            session.execute(&format!("eval {expr}"), CommandKind::normal(CommandHint::Eval))
+            session.execute(&format!("eval {expr}"), CommandKind::normal(CommandHint::Eval).with_timeout_secs(t))
         }
-        Command::Threads => session.threads(),
+        Command::Threads => session.threads(t),
         Command::Thread { id: tid } => {
-            session.execute(&format!("thread {tid}"), CommandKind::normal(CommandHint::Other))
+            session.execute(&format!("thread {tid}"), CommandKind::normal(CommandHint::Other).with_timeout_secs(t))
         }
         Command::Frame { direction, n } => {
             let cmd = format!("{direction} {n}");
-            session.execute(&cmd, CommandKind::normal(CommandHint::Other))
+            session.execute(&cmd, CommandKind::normal(CommandHint::Other).with_timeout_secs(t))
         }
-        Command::ListSource { line } => session.list_source(*line),
-        Command::Raw { command } => session.raw(command),
+        Command::ListSource { line } => session.list_source(*line, t),
+        Command::Raw { command } => session.raw(command, t),
 
-        // Attach（TODO：后续实现 Session::attach）
-        Command::Attach { .. } => {
-            return Response::err(id, 501, "attach mode not yet implemented");
-        }
-
-        // 不应走到这里（lifecycle/daemon commands 已在上层处理）
+        // 不应走到这里（lifecycle/daemon/attach commands 已在上层处理）
         _ => return Response::err(id, 400, "unexpected command in session dispatch"),
     };
 

@@ -32,6 +32,14 @@ pub struct LaunchConfig {
     pub jdb_args: Vec<String>,
 }
 
+/// attach 模式配置（`jdbg attach`）——连接已运行 JVM 的 JDWP 端口。
+#[derive(Debug, Clone)]
+pub struct AttachConfig {
+    pub host: String,
+    pub port: u16,
+    pub sourcepath: Vec<PathBuf>,
+}
+
 /// spawn 后交出的句柄集合：进程 + stdin 封装在 `JdbProcess`，stdout/stderr 交给 reader 线程。
 pub struct Spawned {
     pub process: JdbProcess,
@@ -69,6 +77,32 @@ pub fn build_launch_args(config: &LaunchConfig) -> Vec<String> {
     args.extend(config.jdb_args.iter().cloned());
     args.push(config.main_class.clone());
     args.extend(config.app_args.iter().cloned());
+    args
+}
+
+/// 按 attach 模式 spawn jdb。
+///
+/// 命令行：`jdb <-J flags> -connect com.sun.jdi.SocketAttach:hostname=H,port=P [-sourcepath SP]`。
+/// **必须用显式 SocketAttach 连接器**：Windows 上 `jdb -attach host:port` 默认走共享内存
+/// （dt_shmem）传输，与 JDWP `dt_socket` 不匹配会 `Unable to attach`、jdb 立即退出（§10）。
+/// `-connect` 强制 socket 传输，跨平台一致。
+pub fn spawn_attach(jdb_path: &Path, config: &AttachConfig) -> Result<Spawned> {
+    let args = build_attach_args(config);
+    spawn(jdb_path, &args)
+}
+
+/// 构造 attach 模式的完整参数列表（不含 jdb 可执行文件本身）。
+pub fn build_attach_args(config: &AttachConfig) -> Vec<String> {
+    let mut args: Vec<String> = LOCALE_FLAGS.iter().map(|s| s.to_string()).collect();
+    args.push("-connect".into());
+    args.push(format!(
+        "com.sun.jdi.SocketAttach:hostname={},port={}",
+        config.host, config.port
+    ));
+    if !config.sourcepath.is_empty() {
+        args.push("-sourcepath".into());
+        args.push(join_paths(&config.sourcepath));
+    }
     args
 }
 
@@ -139,5 +173,49 @@ impl JdbProcess {
         self.child.kill()?;
         let _ = self.child.wait();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn starts_with_locale(args: &[String]) -> bool {
+        let head: Vec<&str> = args.iter().take(LOCALE_FLAGS.len()).map(|s| s.as_str()).collect();
+        head.as_slice() == LOCALE_FLAGS
+    }
+
+    #[test]
+    fn launch_args_have_locale_flags_and_order() {
+        let cfg = LaunchConfig {
+            main_class: "Main".into(),
+            classpath: vec![PathBuf::from("fixtures")],
+            ..Default::default()
+        };
+        let args = build_launch_args(&cfg);
+        assert!(starts_with_locale(&args));
+        // MainClass 必须在所有 `-` flag 之后。
+        let cp = args.iter().position(|a| a == "-classpath").unwrap();
+        let main = args.iter().position(|a| a == "Main").unwrap();
+        assert!(cp < main, "args: {args:?}");
+    }
+
+    #[test]
+    fn attach_args_use_socket_connector_not_dash_attach() {
+        // 关键回归：Windows 上 `-attach host:port` 默认走共享内存，必须用 SocketAttach 连接器。
+        let cfg = AttachConfig {
+            host: "localhost".into(),
+            port: 5005,
+            sourcepath: vec![PathBuf::from("src")],
+        };
+        let args = build_attach_args(&cfg);
+        assert!(starts_with_locale(&args));
+        assert!(args.iter().any(|a| a == "-connect"), "args: {args:?}");
+        assert!(
+            args.iter().any(|a| a == "com.sun.jdi.SocketAttach:hostname=localhost,port=5005"),
+            "args: {args:?}"
+        );
+        assert!(!args.iter().any(|a| a == "-attach"), "must not use -attach: {args:?}");
+        assert!(args.iter().any(|a| a == "-sourcepath"), "args: {args:?}");
     }
 }

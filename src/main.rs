@@ -49,7 +49,7 @@ fn run_client(cli: Cli) -> anyhow::Result<ExitCode> {
     }
 
     let cmd = build_command(&cli)?;
-    let req = Request::new(cmd, cli.session.clone());
+    let req = Request::new(cmd, cli.session.clone()).with_timeout(cli.timeout);
     let resp = client::send_request(&req)?;
 
     if resp.ok {

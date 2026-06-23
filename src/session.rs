@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::jdb::parser::{CommandHint, classify_output};
-use crate::jdb::process::{JdbProcess, LaunchConfig, spawn_launch};
+use crate::jdb::process::{AttachConfig, JdbProcess, LaunchConfig, spawn_attach, spawn_launch};
 use crate::jdb::reader::{DetectedEvent, PromptReader, ReadMode, ReadOutcome};
 use crate::protocol::*;
 
@@ -66,6 +66,14 @@ impl CommandKind {
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    /// 按可选秒值覆盖超时；None 保持默认。
+    pub fn with_timeout_secs(self, secs: Option<u64>) -> Self {
+        match secs {
+            Some(s) => self.with_timeout(Duration::from_secs(s)),
+            None => self,
+        }
     }
 }
 
@@ -115,6 +123,72 @@ impl Session {
             name,
             mode: SessionMode::Launch,
             target: config.main_class.clone(),
+            jdb_pid,
+            created_at: Some(jiff::Zoned::now().to_string()),
+        };
+        Ok(Session {
+            meta,
+            inner: Mutex::new(inner),
+            stderr,
+            _stderr_handle: stderr_handle,
+        })
+    }
+
+    /// 以 attach 模式连接已运行的 JVM：spawn `jdb -attach`、起读取线程、读掉连接握手输出。
+    ///
+    /// 初始状态设为 `Suspended`：DESIGN §10 推荐目标 JVM 用 `suspend=y` 启动，
+    /// attach 后线程处于挂起、调试器掌控（典型流程：attach → 断点 → cont）。
+    /// attach 模式没有 `run`（VM 已在运行），见 [`Session::run`]。
+    pub fn attach(
+        jdb_path: &std::path::Path,
+        config: &AttachConfig,
+        id: String,
+        name: Option<String>,
+    ) -> Result<Session> {
+        let spawned = spawn_attach(jdb_path, config)?;
+        let mut process = spawned.process;
+        let jdb_pid = process.pid();
+        let mut reader = PromptReader::new(spawned.stdout);
+        let (stderr, stderr_handle) = spawn_stderr_drain(spawned.stderr);
+
+        // attach 握手：jdb 连上 JVM 后输出初始化信息并给出 prompt。
+        let outcome = reader.read_until_prompt(TIMEOUT_NORMAL, ReadMode::Normal);
+        // 连接失败：jdb 报致命错误（stdout）或把错误写到 stderr 后直接退出（→ Eof）。
+        // 两种都杀掉 jdb 并报错，避免悬挂子进程。
+        match outcome {
+            ReadOutcome::Fatal { message } => {
+                let _ = process.kill();
+                return Err(Error::Connection(message));
+            }
+            ReadOutcome::Eof { .. } => {
+                let _ = process.kill();
+                let detail = drain_buf(&stderr)
+                    .unwrap_or_else(|| "jdb exited during attach handshake".into());
+                return Err(Error::Connection(format!("attach failed: {}", detail.trim())));
+            }
+            _ => {}
+        }
+
+        // attach 到 suspend=y 的 VM 后，jdb 会异步追加 `VM Started` 事件 banner + 额外 prompt。
+        // 排空这些待处理输出，否则后续命令会读到上一个 prompt 的滞后内容（attach 特有的双 prompt）。
+        for _ in 0..3 {
+            match reader.read_until_prompt(Duration::from_millis(800), ReadMode::Normal) {
+                ReadOutcome::Prompt { .. } => continue,
+                _ => break,
+            }
+        }
+
+        let inner = SessionInner {
+            process,
+            reader,
+            state: RunState::Suspended,
+            last_event: None,
+        };
+        let meta = SessionMeta {
+            id,
+            name,
+            mode: SessionMode::Attach,
+            target: format!("{}:{}", config.host, config.port),
             jdb_pid,
             created_at: Some(jiff::Zoned::now().to_string()),
         };
@@ -192,76 +266,81 @@ impl Session {
     // ── 语义便捷方法（封装 jdb 命令字符串，§7 命令面）──────────────────────────
 
     /// `stop at Class:line`
-    pub fn stop_at(&self, class: &str, line: u32) -> Result<CommandResponse> {
-        self.execute(&format!("stop at {class}:{line}"), CommandKind::normal(CommandHint::BreakpointSet))
+    pub fn stop_at(&self, class: &str, line: u32, timeout: Option<u64>) -> Result<CommandResponse> {
+        self.execute(&format!("stop at {class}:{line}"), CommandKind::normal(CommandHint::BreakpointSet).with_timeout_secs(timeout))
     }
 
     /// `stop in Class.method`（可选签名以区分重载）
-    pub fn stop_in(&self, class: &str, method: &str, args: Option<&str>) -> Result<CommandResponse> {
+    pub fn stop_in(&self, class: &str, method: &str, args: Option<&str>, timeout: Option<u64>) -> Result<CommandResponse> {
         let spec = match args {
             Some(a) => format!("stop in {class}.{method}({a})"),
             None => format!("stop in {class}.{method}"),
         };
-        self.execute(&spec, CommandKind::normal(CommandHint::BreakpointSet))
+        self.execute(&spec, CommandKind::normal(CommandHint::BreakpointSet).with_timeout_secs(timeout))
     }
 
     /// `run`（仅 launch 模式）
-    pub fn run(&self) -> Result<CommandResponse> {
-        self.execute("run", CommandKind::blocking(CommandHint::Run))
+    pub fn run(&self, timeout: Option<u64>) -> Result<CommandResponse> {
+        if self.meta.mode == SessionMode::Attach {
+            return Err(Error::SessionDead(
+                "`run` is launch-mode only; an attached JVM is already running (use `cont`)".into(),
+            ));
+        }
+        self.execute("run", CommandKind::blocking(CommandHint::Run).with_timeout_secs(timeout))
     }
 
     /// `cont`
-    pub fn cont(&self) -> Result<CommandResponse> {
-        self.execute("cont", CommandKind::blocking(CommandHint::Cont))
+    pub fn cont(&self, timeout: Option<u64>) -> Result<CommandResponse> {
+        self.execute("cont", CommandKind::blocking(CommandHint::Cont).with_timeout_secs(timeout))
     }
 
     /// `step`（step into）
-    pub fn step(&self) -> Result<CommandResponse> {
-        self.execute("step", CommandKind::blocking(CommandHint::Step))
+    pub fn step(&self, timeout: Option<u64>) -> Result<CommandResponse> {
+        self.execute("step", CommandKind::blocking(CommandHint::Step).with_timeout_secs(timeout))
     }
 
     /// `next`（step over）
-    pub fn next(&self) -> Result<CommandResponse> {
-        self.execute("next", CommandKind::blocking(CommandHint::Next))
+    pub fn next(&self, timeout: Option<u64>) -> Result<CommandResponse> {
+        self.execute("next", CommandKind::blocking(CommandHint::Next).with_timeout_secs(timeout))
     }
 
     /// `step up`（run until method returns）
-    pub fn step_out(&self) -> Result<CommandResponse> {
-        self.execute("step up", CommandKind::blocking(CommandHint::StepOut))
+    pub fn step_out(&self, timeout: Option<u64>) -> Result<CommandResponse> {
+        self.execute("step up", CommandKind::blocking(CommandHint::StepOut).with_timeout_secs(timeout))
     }
 
     /// `where`
-    pub fn stack(&self) -> Result<CommandResponse> {
-        self.execute("where", CommandKind::normal(CommandHint::Where))
+    pub fn stack(&self, timeout: Option<u64>) -> Result<CommandResponse> {
+        self.execute("where", CommandKind::normal(CommandHint::Where).with_timeout_secs(timeout))
     }
 
     /// `locals`
-    pub fn locals(&self) -> Result<CommandResponse> {
-        self.execute("locals", CommandKind::normal(CommandHint::Locals))
+    pub fn locals(&self, timeout: Option<u64>) -> Result<CommandResponse> {
+        self.execute("locals", CommandKind::normal(CommandHint::Locals).with_timeout_secs(timeout))
     }
 
     /// `print <expr>`
-    pub fn print(&self, expr: &str) -> Result<CommandResponse> {
-        self.execute(&format!("print {expr}"), CommandKind::normal(CommandHint::Print))
+    pub fn print(&self, expr: &str, timeout: Option<u64>) -> Result<CommandResponse> {
+        self.execute(&format!("print {expr}"), CommandKind::normal(CommandHint::Print).with_timeout_secs(timeout))
     }
 
     /// `threads`
-    pub fn threads(&self) -> Result<CommandResponse> {
-        self.execute("threads", CommandKind::normal(CommandHint::Threads))
+    pub fn threads(&self, timeout: Option<u64>) -> Result<CommandResponse> {
+        self.execute("threads", CommandKind::normal(CommandHint::Threads).with_timeout_secs(timeout))
     }
 
     /// `list [line]`
-    pub fn list_source(&self, line: Option<u32>) -> Result<CommandResponse> {
+    pub fn list_source(&self, line: Option<u32>, timeout: Option<u64>) -> Result<CommandResponse> {
         let cmd = match line {
             Some(l) => format!("list {l}"),
             None => "list".to_string(),
         };
-        self.execute(&cmd, CommandKind::normal(CommandHint::ListSource))
+        self.execute(&cmd, CommandKind::normal(CommandHint::ListSource).with_timeout_secs(timeout))
     }
 
     /// 透传任意 jdb 命令（escape hatch）。
-    pub fn raw(&self, cmd: &str) -> Result<CommandResponse> {
-        self.execute(cmd, CommandKind::normal(CommandHint::Other))
+    pub fn raw(&self, cmd: &str, timeout: Option<u64>) -> Result<CommandResponse> {
+        self.execute(cmd, CommandKind::normal(CommandHint::Other).with_timeout_secs(timeout))
     }
 }
 
@@ -376,6 +455,16 @@ fn spawn_stderr_drain(stderr: ChildStderr) -> (Arc<Mutex<String>>, JoinHandle<()
         }
     });
     (buf, handle)
+}
+
+/// 取出并清空一个共享文本缓冲（用于 attach 失败时读 stderr 线程已捕获的错误）。
+fn drain_buf(buf: &Arc<Mutex<String>>) -> Option<String> {
+    let mut b = buf.lock().ok()?;
+    if b.is_empty() {
+        None
+    } else {
+        Some(std::mem::take(&mut *b))
+    }
 }
 
 #[cfg(test)]

@@ -22,6 +22,15 @@ sum = 3";
 
     const WHERE_SINGLE: &str = "  [1] Main.main (Main.java:9)";
 
+    const WHERE_ALL: &str = "\
+Reference Handler:
+  [1] java.lang.Object.wait (native method)
+  [2] java.lang.ref.Reference.tryHandlePending (Reference.java:191)
+Signal Dispatcher:
+main:
+  [1] Main.foo (Main.java:15)
+  [2] Main.main (Main.java:9)";
+
     const PRINT_INT: &str = " count = 3";
 
     const PRINT_STR: &str = " label = \"hello\"";
@@ -95,6 +104,31 @@ It will be set after the class is loaded.";
         assert_eq!(f.location.file.as_deref(), Some("Main.java"));
         assert_eq!(f.location.line, 9);
         assert!(!f.is_native);
+    }
+
+    #[test]
+    fn where_all_groups_by_thread() {
+        let result = parse_where_all(WHERE_ALL);
+        let CommandResult::ThreadStackTrace { threads } = result else {
+            panic!("expected ThreadStackTrace, got {result:?}");
+        };
+        assert_eq!(threads.len(), 3, "threads: {threads:?}");
+
+        // 含 native 帧的线程
+        assert_eq!(threads[0].thread, "Reference Handler");
+        assert_eq!(threads[0].frames.len(), 2);
+        assert!(threads[0].frames[0].is_native);
+        assert_eq!(threads[0].frames[1].location.line, 191);
+
+        // 无帧线程仍保留
+        assert_eq!(threads[1].thread, "Signal Dispatcher");
+        assert!(threads[1].frames.is_empty());
+
+        // 主线程（线程名为 "main"，注意不要与帧行混淆）
+        assert_eq!(threads[2].thread, "main");
+        assert_eq!(threads[2].frames.len(), 2);
+        assert_eq!(threads[2].frames[0].location.method, "foo");
+        assert_eq!(threads[2].frames[0].location.line, 15);
     }
 
     #[test]

@@ -68,6 +68,7 @@ static RE_SOURCE_LINE: LazyLock<Regex> = LazyLock::new(|| {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandHint {
     Where,
+    WhereAll,
     Locals,
     Print,
     Dump,
@@ -98,6 +99,7 @@ pub fn classify_output(output: &str, hint: CommandHint) -> (CommandResult, Optio
 
     let result = match hint {
         CommandHint::Where => parse_where(output),
+        CommandHint::WhereAll => parse_where_all(output),
         CommandHint::Locals => parse_locals(output),
         CommandHint::Print | CommandHint::Eval => parse_print(output),
         CommandHint::Dump => parse_dump(output),
@@ -112,35 +114,58 @@ pub fn classify_output(output: &str, hint: CommandHint) -> (CommandResult, Optio
 
 // ─── 子解析器 ────────────────────────────────────────────────────────────────────
 
-/// 解析 `where` / `where all` 输出为 `StackTrace`。
+/// 解析单条 `where` 栈帧行；非帧行返回 None。
+fn parse_frame_line(line: &str) -> Option<StackFrame> {
+    let c = RE_FRAME.captures(line)?;
+    let index = c["idx"].parse().unwrap_or(0);
+    let method = c["method"].to_string();
+    // loc 格式: "File.java:42" 或 "native method" 或 "Unknown Source"
+    let (file, line_num, is_native) = parse_location_parens(&c["loc"]);
+    Some(StackFrame {
+        index,
+        location: Location {
+            class: c["class"].to_string(),
+            method,
+            file,
+            line: line_num,
+        },
+        is_native,
+    })
+}
+
+/// 解析单线程 `where` 输出为 `StackTrace`。
 pub fn parse_where(output: &str) -> CommandResult {
-    let mut frames = Vec::new();
-    for line in output.lines() {
-        if let Some(c) = RE_FRAME.captures(line) {
-            let index = c["idx"].parse().unwrap_or(0);
-            let full_class = &c["class"];
-            let method = c["method"].to_string();
-            let loc = &c["loc"];
-
-            // loc 格式: "File.java:42" 或 "native method" 或 "Unknown Source"
-            let (file, line_num, is_native) = parse_location_parens(loc);
-
-            frames.push(StackFrame {
-                index,
-                location: Location {
-                    class: full_class.to_string(),
-                    method,
-                    file,
-                    line: line_num,
-                },
-                is_native,
-            });
-        }
-    }
+    let frames: Vec<StackFrame> = output.lines().filter_map(parse_frame_line).collect();
     if frames.is_empty() {
         CommandResult::Raw { text: output.to_string() }
     } else {
         CommandResult::StackTrace { frames }
+    }
+}
+
+/// 解析 `where all` 多线程输出为 `ThreadStackTrace`。
+///
+/// 输出形如：每个线程一个 header 行（`main:`、`Reference Handler:`），其后为缩进的帧行；
+/// 无帧的线程只有 header。线程名可能含空格，故用"以冒号结尾的非帧行"作为分组边界。
+pub fn parse_where_all(output: &str) -> CommandResult {
+    let mut threads: Vec<ThreadStack> = Vec::new();
+    for line in output.lines() {
+        if let Some(frame) = parse_frame_line(line) {
+            match threads.last_mut() {
+                Some(t) => t.frames.push(frame),
+                // 帧出现在任何 header 之前——归入一个匿名线程兜底。
+                None => threads.push(ThreadStack { thread: String::new(), frames: vec![frame] }),
+            }
+        } else if let Some(name) = line.trim().strip_suffix(':')
+            && !name.is_empty()
+        {
+            threads.push(ThreadStack { thread: name.to_string(), frames: Vec::new() });
+        }
+    }
+    if threads.is_empty() {
+        CommandResult::Raw { text: output.to_string() }
+    } else {
+        CommandResult::ThreadStackTrace { threads }
     }
 }
 
