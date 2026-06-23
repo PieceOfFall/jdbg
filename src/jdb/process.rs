@@ -117,11 +117,23 @@ fn join_paths(paths: &[PathBuf]) -> String {
 
 /// 实际 spawn：piped stdin/stdout/stderr。
 fn spawn(jdb_path: &Path, args: &[String]) -> Result<Spawned> {
-    let mut child = Command::new(jdb_path)
-        .args(args)
+    let mut cmd = Command::new(jdb_path);
+    cmd.args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // Windows: 不为 jdb 弹出空的控制台窗口。daemon 以 DETACHED_PROCESS 运行（无控制台），
+    // 系统会给控制台子程序 jdb.exe 新建一个控制台窗口；但 stdio 全走管道，窗口无内容、纯噪音。
+    // CREATE_NO_WINDOW 让 jdb 在不可见的控制台中运行（子 JVM 继承），管道 I/O 不受影响。
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+
+    let mut child = cmd
         .spawn()
         .map_err(|source| Error::Spawn {
             path: jdb_path.display().to_string(),
