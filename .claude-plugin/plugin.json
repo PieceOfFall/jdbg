@@ -1,0 +1,20 @@
+{
+  "name": "java-agent-debugger",
+  "version": "0.1.0",
+  "description": "Debug Java programs interactively from the command line via the jdbg CLI: launch a program or attach to a running JVM (JDWP), set breakpoints, step through code, and inspect variables, expressions, threads, and exceptions. Stateful background sessions with structured (text/JSON) output. Cross-platform, native on Windows.",
+  "keywords": [
+    "java",
+    "debugger",
+    "jdb",
+    "jdbg",
+    "jdwp",
+    "jvm",
+    "debugging",
+    "breakpoints",
+    "development-tools",
+    "troubleshooting"
+  ],
+  "author": {
+    "name": "luyiwen"
+  }
+}

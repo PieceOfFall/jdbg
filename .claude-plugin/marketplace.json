@@ -1,0 +1,21 @@
+{
+  "name": "java-agent-debugger",
+  "description": "Interactive Java debugging for AI agents via the jdbg CLI (a native, cross-platform wrapper around the JDK's jdb).",
+  "owner": {
+    "name": "luyiwen"
+  },
+  "plugins": [
+    {
+      "name": "java-agent-debugger",
+      "source": "./",
+      "description": "Debug Java programs interactively: launch under jdb or attach to a running JVM (JDWP), set breakpoints, step, and inspect variables, threads, and exceptions. Stateful background sessions, structured text/JSON output, native on Windows.",
+      "version": "0.1.0",
+      "author": {
+        "name": "luyiwen"
+      },
+      "license": "MIT",
+      "keywords": ["java", "jdb", "jdbg", "debugger", "jvm", "jdwp", "debugging", "breakpoints"],
+      "category": "development"
+    }
+  ]
+}

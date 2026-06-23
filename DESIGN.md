@@ -137,16 +137,11 @@ Loaded  ──run──►  Suspended  ──cont/step/next──►  Suspended
 | 3. session 层 | ✅ 完成 | 三线程模型、RunState、命令锁、语义便捷方法、launch + attach |
 | 4. daemon + IPC + client + registry | ✅ 完成 | interprocess 命名管道、auto-spawn、SessionManager、磁盘注册表 |
 | 5. cli.rs + output.rs | ✅ 完成 | clap 完整命令面 + 文本/JSON 渲染 |
-| 6. SKILL.md + plugin manifest | ❌ 未实现 | Claude 打包：native-first skill 文档 + plugin.json |
+| 6. SKILL.md + plugin manifest | ✅ 完成 | native-first `skills/jdbg/SKILL.md` + `.claude-plugin/{plugin,marketplace}.json`，subagent 应用场景验证通过 |
 
 ## 7. 未实现 / TODO 项
 
-### 7.1 Roadmap 未完成
-
-- **SKILL.md**：文档化 `jdbg` 命令面和调试工作流，供 Claude 参考。
-- **`.claude-plugin/plugin.json` + `marketplace.json`**：插件声明（`allowed-tools: Bash(jdbg:*) Read`）。
-
-### 7.2 功能级 TODO
+### 7.1 功能级 TODO
 
 | 功能 | 优先级 | 说明 |
 |------|--------|------|
@@ -155,15 +150,17 @@ Loaded  ──run──►  Suspended  ──cont/step/next──►  Suspended
 | Unix setsid detach | 低 | 当前 Unix detach 只靠 stdio null（Windows 完善，Unix 最小可用） |
 | 集成测试 | 中 | 需要 JDK 的 feature-gated 集成测试（当前只有单元测试 + 手动验证） |
 
-### 7.3 已完成（本轮）
+### 7.2 已完成（本轮）
 
 | 功能 | 说明 |
 |------|------|
+| **Roadmap 6: SKILL.md + plugin** | native-first `skills/jdbg/SKILL.md`（命令面 §7、stateful "react to each result" 工作流、JDWP 版本感知启用、`-g` 提示、attach；剔除参考的 WSL/temp/sleep/`--auto-inspect`）+ `.claude-plugin/{plugin,marketplace}.json`。subagent 应用场景验证通过（仅凭 skill 正确驱动 launch→break→run→inspect）。 |
 | **Attach 模式** | `Session::attach` + `process::spawn_attach` + `manager::create_attach`，handler 顶层路由。**关键修复：用 `-connect com.sun.jdi.SocketAttach:hostname=H,port=P` 而非 `jdb -attach host:port`**——Windows 上 `-attach` 默认走共享内存(dt_shmem)，与 JDWP dt_socket 不匹配会 attach 失败、jdb 立即退出。attach 后排空 `VM Started` 异步 banner 避免输出滞后；失败路径捕获 stderr 报错。`run` 在 attach 模式被拒绝。 |
 | jdkpath 常见目录扫描 | `find_jdb` 第 4 步扫描 `Program Files\Java\*`、`.jdks\*`、Eclipse Adoptium、Microsoft、`/usr/lib/jvm/*`、macOS bundle 布局；纯 `std::fs`，无新依赖。 |
 | `where --all` 多线程栈 | 新增 `CommandResult::ThreadStackTrace { threads: Vec<ThreadStack> }`，parser 按线程 header 分组（`parse_where_all`），output 渲染。 |
 | `catch` 异常 thread 推断 | reader 从尾部 thread-prompt 提取线程名回填 `DetectedEvent::Exception.thread`（不再为空串）。 |
 | `--timeout` 传递 | `Request.timeout` → handler → `CommandKind::with_timeout_secs` → `read_until_prompt`，便捷方法全部透传。 |
+| `kill` 默认会话 | `jdbg kill` 不带 `--session` 时默认唯一存活会话（与其它命令一致，§7 全局标志约定）。 |
 
 ## 8. 依赖清单
 
