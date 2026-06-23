@@ -7,7 +7,7 @@
 `java-agent-debugger` is a cross-platform **Rust CLI** (invoked as `jdbg`) that lets an AI coding agent
 (Claude Code) **debug Java programs interactively in any Java project**, with **Windows as the primary target**.
 
-It reimplements the logic of the reference project [`jdb-agentic-debugger/`](./jdb-agentic-debugger/) — a Claude
+It reimplements the logic of the reference project [`jdb-agentic-debugger/`]("https://github.com/brunoborges/jdb-agentic-debugger"") — a Claude
 *plugin* made of Bash scripts that wrap the JDK's `jdb` command-line debugger. That reference is **Unix-only**
 (Bash pipes, `/tmp`, `mktemp`, `timeout`, `nc`, and WSL on Windows) and drives `jdb` with **fragile sleep-based
 timing and no output parsing** — the agent just reads raw transcript text.
