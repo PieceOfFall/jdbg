@@ -19,7 +19,7 @@
   },
   "mcpServers": {
     "jdbg": {
-      "command": "${CLAUDE_PLUGIN_ROOT}/bin/jdbg",
+      "command": "jdbg",
       "args": ["__mcp"]
     }
   }

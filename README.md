@@ -12,6 +12,32 @@ Cross-platform CLI debugger for Java — wraps JDK's `jdb` with **prompt-aware**
 
 ## Installation
 
+Every install method drops `jdbg` (or `jdbg.exe` on Windows) onto your `PATH`, so the
+MCP plugin's bare `jdbg` command resolves on every platform — no per-OS binary name to configure.
+
+### Prebuilt binaries (recommended)
+
+The installers fetch the right build for your OS/arch from the latest GitHub Release and add it to `PATH`.
+
+**macOS / Linux**
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/PieceOfFall/jdbg/releases/latest/download/java-agent-debugger-installer.sh | sh
+```
+
+**Windows (PowerShell)**
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/PieceOfFall/jdbg/releases/latest/download/java-agent-debugger-installer.ps1 | iex"
+```
+
+### Via cargo
+
+```bash
+cargo install --git https://github.com/PieceOfFall/jdbg.git
+# Installs to ~/.cargo/bin/jdbg
+```
+
 ### From source
 
 ```bash
@@ -23,8 +49,8 @@ cargo build --release
 
 ### Requirements
 
-- Rust 1.85+ (edition 2024)
 - JDK 8–21+ with `jdb` on PATH or discoverable via `JAVA_HOME`
+- Rust 1.85+ (edition 2024) — only for the `cargo`/from-source methods
 - For debugging: compile your Java code with `javac -g` (debug info for locals/line breakpoints)
 
 ## Quick Start
@@ -96,6 +122,16 @@ During development, point your MCP config at the dev binary:
 {
   "mcpServers": {
     "jdbg": { "command": "target/debug/jdbg", "args": ["__mcp"] }
+  }
+}
+```
+
+For production (after installing `jdbg` to PATH), use the bare command:
+
+```json
+{
+  "mcpServers": {
+    "jdbg": { "command": "jdbg", "args": ["__mcp"] }
   }
 }
 ```
