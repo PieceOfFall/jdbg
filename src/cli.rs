@@ -84,6 +84,16 @@ pub enum Commands {
         action: DaemonAction,
     },
 
+    /// Register (or remove) the jdbg MCP server in Claude Code's config.
+    Setup {
+        /// Remove the registration instead of adding it.
+        #[arg(long)]
+        remove: bool,
+        /// Print the config snippet instead of writing any files.
+        #[arg(long)]
+        print: bool,
+    },
+
     // ── Breakpoints ──
 
     /// Set a line breakpoint: stop at Class:line.

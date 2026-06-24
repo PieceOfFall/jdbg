@@ -10,3 +10,4 @@
 # 工具产物（codegraph 索引 / cursor 规则，本地生成，不入库）
 .codegraph/
 .cursor/
+.claude/

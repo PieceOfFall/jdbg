@@ -24,5 +24,6 @@ pub mod output;
 pub mod protocol;
 pub mod registry;
 pub mod session;
+pub mod setup;
 
 pub use error::{Error, Result};

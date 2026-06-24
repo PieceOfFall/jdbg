@@ -10,6 +10,7 @@ use java_agent_debugger::daemon;
 use java_agent_debugger::mcp;
 use java_agent_debugger::output;
 use java_agent_debugger::protocol::*;
+use java_agent_debugger::setup;
 
 fn main() -> ExitCode {
     let cli = Cli::parse();
@@ -56,6 +57,12 @@ fn run_client(cli: Cli) -> anyhow::Result<ExitCode> {
                 Ok(ExitCode::SUCCESS)
             }
         };
+    }
+
+    // Setup: 纯客户端操作，不联系 daemon。
+    if let Commands::Setup { remove, print } = &cli.command {
+        setup::run_setup(*remove, *print)?;
+        return Ok(ExitCode::SUCCESS);
     }
 
     let cmd = build_command(&cli)?;
@@ -130,6 +137,7 @@ fn build_command(cli: &Cli) -> anyhow::Result<Command> {
         Commands::ListSource { line } => Command::ListSource { line: *line },
         Commands::Raw { command } => Command::Raw { command: command.join(" ") },
         Commands::Daemon { .. } => unreachable!("handled above"),
+        Commands::Setup { .. } => unreachable!("handled above"),
         Commands::Daemon_ => unreachable!("handled above"),
         Commands::Mcp_ => unreachable!("handled above"),
     };

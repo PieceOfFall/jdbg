@@ -138,6 +138,18 @@ For production (after installing `jdbg` to PATH), use the bare command:
 
 The repo ships `.mcp.json` (dev) and `.claude-plugin/plugin.json` (distribution) wiring this up.
 
+### One-command registration
+
+After installing `jdbg`, run:
+
+```bash
+jdbg setup          # writes MCP config + auto-allow permissions
+jdbg setup --remove # reverse: removes both entries
+jdbg setup --print  # just print the config snippet, don't write anything
+```
+
+This writes to `~/.claude.json` (MCP server) and `~/.claude/settings.json` (tool permissions).
+
 ## Architecture
 
 Two clients → one daemon → N × jdb child processes:
