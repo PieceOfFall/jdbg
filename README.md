@@ -1,6 +1,6 @@
 # jdbg
 
-Cross-platform CLI debugger for Java — wraps JDK's `jdb` with **prompt-aware** control so AI coding agents (and humans) can debug Java programs interactively.
+**Agent-friendly Java debugger** CLI for Claude Code and humans, wrapping JDK `jdb` with persistent sessions, structured output, and native MCP tools.
 
 ## Highlights
 
@@ -155,9 +155,9 @@ This writes to `~/.claude.json` (MCP server) and `~/.claude/settings.json` (tool
 Two clients → one daemon → N × jdb child processes:
 
 ```
-    CLI (jdbg)  ─┐                          ┌─ jdb child A → JVM A
-                 ├─► Daemon (SessionManager) ┤
-  MCP (jdbg __mcp)┘    named pipe / socket   └─ jdb child B → JVM B
+     CLI (jdbg)  ─┐                           ┌─ jdb child A → JVM A
+                  ├─► Daemon (SessionManager) ┤
+  MCP (jdbg __mcp)┘    named pipe / socket    └─ jdb child B → JVM B
 ```
 
 - **CLI / MCP server** — two peer clients; each turns its input into a `Request` and sends it to the daemon
