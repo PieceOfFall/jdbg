@@ -148,7 +148,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         tool(
             "thread",
             "Switch the current thread.",
-            json!({"id": {"type": "string", "description": "Thread id (hex, from `threads` output)."}}),
+            json!({"id": {"type": "string", "description": "Thread id — the full hex value WITH 0x prefix from `threads` output, e.g. \"0x37f2\". Not the thread name."}}),
             &["id"],
             true,
             false,

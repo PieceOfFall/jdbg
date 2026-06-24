@@ -129,3 +129,55 @@ Every tool returns a typed result. The ones that drive the next move:
 - **Treating `Timeout` as a crash** → it is non-destructive; the session is still alive. Inspect or kill it.
 - **Wrong JDK picked up** → pass `jdb_path` to `launch` / `attach`, or set `JAVA_HOME`, to force a specific
   JDK (e.g. JDK 8 vs JDK 21).
+
+## Attach-mode guidance (Web servers / long-running JVMs)
+
+### Session lifecycle: one attach per debugging task
+
+**Do NOT kill + re-attach to the same JVM repeatedly.** jdb reconnection to the same JDWP port (without
+restarting the JVM) is unreliable on JDK 8 — breakpoint event registration may silently fail on the second
+connection, causing `cont` to timeout indefinitely.
+
+**Best practice:** use a single session for the entire debugging task:
+1. `attach` once
+2. Set breakpoints, `cont`, inspect, `step`/`next`, `cont` again — all within the same session
+3. When done, `kill` (this resumes the VM so the server keeps running)
+4. If you need to debug again later, `attach` fresh — but avoid rapid kill+re-attach cycles
+
+### Avoiding "No thread specified" or empty responses
+
+If `where` / `locals` returns empty or "No thread specified" immediately after a `Stopped` result:
+1. Retry the **same** tool call once — it is a transient timing issue that resolves on the second call
+2. If it persists, use `threads` to see if the hit thread shows `running (at breakpoint)` (normal) or
+   `cond. waiting` (abnormal — session may need to be killed and re-attached)
+3. The `thread { id }` tool can force-set the current thread by name (the thread name from the `Stopped`
+   event, e.g. `http-nio-8080-exec-5`)
+
+### Thread IDs in `threads` output
+
+The `threads` output shows lines like `(TaskThread)0x37bd http-nio-8231-exec-8 cond. waiting`. The
+**full hex value with `0x` prefix** (e.g. `0x37bd`) is the thread id accepted by the `thread` tool.
+Do NOT pass the thread **name** (e.g. `http-nio-8231-exec-8`) — jdb rejects names.
+Do NOT strip the `0x` prefix — `37bd` alone is also rejected.
+
+Example: if `threads` shows `(TaskThread)0x37f2 http-nio-8231-exec-20`, use:
+```
+thread { "id": "0x37f2" }
+```
+
+Note: if the thread is no longer suspended (e.g. it has finished executing and returned to the pool),
+`thread` will report "not a valid thread id" even with the correct hex value. This indicates the
+breakpoint did not hold the thread — see the guidance above about retrying or re-attaching.
+
+### External Tomcat / application servers
+
+When attaching to an external Tomcat (or similar) started with JDWP:
+```
+-agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=5005
+```
+- `suspend=n` is correct — it means Tomcat doesn't wait for the debugger at startup
+- Breakpoints **do** properly suspend threads (SUSPEND_ALL) when hit — this is controlled by jdb, not by
+  the `suspend=n` flag
+- The target server will **freeze** (all request processing stops) while stopped at a breakpoint — this is
+  expected with SUSPEND_ALL. Inspect quickly and `cont` to unfreeze
+- `kill` resumes the VM before disconnecting so the server continues running afterwards
