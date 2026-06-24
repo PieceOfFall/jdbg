@@ -19,6 +19,7 @@ pub mod daemon;
 pub mod error;
 pub mod jdb;
 pub mod jdkpath;
+pub mod mcp;
 pub mod output;
 pub mod protocol;
 pub mod registry;

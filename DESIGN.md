@@ -10,32 +10,49 @@
 - **原生跨平台**——纯 Rust，无 Bash/WSL/temp-file 依赖，Windows 原生运行。
 - **Prompt-aware，非 sleep-based**——读取 jdb 输出直到 prompt 返回才判定命令完成，超时不杀进程。
 
+**两种接入方式**（共用同一套 daemon/session/jdb 引擎）：
+- **CLI**——`jdbg <subcommand>`，人类/脚本直接调用，输出人类文本或 `--json`。
+- **MCP server**——`jdbg __mcp`，作为 stdio MCP server 被 Claude Code 识别为**原生工具调用**
+  （`mcp__jdbg__launch` 等 25 个工具），无需经 Bash。见 §2.5。
+
 ## 2. 架构设计
 
-### 2.1 三角色模型
+### 2.1 角色模型（两种客户端 → 一个 daemon → N × jdb）
 
 ```
-  Claude Code tool call          (每次调用 = 一个短命进程)
-        │  jdbg break-at Main 9
-        ▼
-  ┌─────────────┐   local socket (命名管道)   ┌──────────────────────────────────┐
-  │  CLI (jdbg) │ ─────────────────────────►  │  Daemon (jdbg __daemon)           │
-  │  one-shot   │ ◄─────────────────────────  │  每用户一个，长驻后台              │
-  └─────────────┘     JSONL request/response   │  HashMap<SessionId, Session>     │
-                                                └──────────────┬───────────────────┘
-                                                               │ owns
-                                                  ┌────────────┴────────────┐
-                                                  ▼                         ▼
-                                           ┌─────────────┐           ┌─────────────┐
-                                           │ jdb child A │           │ jdb child B │
-                                           │  → JVM A    │           │  → JVM B    │
-                                           └─────────────┘           └─────────────┘
+                         Claude Code
+              ┌───────────────┴────────────────┐
+        Bash  ▼                                 ▼  stdio (JSON-RPC 2.0)
+       ┌──────────────┐               ┌──────────────────────┐
+       │  CLI (jdbg)  │               │  MCP server          │
+       │   one-shot   │               │  (jdbg __mcp)        │
+       └──────┬───────┘               └──────────┬───────────┘
+              │        client::send_request(&Request)
+              └────────────────┬────────────────┘
+                               ▼  命名管道 LocalSocket · JSONL (1 Req / 1 Resp)
+              ┌────────────────────────────────────┐
+              │  Daemon (jdbg __daemon)            │
+              │  IPC listener + SessionManager     │
+              │  HashMap<SessionId, Session>       │
+              └────────────────┬───────────────────┘
+                               │ owns
+                  ┌────────────┴────────────┐
+                  ▼                         ▼
+           ┌─────────────┐           ┌─────────────┐
+           │ jdb child A │           │ jdb child B │   … N 个并发会话
+           │  → JVM A    │           │  → JVM B    │
+           └─────────────┘           └─────────────┘
 ```
 
-- **CLI** (`jdbg <subcommand>`)：短命进程，解析 clap 参数 → 连接 daemon → 发送 Request → 打印 Response → 退出。
+`jdbg` 进程有四类角色，Claude Code（或人类终端）从两条客户端路径之一接入，最终汇入同一个 daemon：
+
+- **CLI** (`jdbg <subcommand>`)：短命进程，解析 clap 参数 → 经 `client::send_request` 发 Request → 打印
+  Response → 退出。Claude 的每次 Bash 调用对应一个。
+- **MCP server** (`jdbg __mcp`，隐藏子命令)：Claude Code 通过 stdio 拉起的进程，把 `tools/call` 翻成
+  `Request`、经**同一个** `client::send_request` 发给 daemon——与 CLI 平级的第二种客户端。详见 §2.5。
 - **Daemon** (`jdbg __daemon`，隐藏子命令)：长驻后台，持有 IPC listener 和 `SessionManager`。
-  CLI 首次连接失败时**自动拉起**（detached），无需手动启动。
-- **jdb 子进程**：每个调试会话一个，由 daemon 内的 `Session` 拥有。
+  CLI / MCP server 首次连接失败时**自动拉起**（detached），无需手动启动。
+- **jdb 子进程**：每个调试会话一个，由 daemon 内的 `Session` 拥有；daemon 多路复用 N 个并发会话。
 
 ### 2.2 IPC 协议
 
@@ -76,6 +93,32 @@
   registry.rs            ← 磁盘注册表
 ```
 
+### 2.5 MCP server（Claude Code 原生工具）
+
+MCP server 是 **daemon 的第二种客户端**，与 CLI 平级——CLI 把 clap 解析结果转成 `Request` 发给 daemon；
+MCP server 把 `tools/call` 转成 `Request` 发给 daemon。两者共用同一条下游链路，**daemon/session/jdb 引擎/
+protocol 零改动**。
+
+```
+  Claude Code ──stdio (JSON-RPC 2.0, 行分隔)──►  jdbg __mcp  (Claude 拉起的子进程)
+                                                     │  tools/call → protocol::Command + Request
+                                                     │  client::send_request(&Request)
+                                                     ▼
+                                           命名管道 ──► daemon ──► Session ──► jdb → JVM
+```
+
+- **传输**：手写极简 JSON-RPC 2.0 over stdio（无 tokio，复用 serde_json + blocking IO，与既有 JSONL IPC 同构）。
+  实现的方法：`initialize` / `notifications/initialized` / `tools/list` / `tools/call` / `ping`。
+- **工具粒度**：细粒度 1:1——每个 jdbg 子命令一个工具，共 25 个（不暴露 daemon 控制；`daemon start/stop/status`
+  不该交给 LLM，且 auto-spawn 已覆盖）。`session`/`timeout` 作为通用可选参数注入相关工具的 inputSchema。
+- **结果映射**：`Response.ok` → `output::render` 文本塞进 `CallToolResult.content`（`isError:false`）；
+  业务错误/daemon 连接失败 → tool-level error（`isError:true`，Claude 可见并继续）；仅协议层问题
+  （未知工具、缺必填参数、JSON 解析失败）才用 JSON-RPC error（`-32601`/`-32602`/`-32700`）。
+- **stdout 纪律**：stdout 只承载 JSON-RPC，所有日志走 stderr（`eprintln!`），否则污染协议流。
+- **接入配置**：开发期 `.mcp.json` 指向 `target/debug/jdbg.exe __mcp`；分发期 `.claude-plugin/plugin.json`
+  内联 `mcpServers` 指向 `${CLAUDE_PLUGIN_ROOT}/bin/jdbg`。工具呈现为 `mcp__jdbg__<tool>`
+  （plugin 打包时为 `mcp__plugin_java-agent-debugger_jdbg__<tool>`）。
+
 ## 3. 模块说明
 
 | 模块 | 文件 | 职责 |
@@ -92,8 +135,11 @@
 | daemon/manager | `src/daemon/manager.rs` | `SessionManager`：HashMap 管理多会话、create/get/list/kill |
 | registry | `src/registry.rs` | `directories` 定位数据目录；原子写 daemon.json / sessions.json |
 | client | `src/client.rs` | connect-or-auto-spawn，发一条 Request 收一条 Response |
-| cli | `src/cli.rs` | clap derive：完整 §7 命令面 |
-| output | `src/output.rs` | 人类可读文本渲染 + `--json` 模式 |
+| cli | `src/cli.rs` | clap derive：完整 §7 命令面 + 隐藏 `__daemon` / `__mcp` 入口 |
+| output | `src/output.rs` | 人类可读文本渲染 + `--json` 模式（返回 String，MCP 层复用） |
+| mcp | `src/mcp/mod.rs` | MCP server `run_mcp()`：stdio JSON-RPC 主循环 + 生命周期 + 结果映射 |
+| mcp/jsonrpc | `src/mcp/jsonrpc.rs` | JSON-RPC 2.0 请求/响应/错误类型 + 标准错误码 |
+| mcp/tools | `src/mcp/tools.rs` | 25 工具 spec（name/description/inputSchema）+ `dispatch_tool` 工具→Command 翻译层 |
 
 ## 4. CLI 命令面
 
@@ -117,6 +163,11 @@ jdbg raw <jdb command...>
 全局参数：--session <id> --json --timeout <secs> --jdb-path <path>
 ```
 
+**MCP 工具面**：上述子命令 1:1 映射为 25 个 MCP 工具（`launch`/`attach`/`status`/`list`/`kill`/
+`break_at`/`break_in`/`catch`/`breakpoints`/`clear`/`run`/`cont`/`step`/`next`/`step_out`/`where`/
+`locals`/`print`/`dump`/`eval`/`threads`/`thread`/`frame`/`list_source`/`raw`），命名用 snake_case，
+参数用 JSON object。`daemon` 控制命令不暴露为工具。详见 §2.5。
+
 ## 5. RunState 状态机
 
 ```
@@ -138,6 +189,7 @@ Loaded  ──run──►  Suspended  ──cont/step/next──►  Suspended
 | 4. daemon + IPC + client + registry | ✅ 完成 | interprocess 命名管道、auto-spawn、SessionManager、磁盘注册表 |
 | 5. cli.rs + output.rs | ✅ 完成 | clap 完整命令面 + 文本/JSON 渲染 |
 | 6. SKILL.md + plugin manifest | ✅ 完成 | native-first `skills/jdbg/SKILL.md` + `.claude-plugin/{plugin,marketplace}.json`，subagent 应用场景验证通过 |
+| 7. MCP server | ✅ 完成 | `src/mcp/{mod,jsonrpc,tools}.rs`：手写 stdio JSON-RPC、25 工具 1:1 映射、`.mcp.json` + plugin 内联 mcpServers、SKILL.md 改写为 MCP 工具面；真实 jdb e2e 验证（launch→break→run→locals→cont） |
 
 ## 7. 未实现 / TODO 项
 
@@ -148,12 +200,14 @@ Loaded  ──run──►  Suspended  ──cont/step/next──►  Suspended
 | `dump` 输出解析 | 低 | 当前对复杂对象的 dump 回退为 Raw |
 | graceful daemon shutdown | 低 | 当前用 `process::exit(0)`，可改为 shutdown flag |
 | Unix setsid detach | 低 | 当前 Unix detach 只靠 stdio null（Windows 完善，Unix 最小可用） |
-| 集成测试 | 中 | 需要 JDK 的 feature-gated 集成测试（当前只有单元测试 + 手动验证） |
+| 集成测试 | 中 | 需要 JDK 的 feature-gated 集成测试（当前只有单元测试 + 手动/e2e 验证） |
+| MCP plugin 跨平台二进制名 | 中 | `plugin.json` 的 `${CLAUDE_PLUGIN_ROOT}/bin/jdbg` 在 Windows 需 `.exe`，plugin.json 无法按平台分支；打包阶段需按平台放对应二进制。开发期用 `.mcp.json` 不受影响 |
 
-### 7.2 已完成（本轮）
+### 7.2 已完成（历史轮次）
 
 | 功能 | 说明 |
 |------|------|
+| **MCP server（本轮）** | `src/mcp/{jsonrpc,tools,mod}.rs`：手写极简 stdio JSON-RPC 2.0（无 tokio，零新增依赖），25 工具 1:1 映射现有子命令，复用 `client::send_request` + `output::render`，daemon/session/jdb 零改动。`.mcp.json` + `plugin.json` 内联 mcpServers，SKILL.md 改写为 MCP 工具面（保留何时用/react-to-each-result）。21 个新单测 + 真实 jdb e2e。**关键修复：Windows 句柄继承泄漏**——MCP server `run_mcp()` 入口用零依赖 `SetHandleInformation` 裸 FFI 清除自身 stdout/stderr 的 `HANDLE_FLAG_INHERIT`，否则 auto-spawn 的 detached daemon 继承 MCP 的 stdout 管道写端，使 Claude 端读不到 EOF。 |
 | **Roadmap 6: SKILL.md + plugin** | native-first `skills/jdbg/SKILL.md`（命令面 §7、stateful "react to each result" 工作流、JDWP 版本感知启用、`-g` 提示、attach；剔除参考的 WSL/temp/sleep/`--auto-inspect`）+ `.claude-plugin/{plugin,marketplace}.json`。subagent 应用场景验证通过（仅凭 skill 正确驱动 launch→break→run→inspect）。 |
 | **Attach 模式** | `Session::attach` + `process::spawn_attach` + `manager::create_attach`，handler 顶层路由。**关键修复：用 `-connect com.sun.jdi.SocketAttach:hostname=H,port=P` 而非 `jdb -attach host:port`**——Windows 上 `-attach` 默认走共享内存(dt_shmem)，与 JDWP dt_socket 不匹配会 attach 失败、jdb 立即退出。attach 后排空 `VM Started` 异步 banner 避免输出滞后；失败路径捕获 stderr 报错。`run` 在 attach 模式被拒绝。 |
 | jdkpath 常见目录扫描 | `find_jdb` 第 4 步扫描 `Program Files\Java\*`、`.jdks\*`、Eclipse Adoptium、Microsoft、`/usr/lib/jvm/*`、macOS bundle 布局；纯 `std::fs`，无新依赖。 |
@@ -175,6 +229,10 @@ Loaded  ──run──►  Suspended  ──cont/step/next──►  Suspended
 | directories | 6 | 平台数据目录定位 |
 | rand | 0.9 | 生成 session ID |
 | jiff | 0.2 | 时间戳 |
+
+> MCP server **零新增依赖**：手写 JSON-RPC（serde_json）、Windows 句柄修复用 `std` 裸 FFI（kernel32
+> `SetHandleInformation`，无 windows/winapi crate）。刻意排除 `rmcp`（会引入 tokio）、`tokio`、`once_cell`、
+> `nix`、`daemonize`、ConPTY、TCP/RPC 框架。
 
 ## 9. 构建与运行
 
@@ -219,3 +277,19 @@ jdbg daemon stop                          → Daemon stopped
 - ✅ 阻塞命令（run/step/cont）正确跳过中间裸 prompt，等待事件
 - ✅ locale 强制生效（jdb 输出英文）
 - ✅ 文本渲染人类可读、JSON 渲染机器可解析
+
+**MCP 路径 e2e**（同机，喂 JSON-RPC 到 `jdbg __mcp` stdin）：
+
+```
+initialize                                → serverInfo=jdbg, capabilities.tools
+tools/list                                → 25 工具，每个 inputSchema.type=object
+tools/call launch {main_class,classpath}  → Session created (loaded)
+tools/call break_at {class,line:9}        → Breakpoint set (deferred)
+tools/call run {timeout:30}               → Breakpoint hit: Main.main() line=9
+tools/call locals                         → count=3, label="hello", sum=3
+tools/call cont                           → The application exited
+```
+
+- ✅ 完整链路 Claude → MCP server → daemon → jdb → JVM，结构化结果正确（1.3s 完成）
+- ✅ 句柄修复后 auto-spawn daemon 不再泄漏 stdout 管道，进程干净退出
+- ✅ 37 个库单测全绿（16 既有 + 21 MCP，零破坏）

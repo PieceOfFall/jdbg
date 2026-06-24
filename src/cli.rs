@@ -191,6 +191,10 @@ pub enum Commands {
     /// Hidden: run as daemon (auto-spawned by CLI).
     #[command(name = "__daemon", hide = true)]
     Daemon_,
+
+    /// Hidden: run as MCP server over stdio (spawned by Claude Code).
+    #[command(name = "__mcp", hide = true)]
+    Mcp_,
 }
 
 #[derive(Subcommand, Debug)]

@@ -16,5 +16,11 @@
   ],
   "author": {
     "name": "luyiwen"
+  },
+  "mcpServers": {
+    "jdbg": {
+      "command": "${CLAUDE_PLUGIN_ROOT}/bin/jdbg",
+      "args": ["__mcp"]
+    }
   }
 }

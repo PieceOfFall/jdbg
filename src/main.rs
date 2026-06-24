@@ -7,6 +7,7 @@ use clap::Parser;
 use java_agent_debugger::cli::{Cli, Commands, DaemonAction};
 use java_agent_debugger::client;
 use java_agent_debugger::daemon;
+use java_agent_debugger::mcp;
 use java_agent_debugger::output;
 use java_agent_debugger::protocol::*;
 
@@ -17,6 +18,15 @@ fn main() -> ExitCode {
     if matches!(cli.command, Commands::Daemon_) {
         if let Err(e) = daemon::run_daemon() {
             eprintln!("daemon error: {e}");
+            return ExitCode::from(1);
+        }
+        return ExitCode::SUCCESS;
+    }
+
+    // 隐藏的 MCP server 模式（stdio，由 Claude Code 拉起）。
+    if matches!(cli.command, Commands::Mcp_) {
+        if let Err(e) = mcp::run_mcp() {
+            eprintln!("mcp error: {e}");
             return ExitCode::from(1);
         }
         return ExitCode::SUCCESS;
@@ -121,6 +131,7 @@ fn build_command(cli: &Cli) -> anyhow::Result<Command> {
         Commands::Raw { command } => Command::Raw { command: command.join(" ") },
         Commands::Daemon { .. } => unreachable!("handled above"),
         Commands::Daemon_ => unreachable!("handled above"),
+        Commands::Mcp_ => unreachable!("handled above"),
     };
     Ok(cmd)
 }
