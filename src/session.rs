@@ -214,6 +214,13 @@ impl Session {
             )));
         }
 
+        // Normal 命令在 Suspended 态发出前，清掉 channel 里可能残留的 stale bare-prompt
+        // （上一条 blocking 命令命中事件后 jdb 迟到补发的 `> `）。此时缓冲本应为空，
+        // 任何残留都是陈旧数据，清掉它避免本次命令读到空响应而错位。
+        if kind.mode == ReadMode::Normal && inner.state == RunState::Suspended {
+            inner.reader.purge_pending();
+        }
+
         inner.process.write_command(raw)?;
         let outcome = inner.reader.read_until_prompt(kind.timeout, kind.mode);
 
@@ -253,11 +260,20 @@ impl Session {
         }
     }
 
-    /// 结束会话：发 `quit`、杀掉 jdb、标记 `Dead`。
+    /// 结束会话：先 resume（确保 VM 不卡在 SUSPEND_ALL）、发 `quit`、等 jdb 退出、标记 `Dead`。
     pub fn kill(&self) -> Result<()> {
         let mut inner = self.inner.lock().expect("session mutex poisoned");
+        // resume 确保 VM 所有线程恢复执行——否则 jdb detach 后 VM 永久卡死。
+        let _ = inner.process.write_command("resume");
         let _ = inner.process.write_command("quit");
-        inner.process.kill()?;
+        // 给 jdb 短暂的时间处理 resume+quit 并正常退出，之后再强杀兜底。
+        for _ in 0..10 {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            if !inner.process.is_alive() {
+                break;
+            }
+        }
+        let _ = inner.process.kill();
         inner.state = RunState::Dead;
         Ok(())
     }

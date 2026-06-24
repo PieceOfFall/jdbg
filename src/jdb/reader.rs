@@ -222,6 +222,22 @@ impl PromptReader {
         let _ = self.take_text();
     }
 
+    /// 非阻塞清空 channel 中已到达的残留字节 + 内部缓冲。
+    /// 在确知缓冲应为空时（Suspended 态下发新命令前）调用：清掉上一条 blocking
+    /// 命令遗留、迟到才到达的 stale bare-prompt `> `，避免它被当成本次命令的空响应。
+    pub fn purge_pending(&mut self) {
+        while let Ok(chunk) = self.rx.try_recv() {
+            match chunk {
+                Some(bytes) => self.push(&bytes),
+                None => {
+                    self.eof = true;
+                    break;
+                }
+            }
+        }
+        let _ = self.take_text();
+    }
+
     /// 检查当前缓冲是否到达某个终止条件。
     fn try_match(&mut self, mode: ReadMode) -> Option<ReadOutcome> {
         // 1. 致命错误优先。
