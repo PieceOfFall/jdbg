@@ -89,7 +89,8 @@
   jdb/                   ← 引擎子系统（spawn / 读取 / 解析）
   jdkpath.rs             ← 定位 jdb
     │
-  error.rs / protocol.rs ← 基础类型（零内部依赖）
+  error.rs / protocol/    ← 基础类型（零内部依赖）
+                            protocol/result.rs（输出 schema）+ protocol/wire.rs（IPC 协议）
   registry.rs            ← 磁盘注册表
 ```
 
@@ -124,7 +125,9 @@ protocol 零改动**。
 | 模块 | 文件 | 职责 |
 |------|------|------|
 | error | `src/error.rs` | `thiserror` Error enum + exit code 映射 |
-| protocol | `src/protocol.rs` | `CommandResult`（§8 输出 schema）+ IPC wire 类型 (Request/Response/Command) |
+| protocol | `src/protocol/mod.rs` | 子模块聚合 + 向后兼容 re-export（`pub use result::*; pub use wire::*`） |
+| protocol/result | `src/protocol/result.rs` | 输出 schema（§8）：`CommandResult` 及其组成类型（Location/StackFrame/VarBinding/Event/…）、`CommandResponse` |
+| protocol/wire | `src/protocol/wire.rs` | IPC wire 类型（§4 JSONL 协议）：`Request`/`Response`/`Command`/`WireError` + 构造 impl |
 | jdkpath | `src/jdkpath.rs` | 定位 jdb：`--jdb-path` → JAVA_HOME → PATH |
 | jdb/process | `src/jdb/process.rs` | Spawn jdb (piped, MANDATORY -J flags)，`write_command` |
 | jdb/reader | `src/jdb/reader.rs` | Prompt-aware 读取器：Normal/Blocking 模式、event 检测、超时 |
@@ -293,3 +296,11 @@ tools/call cont                           → The application exited
 - ✅ 完整链路 Claude → MCP server → daemon → jdb → JVM，结构化结果正确（1.3s 完成）
 - ✅ 句柄修复后 auto-spawn daemon 不再泄漏 stdout 管道，进程干净退出
 - ✅ 37 个库单测全绿（16 既有 + 21 MCP，零破坏）
+
+## 11. 开源项目规范
+
+| 文件 | 说明 |
+|------|------|
+| `README.md` | 英文门面：项目简介、安装、快速上手、CLI 命令面、MCP 工具面、架构概览、构建测试 |
+| `LICENSE` | Apache License 2.0 全文（`Cargo.toml` 的 `license` 字段已同步为 `"Apache-2.0"`） |
+| `.gitignore` | 排除 `/target`、`/out`、`*.class`、`.idea/`、`.codegraph/`、`.cursor/` |
