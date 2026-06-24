@@ -15,6 +15,9 @@ use serde_json::{Value, json};
 const MCP_SERVER_KEY: &str = "jdbg";
 const PERMISSION_ENTRY: &str = "mcp__jdbg__*";
 
+/// skill 文档，编译期内嵌进二进制——保证 prebuilt 安装（机器上没有仓库 skills/ 目录）也带 skill。
+const SKILL_MD: &str = include_str!("../skills/jdbg/SKILL.md");
+
 fn mcp_server_value() -> Value {
     json!({
         "command": "jdbg",
@@ -40,6 +43,11 @@ pub fn claude_settings_path() -> Result<PathBuf> {
     Ok(home_dir()?.join(".claude").join("settings.json"))
 }
 
+/// `~/.claude/skills/jdbg/`
+pub fn skill_dir() -> Result<PathBuf> {
+    Ok(home_dir()?.join(".claude").join("skills").join("jdbg"))
+}
+
 // ─── JSON 读写 ───────────────────────────────────────────────────────────────
 
 fn read_json(path: &Path) -> Value {
@@ -59,6 +67,28 @@ fn write_json(path: &Path, value: &Value) -> Result<()> {
     fs::write(&tmp, content.as_bytes())?;
     fs::rename(&tmp, path).context("atomic rename failed")?;
     Ok(())
+}
+
+// ─── skill 安装/卸载 ─────────────────────────────────────────────────────────
+
+/// 把内嵌的 skill 写入全局 skill 目录，返回写入路径。
+fn install_skill() -> Result<PathBuf> {
+    let dir = skill_dir()?;
+    fs::create_dir_all(&dir)?;
+    let path = dir.join("SKILL.md");
+    fs::write(&path, SKILL_MD)?;
+    Ok(path)
+}
+
+/// 删除全局 skill 目录；返回是否确有删除。
+fn remove_skill() -> Result<bool> {
+    let dir = skill_dir()?;
+    if dir.exists() {
+        fs::remove_dir_all(&dir)?;
+        Ok(true)
+    } else {
+        Ok(false)
+    }
 }
 
 // ─── 纯逻辑：mcpServers 增删 ──────────────────────────────────────────────────
@@ -162,10 +192,11 @@ pub fn run_setup(remove: bool, print: bool) -> Result<()> {
         if p {
             write_json(&settings_path, &settings)?;
         }
-        if c || p {
-            println!("✓ Removed jdbg MCP server from Claude Code config.");
+        let s = remove_skill()?;
+        if c || p || s {
+            println!("✓ Removed jdbg MCP server and skill from Claude Code config.");
         } else {
-            println!("jdbg MCP server was not registered — nothing to remove.");
+            println!("jdbg was not registered — nothing to remove.");
         }
     } else {
         let mut config = read_json(&config_path);
@@ -174,9 +205,11 @@ pub fn run_setup(remove: bool, print: bool) -> Result<()> {
         apply_perm_install(&mut settings);
         write_json(&config_path, &config)?;
         write_json(&settings_path, &settings)?;
-        println!("✓ Registered jdbg MCP server for Claude Code.");
+        let skill_path = install_skill()?;
+        println!("✓ Registered jdbg MCP server and skill for Claude Code.");
         println!("  config:   {}", config_path.display());
         println!("  settings: {}", settings_path.display());
+        println!("  skill:    {}", skill_path.display());
         println!("  Restart Claude Code (or reload) to pick up the new server.");
     }
     Ok(())
@@ -286,6 +319,14 @@ mod tests {
         let changed = apply_perm_remove(&mut settings);
         assert!(!changed);
         assert_eq!(settings["other"], json!(true));
+    }
+
+    #[test]
+    fn skill_is_embedded() {
+        // include_str! 必须在编译期把 SKILL.md 打进二进制（prebuilt 安装不带仓库文件）。
+        assert!(SKILL_MD.contains("name: jdbg"));
+        assert!(SKILL_MD.contains("interactive Java debugging"));
+        assert!(SKILL_MD.len() > 500);
     }
 }
 
