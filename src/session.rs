@@ -223,6 +223,15 @@ impl Session {
             return Err(Error::Connection(message.clone()));
         }
 
+        // Blocking 命令命中事件（断点/异常/单步）后，jdb 可能在 reader 匹配 prompt 之后的极短
+        // 窗口里继续 flush 尾部输出（源码行、追加 prompt 等）。排空这些残留，否则下一条命令会
+        // 读到错位的滞后内容（attach+suspend=n 高并发场景下尤其明显）。
+        if kind.mode == ReadMode::Blocking
+            && matches!(&outcome, ReadOutcome::Prompt { event: Some(_), .. })
+        {
+            inner.reader.drain_stale();
+        }
+
         let stderr = self.take_stderr();
         Ok(inner.map_outcome(outcome, kind.hint, stderr))
     }

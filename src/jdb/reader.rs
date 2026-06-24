@@ -209,6 +209,19 @@ impl PromptReader {
         out
     }
 
+    /// 排空 channel 中已到达或即将到达的残留字节，清空内部缓冲。
+    /// 用于 blocking 命令返回后消除尾部输出（bare prompt 残留、源码行等）。
+    /// 循环 recv_timeout(100ms)：确保把 jdb 正在 flush 的尾部字节全收完再丢弃。
+    pub fn drain_stale(&mut self) {
+        loop {
+            match self.rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(Some(bytes)) => self.push(&bytes),
+                _ => break,
+            }
+        }
+        let _ = self.take_text();
+    }
+
     /// 检查当前缓冲是否到达某个终止条件。
     fn try_match(&mut self, mode: ReadMode) -> Option<ReadOutcome> {
         // 1. 致命错误优先。
