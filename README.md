@@ -10,14 +10,11 @@
 - **Two access paths** — CLI (`jdbg <cmd>`) and MCP server (`jdbg __mcp`) for native tool calls from Claude Code.
 - **Structured output** — human-readable text by default, `--json` for machine consumption.
 
-## Installation
+## Get Started
 
-Every install method drops `jdbg` (or `jdbg.exe` on Windows) onto your `PATH`, so the
-MCP plugin's bare `jdbg` command resolves on every platform — no per-OS binary name to configure.
+### 1. Install the CLI
 
-### Prebuilt binaries (recommended)
-
-The installers fetch the right build for your OS/arch from the latest GitHub Release and add it to `PATH`.
+The installer fetches the right build for your OS/arch from the latest GitHub Release and adds `jdbg` to your `PATH`.
 
 **macOS / Linux**
 
@@ -31,29 +28,38 @@ curl --proto '=https' --tlsv1.2 -LsSf https://github.com/PieceOfFall/jdbg/releas
 powershell -ExecutionPolicy Bypass -c "irm https://github.com/PieceOfFall/jdbg/releases/latest/download/java-agent-debugger-installer.ps1 | iex"
 ```
 
-### Via cargo
+> The installer edits your **user-level** `PATH` (no admin needed). **Open a new terminal** afterwards so `jdbg` resolves.
+
+<details>
+<summary><b>Already have Rust?</b> Install via cargo or from source.</summary>
 
 ```bash
+# via cargo (installs to ~/.cargo/bin/jdbg)
 cargo install --git https://github.com/PieceOfFall/jdbg.git
-# Installs to ~/.cargo/bin/jdbg
-```
 
-### From source
-
-```bash
+# from source
 git clone https://github.com/PieceOfFall/jdbg.git
 cd jdbg
-cargo build --release
-# Binary at target/release/jdbg (or jdbg.exe on Windows)
+cargo build --release   # binary at target/release/jdbg
 ```
 
-### Requirements
+</details>
 
-- JDK 8–21+ with `jdb` on PATH or discoverable via `JAVA_HOME`
-- Rust 1.85+ (edition 2024) — only for the `cargo`/from-source methods
-- For debugging: compile your Java code with `javac -g` (debug info for locals/line breakpoints)
+### 2. Register with Claude Code
 
-## Quick Start
+One command wires `jdbg` into Claude Code as an MCP server:
+
+```bash
+jdbg setup
+```
+
+This writes the MCP server entry to `~/.claude.json` and an auto-allow permission (`mcp__jdbg__*`) to `~/.claude/settings.json`. **Restart Claude Code** to pick up the new server — its tools then appear as `mcp__jdbg__<tool>`.
+
+```bash
+jdbg setup --print    # preview the config snippet without writing anything
+```
+
+### 3. Start debugging
 
 ```bash
 # Compile the target program with debug info
@@ -80,6 +86,20 @@ jdbg kill
 jdbg daemon stop
 ```
 
+In Claude Code, just ask it to debug — it drives the same flow through the `mcp__jdbg__*` tools.
+
+### Uninstall
+
+```bash
+jdbg setup --remove   # removes the MCP server entry and the permission; leaves the binary
+```
+
+## Requirements
+
+- JDK 8–21+ with `jdb` on PATH or discoverable via `JAVA_HOME`
+- Rust 1.85+ (edition 2024) — only for the `cargo`/from-source install methods
+- For debugging: compile your Java code with `javac -g` (debug info for locals/line breakpoints)
+
 ## CLI Commands
 
 ```
@@ -103,7 +123,8 @@ jdbg where [--all] | locals | print <expr> | dump <obj> | eval <expr>
 jdbg threads | thread <id> | frame <up|down> [n] | list-source [line]
 jdbg raw <jdb command...>
 
-# Global flags
+# Setup / global flags
+jdbg setup [--remove] [--print]
 --session <id>   target a specific session (defaults to the sole live one)
 --json           machine-readable JSON output
 --timeout <secs> override per-command timeout
@@ -116,7 +137,8 @@ jdbg raw <jdb command...>
 (`launch`, `break_at`, `run`, `locals`, `cont`, …) so Claude Code can drive a debug session without
 going through Bash. Tools appear as `mcp__jdbg__<tool>`.
 
-During development, point your MCP config at the dev binary:
+`jdbg setup` ([Get Started step 2](#2-register-with-claude-code)) wires this up for you. To configure it
+manually instead — or to point at a **dev build** while hacking on jdbg itself:
 
 ```json
 {
@@ -126,29 +148,7 @@ During development, point your MCP config at the dev binary:
 }
 ```
 
-For production (after installing `jdbg` to PATH), use the bare command:
-
-```json
-{
-  "mcpServers": {
-    "jdbg": { "command": "jdbg", "args": ["__mcp"] }
-  }
-}
-```
-
 The repo ships `.mcp.json` (dev) and `.claude-plugin/plugin.json` (distribution) wiring this up.
-
-### One-command registration
-
-After installing `jdbg`, run:
-
-```bash
-jdbg setup          # writes MCP config + auto-allow permissions
-jdbg setup --remove # reverse: removes both entries
-jdbg setup --print  # just print the config snippet, don't write anything
-```
-
-This writes to `~/.claude.json` (MCP server) and `~/.claude/settings.json` (tool permissions).
 
 ## Architecture
 
@@ -181,7 +181,7 @@ See [`DESIGN.md`](DESIGN.md) for the full design reference (Chinese).
 ```bash
 cargo build          # debug build
 cargo build --release
-cargo test           # 37 unit tests (parser, protocol mapping, MCP tools, session)
+cargo test           # 48 unit tests (parser, protocol mapping, MCP tools, session, setup)
 ```
 
 The parser is validated against captured real-jdb transcripts under `tests/fixtures/jdb/`. Pure logic
