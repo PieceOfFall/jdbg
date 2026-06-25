@@ -266,9 +266,17 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
 
 // ─── Enrichment helpers ─────────────────────────────────────────────────────────
 
+/// 追加一条消息到 resp.note（多条用换行分隔）。
+fn append_note(resp: &mut CommandResponse, msg: &str) {
+    match &mut resp.note {
+        Some(existing) => { existing.push('\n'); existing.push_str(msg); }
+        None => resp.note = Some(msg.to_string()),
+    }
+}
+
 /// 线程级 suspend：仅保持命中线程挂起，恢复其他线程（ZK 心跳等）。
 /// 利用 suspend count 技巧：先 suspend <id>（count +1），再 resume all（count -1）。
-/// 失败时静默退回 SUSPEND_ALL（安全）。
+/// 失败时退回 SUSPEND_ALL 并在 note 中报告 warning。
 fn apply_suspend_policy(session: &Session, resp: &mut CommandResponse, timeout: Option<u64>) {
     let (spec, thread_name) = match &resp.result {
         CommandResult::Stopped { event: Event::Breakpoint { location, .. }, thread, .. } => {
@@ -284,28 +292,41 @@ fn apply_suspend_policy(session: &Session, resp: &mut CommandResponse, timeout: 
 
     let hex_id = match session.resolve_thread_id(&thread_name, timeout) {
         Some(id) => id,
-        None => return,
+        None => {
+            append_note(resp, &format!(
+                "WARNING: suspend policy is 'thread' but could not resolve thread \"{}\" to a hex ID — \
+                 falling back to suspend=all (all threads frozen).",
+                thread_name
+            ));
+            return;
+        }
     };
 
     // suspend count +1（命中线程 → count=2）
-    if session.raw(&format!("suspend {hex_id}"), timeout).is_err() {
+    if let Err(e) = session.raw(&format!("suspend {hex_id}"), timeout) {
+        append_note(resp, &format!(
+            "WARNING: suspend policy is 'thread' but `suspend {}` failed ({}) — \
+             falling back to suspend=all (all threads frozen).",
+            hex_id, e
+        ));
         return;
     }
 
     // resume all（全部 count -1：命中线程 2→1 仍挂，其他 1→0 恢复）
-    if session.raw("resume", timeout).is_err() {
+    if let Err(e) = session.raw("resume", timeout) {
         let _ = session.raw(&format!("resume {hex_id}"), timeout);
+        append_note(resp, &format!(
+            "WARNING: suspend policy is 'thread' but `resume` (all) failed ({}) — \
+             rolled back suspend count; falling back to suspend=all (all threads frozen).",
+            e
+        ));
         return;
     }
 
-    let note_msg = format!(
+    append_note(resp, &format!(
         "Suspend policy: thread — only \"{}\" ({}) is suspended; other threads continue.",
         thread_name, hex_id
-    );
-    match &mut resp.note {
-        Some(existing) => { existing.push('\n'); existing.push_str(&note_msg); }
-        None => resp.note = Some(note_msg),
-    }
+    ));
 }
 
 /// 条件断点循环：如果命中的断点有条件且条件为 false，自动 cont 继续。
@@ -326,12 +347,26 @@ fn eval_condition_loop(session: &Session, mut resp: CommandResponse, timeout: Op
 
         // eval 条件表达式
         let cond_result = session.print(&condition, Some(5));
-        let should_stop = match cond_result {
-            Ok(ref r) => match &r.result {
+        let should_stop = match &cond_result {
+            Ok(r) => match &r.result {
                 CommandResult::Value { value, .. } => value.trim() == "true",
-                _ => true, // eval 失败 → 停下让用户看
+                _ => {
+                    append_note(&mut resp, &format!(
+                        "WARNING: conditional breakpoint eval of \"{}\" returned unexpected result — \
+                         stopping to let you inspect.",
+                        condition
+                    ));
+                    true
+                }
             },
-            Err(_) => true,
+            Err(e) => {
+                append_note(&mut resp, &format!(
+                    "WARNING: conditional breakpoint eval of \"{}\" failed ({}) — \
+                     stopping to let you inspect.",
+                    condition, e
+                ));
+                true
+            }
         };
 
         if should_stop {
@@ -341,39 +376,91 @@ fn eval_condition_loop(session: &Session, mut resp: CommandResponse, timeout: Op
         // 条件不满足，自动 cont
         match session.cont(timeout) {
             Ok(next_resp) => resp = next_resp,
-            Err(_) => return resp,
+            Err(e) => {
+                append_note(&mut resp, &format!(
+                    "WARNING: conditional breakpoint auto-cont failed ({}) — \
+                     returning current stop location.",
+                    e
+                ));
+                return resp;
+            }
         }
     }
+    append_note(&mut resp, "WARNING: conditional breakpoint hit 100 iterations without condition becoming true — stopping to prevent infinite loop.");
     resp
 }
 
-/// 阻塞命令返回 Stopped 后，自动获取栈帧 + 源码上下文（best-effort）。
+/// 阻塞命令返回 Stopped 后，自动获取栈帧 + 源码上下文。
+/// 失败时在 note 中报告 warning（不静默忽略）。
 fn enrich_stopped(session: &Session, resp: &mut CommandResponse) {
-    let (location_line, frame_ref, source_ref) = match &mut resp.result {
+    // 先提取需要的信息（避免长生命周期可变借用）。
+    let (location_line, needs_frame, needs_source) = match &resp.result {
         CommandResult::Stopped { location, frame, source_context, .. } => {
-            (location.line, frame, source_context)
+            (location.line, frame.is_none(), source_context.is_none())
         }
         _ => return,
     };
 
-    // 填充 frame（top of stack）
-    if frame_ref.is_none() {
-        if let Ok(stack_resp) = session.stack(Some(5)) {
-            if let CommandResult::StackTrace { frames } = &stack_resp.result {
-                if let Some(top) = frames.first() {
-                    *frame_ref = Some(top.clone());
+    // 收集 enrichment 数据（独立于 resp 的借用）。
+    let mut frame_data = None;
+    let mut source_data = None;
+    let mut warnings: Vec<String> = Vec::new();
+
+    if needs_frame {
+        match session.stack(Some(5)) {
+            Ok(stack_resp) => {
+                if let CommandResult::StackTrace { frames } = &stack_resp.result {
+                    if let Some(top) = frames.first() {
+                        frame_data = Some(top.clone());
+                    }
                 }
+            }
+            Err(e) => {
+                warnings.push(format!(
+                    "WARNING: failed to enrich stack frame: {e}"
+                ));
             }
         }
     }
 
-    // 填充 source_context
-    if source_ref.is_none() && location_line > 0 {
-        if let Ok(src_resp) = session.list_source(Some(location_line), Some(5)) {
-            if let CommandResult::Source { lines, .. } = src_resp.result {
-                *source_ref = Some(lines);
+    if needs_source && location_line > 0 {
+        match session.list_source(Some(location_line), Some(5)) {
+            Ok(src_resp) => {
+                if let CommandResult::Source { lines, .. } = src_resp.result {
+                    source_data = Some(lines);
+                }
+            }
+            Err(e) => {
+                warnings.push(format!(
+                    "WARNING: failed to enrich source context: {e}"
+                ));
             }
         }
+    }
+
+    // 写回结果。
+    if let CommandResult::Stopped { frame, source_context, .. } = &mut resp.result {
+        if frame.is_none() {
+            *frame = frame_data;
+        }
+        if source_context.is_none() {
+            *source_context = source_data;
+        }
+
+        if frame.is_none() && needs_frame {
+            warnings.push(
+                "WARNING: could not retrieve stack frame (enrichment skipped — `where` may return unexpected format).".into()
+            );
+        }
+        if source_context.is_none() && needs_source && location_line > 0 {
+            warnings.push(
+                "WARNING: could not retrieve source context (enrichment skipped — is sourcepath set and class compiled with -g?).".into()
+            );
+        }
+    }
+
+    for w in &warnings {
+        append_note(resp, w);
     }
 }
 
@@ -386,7 +473,7 @@ fn check_line_mismatch(session: &Session, resp: &mut CommandResponse) {
 
     if let Some((ref cls, req_line)) = session.take_break_target() {
         if cls == &location.class && req_line != location.line {
-            resp.note = Some(format!(
+            append_note(resp, &format!(
                 "Breakpoint requested at line {} but hit at line {} — \
                  JVM rounded to nearest executable bytecode.",
                 req_line, location.line

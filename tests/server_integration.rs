@@ -633,6 +633,13 @@ fn try_get_element_helper(
     None
 }
 
+fn append_note_helper(resp: &mut CommandResponse, msg: &str) {
+    match &mut resp.note {
+        Some(existing) => { existing.push('\n'); existing.push_str(msg); }
+        None => resp.note = Some(msg.to_string()),
+    }
+}
+
 /// Mirror of handler.rs `apply_suspend_policy` — thread-level suspend via suspend-count trick.
 fn apply_suspend_policy_test_helper(session: &Session, resp: &mut CommandResponse, timeout: Option<u64>) {
     let (spec, thread_name) = match &resp.result {
@@ -649,26 +656,39 @@ fn apply_suspend_policy_test_helper(session: &Session, resp: &mut CommandRespons
 
     let hex_id = match session.resolve_thread_id(&thread_name, timeout) {
         Some(id) => id,
-        None => return,
+        None => {
+            append_note_helper(resp, &format!(
+                "WARNING: suspend policy is 'thread' but could not resolve thread \"{}\" to a hex ID — \
+                 falling back to suspend=all (all threads frozen).",
+                thread_name
+            ));
+            return;
+        }
     };
 
     // suspend count +1
-    if session.raw(&format!("suspend {hex_id}"), timeout).is_err() {
+    if let Err(e) = session.raw(&format!("suspend {hex_id}"), timeout) {
+        append_note_helper(resp, &format!(
+            "WARNING: suspend policy is 'thread' but `suspend {}` failed ({}) — \
+             falling back to suspend=all (all threads frozen).",
+            hex_id, e
+        ));
         return;
     }
 
     // resume all (count -1)
-    if session.raw("resume", timeout).is_err() {
+    if let Err(e) = session.raw("resume", timeout) {
         let _ = session.raw(&format!("resume {hex_id}"), timeout);
+        append_note_helper(resp, &format!(
+            "WARNING: suspend policy is 'thread' but `resume` (all) failed ({}) — \
+             rolled back suspend count; falling back to suspend=all (all threads frozen).",
+            e
+        ));
         return;
     }
 
-    let note_msg = format!(
+    append_note_helper(resp, &format!(
         "Suspend policy: thread — only \"{}\" ({}) is suspended; other threads continue.",
         thread_name, hex_id
-    );
-    match &mut resp.note {
-        Some(existing) => { existing.push('\n'); existing.push_str(&note_msg); }
-        None => resp.note = Some(note_msg),
-    }
+    ));
 }
