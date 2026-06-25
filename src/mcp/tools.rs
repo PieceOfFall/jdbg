@@ -481,4 +481,67 @@ mod tests {
         let req = dispatch_tool("inspect", &json!({"expr": "arr", "max_elements": 5})).unwrap();
         assert!(matches!(req.cmd, Command::Inspect { ref expr, max_elements } if expr == "arr" && max_elements == 5));
     }
+
+    // ─── suspend parameter tests ─────────────────────────────────────────────
+
+    #[test]
+    fn break_at_suspend_thread_maps() {
+        let req = dispatch_tool("break_at", &json!({"class": "Main", "line": 10, "suspend": "thread"})).unwrap();
+        match req.cmd {
+            Command::BreakAt { suspend, .. } => assert_eq!(suspend, Some("thread".to_string())),
+            other => panic!("expected BreakAt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn break_at_suspend_all_maps() {
+        let req = dispatch_tool("break_at", &json!({"class": "Main", "line": 10, "suspend": "all"})).unwrap();
+        match req.cmd {
+            Command::BreakAt { suspend, .. } => assert_eq!(suspend, Some("all".to_string())),
+            other => panic!("expected BreakAt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn break_at_suspend_absent_is_none() {
+        let req = dispatch_tool("break_at", &json!({"class": "Main", "line": 10})).unwrap();
+        match req.cmd {
+            Command::BreakAt { suspend, .. } => assert_eq!(suspend, None),
+            other => panic!("expected BreakAt, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn break_in_suspend_thread_maps() {
+        let req = dispatch_tool("break_in", &json!({"class": "Main", "method": "foo", "suspend": "thread"})).unwrap();
+        match req.cmd {
+            Command::BreakIn { suspend, .. } => assert_eq!(suspend, Some("thread".to_string())),
+            other => panic!("expected BreakIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn break_in_suspend_absent_is_none() {
+        let req = dispatch_tool("break_in", &json!({"class": "Main", "method": "foo"})).unwrap();
+        match req.cmd {
+            Command::BreakIn { suspend, .. } => assert_eq!(suspend, None),
+            other => panic!("expected BreakIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn break_at_with_condition_and_suspend() {
+        let req = dispatch_tool("break_at", &json!({
+            "class": "Main", "line": 10,
+            "condition": "x > 5",
+            "suspend": "thread"
+        })).unwrap();
+        match req.cmd {
+            Command::BreakAt { condition, suspend, .. } => {
+                assert_eq!(condition, Some("x > 5".to_string()));
+                assert_eq!(suspend, Some("thread".to_string()));
+            }
+            other => panic!("expected BreakAt, got {other:?}"),
+        }
+    }
 }

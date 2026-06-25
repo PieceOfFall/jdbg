@@ -309,6 +309,217 @@ fn attach_to_unreachable_port_gives_clear_error() {
     );
 }
 
+// ─── Phase: thread suspend policy (per-breakpoint) ───
+
+#[test]
+fn suspend_policy_stored_and_retrieved() {
+    let session = launch_fixture("CollectionTest");
+
+    // 初始无 policy
+    assert_eq!(session.get_suspend_policy("CollectionTest:10"), None);
+
+    // 设置 thread policy
+    session.set_suspend_policy("CollectionTest:10", "thread");
+    assert_eq!(session.get_suspend_policy("CollectionTest:10"), Some("thread".to_string()));
+
+    // 设置 all policy
+    session.set_suspend_policy("CollectionTest:10", "all");
+    assert_eq!(session.get_suspend_policy("CollectionTest:10"), Some("all".to_string()));
+
+    // 不同 spec 独立
+    session.set_suspend_policy("Foo.bar", "thread");
+    assert_eq!(session.get_suspend_policy("Foo.bar"), Some("thread".to_string()));
+    assert_eq!(session.get_suspend_policy("CollectionTest:10"), Some("all".to_string()));
+
+    let _ = session.kill();
+}
+
+#[test]
+fn thread_breakpoint_stops_and_notes_thread_policy() {
+    let session = launch_fixture("ThreadTest");
+
+    // 在 doWork 第一行设置 thread breakpoint
+    let bp_resp = session
+        .stop_at("ThreadTest", 37, None, None)
+        .expect("stop_at failed");
+    assert!(
+        matches!(bp_resp.result, CommandResult::BreakpointSet { .. }),
+        "expected BreakpointSet, got {:?}",
+        bp_resp.result
+    );
+
+    // 注册 thread suspend policy
+    session.set_suspend_policy("ThreadTest:37", "thread");
+
+    // 运行
+    let run_resp = session.run(Some(30)).expect("run failed");
+
+    // 应该停在 doWork 里
+    match &run_resp.result {
+        CommandResult::Stopped { location, thread, .. } => {
+            assert_eq!(location.class, "ThreadTest");
+            assert_eq!(location.method, "doWork");
+            // thread 应该是 "worker"
+            assert_eq!(thread, "worker");
+        }
+        other => panic!("expected Stopped in doWork, got {other:?}"),
+    }
+
+    // 模拟 apply_suspend_policy
+    let mut resp = run_resp;
+    apply_suspend_policy_test_helper(&session, &mut resp, None);
+
+    // 验证 note 中包含 suspend policy 信息
+    assert!(
+        resp.note.is_some(),
+        "thread suspend policy should produce a note"
+    );
+    let note = resp.note.as_ref().unwrap();
+    assert!(
+        note.contains("thread"),
+        "note should mention 'thread', got: {note}"
+    );
+    assert!(
+        note.contains("worker"),
+        "note should mention the thread name 'worker', got: {note}"
+    );
+
+    let _ = session.kill();
+}
+
+#[test]
+fn thread_breakpoint_other_threads_resume() {
+    let session = launch_fixture("ThreadTest");
+
+    // 在 doWork 第一行设置 thread breakpoint
+    session
+        .stop_at("ThreadTest", 37, None, None)
+        .expect("stop_at failed");
+    session.set_suspend_policy("ThreadTest:37", "thread");
+
+    let run_resp = session.run(Some(30)).expect("run failed");
+    assert!(
+        matches!(&run_resp.result, CommandResult::Stopped { .. }),
+        "expected Stopped, got {:?}",
+        run_resp.result
+    );
+
+    // 应用 thread suspend policy
+    let mut resp = run_resp;
+    apply_suspend_policy_test_helper(&session, &mut resp, None);
+
+    // 验证 heartbeat 线程在 apply 后是 running（不再 suspended）
+    // 获取线程列表
+    let threads_resp = session.threads(Some(5)).expect("threads failed");
+    if let CommandResult::Threads { threads } = &threads_resp.result {
+        let heartbeat = threads.iter().find(|t| t.name == "heartbeat");
+        assert!(
+            heartbeat.is_some(),
+            "heartbeat thread should exist in thread list"
+        );
+        let hb = heartbeat.unwrap();
+        // heartbeat 不应该是 "at breakpoint" 状态 — 它应该是 running/sleeping
+        assert!(
+            !hb.state.contains("breakpoint"),
+            "heartbeat should NOT be at breakpoint, state: {}",
+            hb.state
+        );
+    }
+
+    // worker 线程应该仍然 suspended
+    let threads_resp2 = session.threads(Some(5)).expect("threads failed");
+    if let CommandResult::Threads { threads } = &threads_resp2.result {
+        let worker = threads.iter().find(|t| t.name == "worker");
+        assert!(
+            worker.is_some(),
+            "worker thread should exist in thread list"
+        );
+    }
+
+    let _ = session.kill();
+}
+
+#[test]
+fn default_suspend_all_does_not_produce_note() {
+    let session = launch_fixture("ThreadTest");
+
+    // 设置断点但不设置 suspend policy（默认 "all"）
+    session
+        .stop_at("ThreadTest", 37, None, None)
+        .expect("stop_at failed");
+
+    let run_resp = session.run(Some(30)).expect("run failed");
+    assert!(matches!(&run_resp.result, CommandResult::Stopped { .. }));
+
+    // apply_suspend_policy 不应改变什么（policy 默认 = "all"）
+    let mut resp = run_resp;
+    apply_suspend_policy_test_helper(&session, &mut resp, None);
+
+    // 不应有 suspend policy note
+    assert!(
+        resp.note.is_none(),
+        "default 'all' policy should not produce a note, got: {:?}",
+        resp.note
+    );
+
+    let _ = session.kill();
+}
+
+#[test]
+fn explicit_suspend_all_does_not_produce_note() {
+    let session = launch_fixture("ThreadTest");
+
+    session
+        .stop_at("ThreadTest", 37, None, None)
+        .expect("stop_at failed");
+    // 显式设置 "all"
+    session.set_suspend_policy("ThreadTest:37", "all");
+
+    let run_resp = session.run(Some(30)).expect("run failed");
+    assert!(matches!(&run_resp.result, CommandResult::Stopped { .. }));
+
+    let mut resp = run_resp;
+    apply_suspend_policy_test_helper(&session, &mut resp, None);
+
+    assert!(
+        resp.note.is_none(),
+        "explicit 'all' policy should not produce a note, got: {:?}",
+        resp.note
+    );
+
+    let _ = session.kill();
+}
+
+#[test]
+fn resolve_thread_id_finds_worker() {
+    let session = launch_fixture("ThreadTest");
+
+    // 在 doWork 里停住，这时 "worker" 线程存在
+    session
+        .stop_at("ThreadTest", 37, None, None)
+        .expect("stop_at failed");
+    let run_resp = session.run(Some(30)).expect("run failed");
+    assert!(matches!(&run_resp.result, CommandResult::Stopped { .. }));
+
+    // resolve_thread_id 应该找到 "worker"
+    let hex_id = session.resolve_thread_id("worker", Some(5));
+    assert!(
+        hex_id.is_some(),
+        "should resolve 'worker' thread to a hex id"
+    );
+    let id = hex_id.unwrap();
+    assert!(
+        id.starts_with("0x"),
+        "thread id should be hex format (0x...), got: {id}"
+    );
+
+    // 不存在的线程名返回 None
+    let bogus = session.resolve_thread_id("nonexistent-thread-xyz", Some(5));
+    assert!(bogus.is_none(), "nonexistent thread should return None");
+
+    let _ = session.kill();
+}
+
 // ─── Test helpers that mirror handler.rs logic (can't import private fns) ───
 
 fn enrich_stopped_test_helper(session: &Session, resp: &mut CommandResponse) {
@@ -420,4 +631,44 @@ fn try_get_element_helper(
         }
     }
     None
+}
+
+/// Mirror of handler.rs `apply_suspend_policy` — thread-level suspend via suspend-count trick.
+fn apply_suspend_policy_test_helper(session: &Session, resp: &mut CommandResponse, timeout: Option<u64>) {
+    let (spec, thread_name) = match &resp.result {
+        CommandResult::Stopped { event: Event::Breakpoint { location, .. }, thread, .. } => {
+            (format!("{}:{}", location.class, location.line), thread.clone())
+        }
+        _ => return,
+    };
+
+    let policy = session.get_suspend_policy(&spec).unwrap_or_else(|| "all".into());
+    if policy != "thread" {
+        return;
+    }
+
+    let hex_id = match session.resolve_thread_id(&thread_name, timeout) {
+        Some(id) => id,
+        None => return,
+    };
+
+    // suspend count +1
+    if session.raw(&format!("suspend {hex_id}"), timeout).is_err() {
+        return;
+    }
+
+    // resume all (count -1)
+    if session.raw("resume", timeout).is_err() {
+        let _ = session.raw(&format!("resume {hex_id}"), timeout);
+        return;
+    }
+
+    let note_msg = format!(
+        "Suspend policy: thread — only \"{}\" ({}) is suspended; other threads continue.",
+        thread_name, hex_id
+    );
+    match &mut resp.note {
+        Some(existing) => { existing.push('\n'); existing.push_str(&note_msg); }
+        None => resp.note = Some(note_msg),
+    }
 }

@@ -664,4 +664,80 @@ mod tests {
         let custom = n.with_timeout(std::time::Duration::from_secs(5));
         assert_eq!(custom.timeout.as_secs(), 5);
     }
+
+    // ─── suspend_policies unit tests ─────────────────────────────────────────
+
+    /// Helper: build a minimal Session-like struct to test suspend_policies in isolation.
+    /// Since Session requires a real jdb process, we test the Mutex<Vec> logic directly.
+    mod suspend_policy_logic {
+        #[test]
+        fn set_and_get_policy() {
+            let policies: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+            // set
+            {
+                let mut pols = policies.lock().unwrap();
+                pols.retain(|(s, _)| s != "Main:10");
+                pols.push(("Main:10".to_string(), "thread".to_string()));
+            }
+
+            // get
+            let result = policies.lock().unwrap()
+                .iter()
+                .find(|(s, _)| s == "Main:10")
+                .map(|(_, p)| p.clone());
+            assert_eq!(result, Some("thread".to_string()));
+        }
+
+        #[test]
+        fn set_overwrites_previous() {
+            let policies: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+            // set "all"
+            {
+                let mut pols = policies.lock().unwrap();
+                pols.push(("Main:10".to_string(), "all".to_string()));
+            }
+            // overwrite with "thread"
+            {
+                let mut pols = policies.lock().unwrap();
+                pols.retain(|(s, _)| s != "Main:10");
+                pols.push(("Main:10".to_string(), "thread".to_string()));
+            }
+
+            let result = policies.lock().unwrap()
+                .iter()
+                .find(|(s, _)| s == "Main:10")
+                .map(|(_, p)| p.clone());
+            assert_eq!(result, Some("thread".to_string()));
+            assert_eq!(policies.lock().unwrap().len(), 1);
+        }
+
+        #[test]
+        fn get_nonexistent_returns_none() {
+            let policies: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+            let result = policies.lock().unwrap()
+                .iter()
+                .find(|(s, _)| s == "Main:99")
+                .map(|(_, p)| p.clone());
+            assert_eq!(result, None);
+        }
+
+        #[test]
+        fn multiple_specs_independent() {
+            let policies: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
+
+            {
+                let mut pols = policies.lock().unwrap();
+                pols.push(("Main:10".to_string(), "thread".to_string()));
+                pols.push(("Main:20".to_string(), "all".to_string()));
+                pols.push(("Foo.bar".to_string(), "thread".to_string()));
+            }
+
+            let pols = policies.lock().unwrap();
+            assert_eq!(pols.iter().find(|(s, _)| s == "Main:10").map(|(_, p)| p.as_str()), Some("thread"));
+            assert_eq!(pols.iter().find(|(s, _)| s == "Main:20").map(|(_, p)| p.as_str()), Some("all"));
+            assert_eq!(pols.iter().find(|(s, _)| s == "Foo.bar").map(|(_, p)| p.as_str()), Some("thread"));
+        }
+    }
 }
