@@ -90,6 +90,8 @@ pub struct Session {
     last_break_target: Mutex<Option<(String, u32)>>,
     /// 活跃的条件断点：key = "Class:line" 或 "Class.method"，value = condition expr。
     conditions: Mutex<Vec<(String, String)>>,
+    /// 每个断点的 suspend policy：key = "Class:line" 或 "Class.method"，value = "thread" | "all"。
+    suspend_policies: Mutex<Vec<(String, String)>>,
 }
 
 /// 受命令锁保护的可变状态。
@@ -137,6 +139,7 @@ impl Session {
             _stderr_handle: stderr_handle,
             last_break_target: Mutex::new(None),
             conditions: Mutex::new(Vec::new()),
+            suspend_policies: Mutex::new(Vec::new()),
         })
     }
 
@@ -208,6 +211,7 @@ impl Session {
             _stderr_handle: stderr_handle,
             last_break_target: Mutex::new(None),
             conditions: Mutex::new(Vec::new()),
+            suspend_policies: Mutex::new(Vec::new()),
         })
     }
 
@@ -323,6 +327,32 @@ impl Session {
             .iter()
             .find(|(s, _)| s == spec)
             .map(|(_, c)| c.clone())
+    }
+
+    /// 注册断点的 suspend policy。
+    pub fn set_suspend_policy(&self, spec: &str, policy: &str) {
+        let mut pols = self.suspend_policies.lock().expect("suspend_policies mutex poisoned");
+        pols.retain(|(s, _)| s != spec);
+        pols.push((spec.to_string(), policy.to_string()));
+    }
+
+    /// 查询 spec 对应的 suspend policy（None 表示未设置 = 默认 "all"）。
+    pub fn get_suspend_policy(&self, spec: &str) -> Option<String> {
+        self.suspend_policies.lock().expect("suspend_policies mutex poisoned")
+            .iter()
+            .find(|(s, _)| s == spec)
+            .map(|(_, p)| p.clone())
+    }
+
+    /// 通过 `threads` 命令解析线程名对应的 hex ID。
+    pub fn resolve_thread_id(&self, thread_name: &str, timeout: Option<u64>) -> Option<String> {
+        let resp = self.threads(timeout).ok()?;
+        if let CommandResult::Threads { threads } = &resp.result {
+            if let Some(t) = threads.iter().find(|t| t.name == thread_name) {
+                return Some(t.id.clone());
+            }
+        }
+        None
     }
 
     // ── 语义便捷方法（封装 jdb 命令字符串，§7 命令面）──────────────────────────

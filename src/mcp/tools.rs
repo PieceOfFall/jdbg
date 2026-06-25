@@ -65,11 +65,13 @@ pub fn tool_specs() -> Vec<ToolSpec> {
              has not yet executed). The actual hit line may differ if the requested line has no \
              executable bytecode (JVM rounds to the nearest valid line). Breakpoints set before \
              the class loads are deferred and bind on run/cont. Use `condition` to only stop when \
-             a boolean expression is true (e.g. \"userId == 123\").",
+             a boolean expression is true. Use `suspend: \"thread\"` to only suspend the hit thread \
+             (like IDEA's thread breakpoint — keeps ZK/heartbeat threads alive).",
             json!({
                 "class": {"type": "string", "description": "Class name, e.g. com.example.Main."},
                 "line": {"type": "integer", "description": "Source line number (must hold executable code)."},
-                "condition": {"type": "string", "description": "Optional boolean expression — breakpoint only fires when true (e.g. \"i > 5\", \"name.equals(\\\"test\\\")\")."}
+                "condition": {"type": "string", "description": "Optional boolean expression — breakpoint only fires when true (e.g. \"i > 5\", \"name.equals(\\\"test\\\")\")."},
+                "suspend": {"type": "string", "enum": ["all", "thread"], "description": "Suspend policy: 'all' freezes the entire JVM (default), 'thread' only suspends the hit thread (keeps heartbeat/ZK alive — use when debugging a live server)."}
             }),
             &["class", "line"],
             true,
@@ -78,12 +80,14 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         tool(
             "break_in",
             "Set a method-entry breakpoint at Class.method. Use `args` (comma-separated param types) to \
-             disambiguate overloads. Use `condition` to only stop when a boolean expression is true.",
+             disambiguate overloads. Use `condition` to only stop when a boolean expression is true. \
+             Use `suspend: \"thread\"` to only suspend the hit thread (keeps heartbeat threads alive).",
             json!({
                 "class": {"type": "string", "description": "Class name."},
                 "method": {"type": "string", "description": "Method name."},
                 "args": {"type": "string", "description": "Parameter types for overload disambiguation, e.g. 'int,java.lang.String'."},
-                "condition": {"type": "string", "description": "Optional boolean expression — breakpoint only fires when true."}
+                "condition": {"type": "string", "description": "Optional boolean expression — breakpoint only fires when true."},
+                "suspend": {"type": "string", "enum": ["all", "thread"], "description": "Suspend policy: 'all' freezes the entire JVM (default), 'thread' only suspends the hit thread."}
             }),
             &["class", "method"],
             true,
@@ -231,12 +235,14 @@ pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> 
             class: require_str(args, "class")?,
             line: require_u32(args, "line")?,
             condition: optional_str(args, "condition"),
+            suspend: optional_str(args, "suspend"),
         },
         "break_in" => Command::BreakIn {
             class: require_str(args, "class")?,
             method: require_str(args, "method")?,
             args: optional_str(args, "args"),
             condition: optional_str(args, "condition"),
+            suspend: optional_str(args, "suspend"),
         },
         "catch" => Command::Catch {
             exception: require_str(args, "exception")?,

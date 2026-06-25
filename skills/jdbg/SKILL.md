@@ -4,7 +4,7 @@ description: Use when you need a Java program's real runtime state instead of re
 compatibility: Requires a JDK 8+ (provides the `jdb` command). Debugging is driven through the `jdbg` MCP server (tools named `launch`, `break_at`, `run`, `locals`, …). Native on Windows, Linux, macOS.
 allowed-tools: mcp__jdbg__launch, mcp__jdbg__attach, mcp__jdbg__status, mcp__jdbg__list, mcp__jdbg__kill, mcp__jdbg__break_at, mcp__jdbg__break_in, mcp__jdbg__catch, mcp__jdbg__breakpoints, mcp__jdbg__clear, mcp__jdbg__run, mcp__jdbg__cont, mcp__jdbg__step, mcp__jdbg__next, mcp__jdbg__step_out, mcp__jdbg__where, mcp__jdbg__locals, mcp__jdbg__print, mcp__jdbg__dump, mcp__jdbg__eval, mcp__jdbg__threads, mcp__jdbg__thread, mcp__jdbg__frame, mcp__jdbg__list_source, mcp__jdbg__inspect, mcp__jdbg__raw, Bash(javac:*), Bash(java:*), Read
 metadata:
-  version: "2.1"
+  version: "2.2"
 ---
 
 # jdbg — interactive Java debugging for agents
@@ -85,18 +85,29 @@ found via `JAVA_HOME/bin` → PATH → common install dirs).
 ### Breakpoints
 | Tool | Purpose |
 |---|---|
-| `break_at { class, line, condition? }` | break at a source line (optional condition: only stop when expression is true) |
-| `break_in { class, method, args?, condition? }` | break at method entry (`args` = comma-separated param types, disambiguates overloads) |
+| `break_at { class, line, condition?, suspend? }` | break at a source line |
+| `break_in { class, method, args?, condition?, suspend? }` | break at method entry (`args` = comma-separated param types) |
 | `catch { exception, mode? }` | break when an exception is thrown (`mode`: caught \| uncaught \| all) |
 | `breakpoints` · `clear { spec }` | list / remove breakpoints |
 
-Conditional breakpoints are useful when debugging high-traffic code (e.g. a Tomcat handler serving many
-requests) — set `condition` to filter for the specific request you care about:
+**Conditional breakpoints** — filter for a specific request in high-traffic code:
 ```
 break_at { "class": "com.example.CartService", "line": 42, "condition": "userId == 1619458289" }
 ```
-The condition is evaluated at the JVM level each time the breakpoint fires; execution automatically
-continues if the condition is false.
+The condition is evaluated each time the breakpoint fires; execution automatically continues if false.
+
+**Thread breakpoints** (`suspend: "thread"`) — like IDEA's "Suspend: Thread" option. Only the hit thread
+is suspended; all other threads (ZooKeeper heartbeat, Dubbo registry, other HTTP handlers) keep running.
+**Use this when debugging a live server** to prevent the service from being deregistered:
+```
+break_at { "class": "com.example.CartService", "line": 42, "suspend": "thread" }
+```
+The `Stopped` response will include a note confirming thread-level suspend is active. All inspection
+commands (`locals`, `print`, `where`) work normally on the suspended thread. When you `cont`, the next
+breakpoint hit re-applies the same policy automatically.
+
+You can combine both: `{ "condition": "userId == 123", "suspend": "thread" }` — only stop for the
+target user, and only freeze that one request thread when it does stop.
 
 ### Execution control (blocking; larger default timeout)
 | Tool | Purpose |
@@ -207,8 +218,11 @@ When attaching to an external Tomcat (or similar) started with JDWP:
 -agentlib:jdwp=transport=dt_socket,server=y,suspend=n,address=5005
 ```
 - `suspend=n` is correct — it means Tomcat doesn't wait for the debugger at startup
-- Breakpoints **do** properly suspend threads (SUSPEND_ALL) when hit — this is controlled by jdb, not by
-  the `suspend=n` flag
-- The target server will **freeze** (all request processing stops) while stopped at a breakpoint — this is
-  expected with SUSPEND_ALL. Inspect quickly and `cont` to unfreeze
+- By default, breakpoints use SUSPEND_ALL (all threads freeze). **To avoid freezing heartbeat threads**
+  (ZooKeeper, Dubbo registry), use `suspend: "thread"` on your breakpoints:
+  ```
+  break_at { "class": "com.example.Handler", "line": 100, "suspend": "thread" }
+  ```
+  This keeps the service registered in ZK/gateway while you inspect the hit thread.
+- Without `suspend: "thread"`, the server **will freeze** until you `cont` — inspect quickly
 - `kill` resumes the VM before disconnecting so the server continues running afterwards

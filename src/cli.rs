@@ -108,6 +108,9 @@ pub enum Commands {
         /// Conditional expression — breakpoint only fires when true.
         #[arg(long, short = 'c')]
         condition: Option<String>,
+        /// Suspend policy: "all" (default) or "thread" (only suspend hit thread).
+        #[arg(long, short = 's')]
+        suspend: Option<String>,
     },
 
     /// Set a method breakpoint: stop in Class.method.
@@ -122,6 +125,9 @@ pub enum Commands {
         /// Conditional expression — breakpoint only fires when true.
         #[arg(long, short = 'c')]
         condition: Option<String>,
+        /// Suspend policy: "all" (default) or "thread" (only suspend hit thread).
+        #[arg(long, short = 's')]
+        suspend: Option<String>,
     },
 
     /// Catch an exception.

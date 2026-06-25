@@ -151,25 +151,32 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
 
     let result = match &req.cmd {
         // Breakpoints
-        Command::BreakAt { class, line, condition } => {
+        Command::BreakAt { class, line, condition, suspend } => {
             let r = session.stop_at(class, *line, condition.as_deref(), t);
             if r.is_ok() {
                 session.record_break_target(class, *line);
+                let spec = format!("{class}:{line}");
                 if let Some(cond) = condition {
-                    session.add_condition(&format!("{class}:{line}"), cond);
+                    session.add_condition(&spec, cond);
+                }
+                if let Some(sp) = suspend {
+                    session.set_suspend_policy(&spec, sp);
                 }
             }
             r
         }
-        Command::BreakIn { class, method, args, condition } => {
+        Command::BreakIn { class, method, args, condition, suspend } => {
             let r = session.stop_in(class, method, args.as_deref(), condition.as_deref(), t);
             if r.is_ok() {
+                let spec = match args {
+                    Some(a) => format!("{class}.{method}({a})"),
+                    None => format!("{class}.{method}"),
+                };
                 if let Some(cond) = condition {
-                    let spec = match args {
-                        Some(a) => format!("{class}.{method}({a})"),
-                        None => format!("{class}.{method}"),
-                    };
                     session.add_condition(&spec, cond);
+                }
+                if let Some(sp) = suspend {
+                    session.set_suspend_policy(&spec, sp);
                 }
             }
             r
@@ -201,8 +208,8 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
             };
             match r {
                 Ok(mut resp) => {
-                    // 条件断点：命中时 eval 条件，若 false 则自动 cont（循环直到条件满足或非断点停下）。
                     resp = eval_condition_loop(&session, resp, t);
+                    apply_suspend_policy(&session, &mut resp, t);
                     enrich_stopped(&session, &mut resp);
                     check_line_mismatch(&session, &mut resp);
                     return Response::ok(id, resp);
@@ -258,6 +265,48 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
 }
 
 // ─── Enrichment helpers ─────────────────────────────────────────────────────────
+
+/// 线程级 suspend：仅保持命中线程挂起，恢复其他线程（ZK 心跳等）。
+/// 利用 suspend count 技巧：先 suspend <id>（count +1），再 resume all（count -1）。
+/// 失败时静默退回 SUSPEND_ALL（安全）。
+fn apply_suspend_policy(session: &Session, resp: &mut CommandResponse, timeout: Option<u64>) {
+    let (spec, thread_name) = match &resp.result {
+        CommandResult::Stopped { event: Event::Breakpoint { location, .. }, thread, .. } => {
+            (format!("{}:{}", location.class, location.line), thread.clone())
+        }
+        _ => return,
+    };
+
+    let policy = session.get_suspend_policy(&spec).unwrap_or_else(|| "all".into());
+    if policy != "thread" {
+        return;
+    }
+
+    let hex_id = match session.resolve_thread_id(&thread_name, timeout) {
+        Some(id) => id,
+        None => return,
+    };
+
+    // suspend count +1（命中线程 → count=2）
+    if session.raw(&format!("suspend {hex_id}"), timeout).is_err() {
+        return;
+    }
+
+    // resume all（全部 count -1：命中线程 2→1 仍挂，其他 1→0 恢复）
+    if session.raw("resume", timeout).is_err() {
+        let _ = session.raw(&format!("resume {hex_id}"), timeout);
+        return;
+    }
+
+    let note_msg = format!(
+        "Suspend policy: thread — only \"{}\" ({}) is suspended; other threads continue.",
+        thread_name, hex_id
+    );
+    match &mut resp.note {
+        Some(existing) => { existing.push('\n'); existing.push_str(&note_msg); }
+        None => resp.note = Some(note_msg),
+    }
+}
 
 /// 条件断点循环：如果命中的断点有条件且条件为 false，自动 cont 继续。
 /// 最多循环 100 次防止无限 loop。

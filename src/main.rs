@@ -119,9 +119,9 @@ fn build_command(cli: &Cli) -> anyhow::Result<Command> {
         Commands::Status => Command::Status,
         Commands::List => Command::List,
         Commands::Kill => Command::Kill,
-        Commands::BreakAt { class, line, condition } => Command::BreakAt { class: class.clone(), line: *line, condition: condition.clone() },
-        Commands::BreakIn { class, method, args, condition } => {
-            Command::BreakIn { class: class.clone(), method: method.clone(), args: args.clone(), condition: condition.clone() }
+        Commands::BreakAt { class, line, condition, suspend } => Command::BreakAt { class: class.clone(), line: *line, condition: condition.clone(), suspend: suspend.clone() },
+        Commands::BreakIn { class, method, args, condition, suspend } => {
+            Command::BreakIn { class: class.clone(), method: method.clone(), args: args.clone(), condition: condition.clone(), suspend: suspend.clone() }
         }
         Commands::Catch { exception, mode } => {
             Command::Catch { exception: exception.clone(), mode: mode.clone() }

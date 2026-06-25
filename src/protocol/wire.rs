@@ -90,6 +90,8 @@ pub enum Command {
         line: u32,
         #[serde(skip_serializing_if = "Option::is_none")]
         condition: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        suspend: Option<String>,
     },
     BreakIn {
         class: String,
@@ -98,6 +100,8 @@ pub enum Command {
         args: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         condition: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        suspend: Option<String>,
     },
     Catch {
         exception: String,
