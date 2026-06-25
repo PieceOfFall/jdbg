@@ -2,9 +2,9 @@
 name: jdbg
 description: Use when you need a Java program's real runtime state instead of reading source or adding print statements — the actual value of a variable/field/expression at a line, why an exception or NullPointerException is thrown (with stack + locals at the throw site), what a thread is blocked or deadlocked on, or how execution reaches some code. Also for stepping through Java line by line, or attaching to an already-running JVM that has JDWP enabled. Cross-platform, native on Windows, no IDE.
 compatibility: Requires a JDK 8+ (provides the `jdb` command). Debugging is driven through the `jdbg` MCP server (tools named `launch`, `break_at`, `run`, `locals`, …). Native on Windows, Linux, macOS.
-allowed-tools: mcp__jdbg__launch, mcp__jdbg__attach, mcp__jdbg__status, mcp__jdbg__list, mcp__jdbg__kill, mcp__jdbg__break_at, mcp__jdbg__break_in, mcp__jdbg__catch, mcp__jdbg__breakpoints, mcp__jdbg__clear, mcp__jdbg__run, mcp__jdbg__cont, mcp__jdbg__step, mcp__jdbg__next, mcp__jdbg__step_out, mcp__jdbg__where, mcp__jdbg__locals, mcp__jdbg__print, mcp__jdbg__dump, mcp__jdbg__eval, mcp__jdbg__threads, mcp__jdbg__thread, mcp__jdbg__frame, mcp__jdbg__list_source, mcp__jdbg__raw, Bash(javac:*), Bash(java:*), Read
+allowed-tools: mcp__jdbg__launch, mcp__jdbg__attach, mcp__jdbg__status, mcp__jdbg__list, mcp__jdbg__kill, mcp__jdbg__break_at, mcp__jdbg__break_in, mcp__jdbg__catch, mcp__jdbg__breakpoints, mcp__jdbg__clear, mcp__jdbg__run, mcp__jdbg__cont, mcp__jdbg__step, mcp__jdbg__next, mcp__jdbg__step_out, mcp__jdbg__where, mcp__jdbg__locals, mcp__jdbg__print, mcp__jdbg__dump, mcp__jdbg__eval, mcp__jdbg__threads, mcp__jdbg__thread, mcp__jdbg__frame, mcp__jdbg__list_source, mcp__jdbg__inspect, mcp__jdbg__raw, Bash(javac:*), Bash(java:*), Read
 metadata:
-  version: "2.0"
+  version: "2.1"
 ---
 
 # jdbg — interactive Java debugging for agents
@@ -97,12 +97,17 @@ found via `JAVA_HOME/bin` → PATH → common install dirs).
 | `cont` | continue until the next stop |
 | `step` · `next` · `step_out` | step into · over · out of the current method |
 
+These tools return a `Stopped` result that **automatically includes source context** (surrounding source
+lines with `=>` marking the current line) and the **top stack frame** when available. You do NOT need to
+call `list_source` or `where` separately after stopping — the information is already in the response.
+
 ### Inspection (fast)
 | Tool | Purpose |
 |---|---|
 | `locals` | local variables in the current frame |
 | `print { expr }` · `eval { expr }` | value of an expression (can call methods on live objects) |
 | `dump { expr }` | all fields of an object |
+| `inspect { expr, max_elements? }` | show size + first N elements of a collection/array (default 10, max 50) |
 | `where { all? }` | call stack of the current thread (or every thread with `all: true`) |
 | `threads` · `thread { id }` | list threads / switch the current thread |
 | `frame { direction, n? }` | move within the call stack (`direction`: up \| down) |
@@ -111,13 +116,29 @@ found via `JAVA_HOME/bin` → PATH → common install dirs).
 
 ## Reading results & deciding what to do next
 Every tool returns a typed result. The ones that drive the next move:
-- **`Stopped`** — a breakpoint or step landed. Now `locals` / `where` / `print { expr }`.
+- **`Stopped`** — a breakpoint or step landed. The response **already includes** source context (lines around
+  the stop with `=>` marking the current line) and the top stack frame — you can read them immediately without
+  extra calls. Execution stops **before** the indicated line runs (the line has not yet executed). Use `locals`
+  / `print { expr }` / `inspect { expr }` to examine state.
 - **`ExceptionCaught`** — an exception fired. `where` for the throw site, `locals` for state.
 - **`VmExited`** — the program ended; the session is done (`list` / `kill`).
 - **`Timeout`** — the app did not stop within the timeout (long loop or deadlock). The session is **kept
   alive** and marked `running` — investigate with `threads` / `where { all: true }`, or `kill`. Re-run the
   blocking tool with a larger `timeout` if it just needs more time.
-- A **`[note]` line** about `-g` means the class lacks local-variable debug info → recompile with `javac -g`.
+- A **`[note]` about line mismatch** means the JVM rounded the breakpoint to the nearest line with executable
+  bytecode — this is normal for lines that are comments, blank, or declarations-only.
+- A **`[note]` about `-g`** means the class lacks local-variable debug info → recompile with `javac -g`.
+
+## Inspecting collections efficiently
+
+Use `inspect` instead of manually looping `print expr.get(0)`, `print expr.get(1)`, etc.:
+```
+inspect { "expr": "myList" }               → shows size + all elements (up to 10)
+inspect { "expr": "map.keySet()", "max_elements": 20 }  → first 20 keys
+```
+Works with `ArrayList`, `HashMap.values()`, `HashMap.keySet()`, arrays, and any object with
+`.size()`/`.length` + `.get(i)`/`[i]` accessors. Returns structured output: size, elements list, and
+whether the result was truncated.
 
 ## Common mistakes
 - **`locals` empty / "information not available"** → the class was compiled without debug info. Recompile
@@ -125,6 +146,8 @@ Every tool returns a typed result. The ones that drive the next move:
 - **`run` after attach** → attach has no `run` (the JVM is already running); use `cont`.
 - **Breakpoint never hit** → wrong line (e.g. a `}`-only line has no code), or wrong class. Note that
   breakpoints set before the class loads are **deferred** (this is normal) and bind on `run`/`cont`.
+- **Calling `list_source`/`where` after every stop** → unnecessary. `Stopped` results already include source
+  context and the top stack frame. Only call them if you need the full stack or a different line range.
 - **Multiple sessions** → pass `session` (an id from `list`), or keep one session at a time.
 - **Treating `Timeout` as a crash** → it is non-destructive; the session is still alive. Inspect or kill it.
 - **Wrong JDK picked up** → pass `jdb_path` to `launch` / `attach`, or set `JAVA_HOME`, to force a specific
