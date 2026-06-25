@@ -94,6 +94,9 @@ pub enum Commands {
         print: bool,
     },
 
+    /// Update jdbg: remove old setup, install latest release from GitHub, then re-register.
+    Update,
+
     // ── Breakpoints ──
 
     /// Set a line breakpoint: stop at Class:line.
