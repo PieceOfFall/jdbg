@@ -75,6 +75,16 @@ These are settled decisions. Changing them needs explicit user sign-off.
   (`-connect com.sun.jdi.SocketAttach:hostname=H,port=P`), **not** `jdb -attach host:port` — on Windows the
   latter defaults to shared-memory (dt_shmem) and fails against a dt_socket JDWP target.
 
+## Release checklist
+
+Before bumping version and tagging a release:
+1. `cargo test` passes (all unit + integration).
+2. **Check `skills/jdbg/SKILL.md`** — if any tool was added/removed/renamed, parameters changed, or
+   behavior semantics changed (e.g. new fields in responses, new notes), update the skill file:
+   `allowed-tools` list, tool reference table, "Reading results" section, "Common mistakes", etc.
+3. Bump `metadata.version` in `SKILL.md` when it changes.
+4. Commit SKILL.md update **before** the version-bump commit (or in the same commit).
+
 ## Build & test conventions
 
 - Build `cargo build` · test `cargo test`. The environment is Windows; this session drives builds/tests via
