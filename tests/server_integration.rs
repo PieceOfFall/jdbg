@@ -70,7 +70,7 @@ fn breakpoint_hit_includes_source_context_and_frame() {
 
     // 设置断点：第 10 行（int size = fruits.size();）
     let bp_resp = session
-        .stop_at("CollectionTest", 10, None)
+        .stop_at("CollectionTest", 10, None, None)
         .expect("stop_at failed");
     assert!(
         matches!(bp_resp.result, CommandResult::BreakpointSet { .. }),
@@ -126,7 +126,7 @@ fn line_mismatch_note_when_hit_differs() {
 
     // 设置断点并记录 target
     session
-        .stop_at("CollectionTest", 10, None)
+        .stop_at("CollectionTest", 10, None, None)
         .expect("stop_at failed");
     session.record_break_target("CollectionTest", 10);
 
@@ -167,7 +167,7 @@ fn inspect_collection_returns_elements() {
 
     // 断点到集合已填充之后（line 10: int size = fruits.size();）
     session
-        .stop_at("CollectionTest", 10, None)
+        .stop_at("CollectionTest", 10, None, None)
         .expect("stop_at failed");
     let run_resp = session.run(Some(30)).expect("run failed");
     assert!(
@@ -212,7 +212,7 @@ fn inspect_with_max_elements_truncates() {
     let session = launch_fixture("CollectionTest");
 
     session
-        .stop_at("CollectionTest", 10, None)
+        .stop_at("CollectionTest", 10, None, None)
         .expect("stop_at failed");
     let run_resp = session.run(Some(30)).expect("run failed");
     assert!(matches!(run_resp.result, CommandResult::Stopped { .. }));
@@ -239,7 +239,7 @@ fn inspect_empty_returns_size_zero() {
     // line 6: List<String> fruits = new ArrayList<>();
     // line 7: fruits.add("apple");
     session
-        .stop_at("CollectionTest", 7, None)
+        .stop_at("CollectionTest", 7, None, None)
         .expect("stop_at failed");
     let run_resp = session.run(Some(30)).expect("run failed");
     assert!(matches!(run_resp.result, CommandResult::Stopped { .. }));
@@ -254,6 +254,59 @@ fn inspect_empty_returns_size_zero() {
     }
 
     let _ = session.kill();
+}
+
+// ─── Phase: conditional breakpoint ───
+
+#[test]
+fn conditional_breakpoint_set_accepted() {
+    let session = launch_fixture("CollectionTest");
+
+    // 验证带条件的断点能被 jdb 接受（不报错）
+    let bp_resp = session
+        .stop_at("CollectionTest", 10, Some("true"), None)
+        .expect("conditional stop_at failed");
+    assert!(
+        matches!(bp_resp.result, CommandResult::BreakpointSet { .. }),
+        "conditional breakpoint should be accepted, got {:?}",
+        bp_resp.result
+    );
+
+    // 条件为 true → 应该停住
+    let run_resp = session.run(Some(30)).expect("run failed");
+    assert!(
+        matches!(run_resp.result, CommandResult::Stopped { .. }),
+        "breakpoint with condition=true should stop, got {:?}",
+        run_resp.result
+    );
+
+    let _ = session.kill();
+}
+
+#[test]
+fn attach_to_unreachable_port_gives_clear_error() {
+    use java_agent_debugger::jdb::process::AttachConfig;
+
+    let config = AttachConfig {
+        host: "127.0.0.1".to_string(),
+        port: 19999, // 没有 JDWP 在这个端口监听
+        sourcepath: vec![],
+    };
+    let result = Session::attach(&jdb_path(), &config, "test-unreachable".into(), None);
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("should fail on unreachable port"),
+    };
+
+    let msg = err.to_string();
+    assert!(
+        msg.contains("not reachable") || msg.contains("Connection refused"),
+        "error should mention unreachable/refused, got: {msg}"
+    );
+    assert!(
+        msg.contains("JDWP"),
+        "error should mention JDWP for diagnosis, got: {msg}"
+    );
 }
 
 // ─── Test helpers that mirror handler.rs logic (can't import private fns) ───

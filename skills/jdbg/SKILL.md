@@ -85,10 +85,18 @@ found via `JAVA_HOME/bin` → PATH → common install dirs).
 ### Breakpoints
 | Tool | Purpose |
 |---|---|
-| `break_at { class, line }` | break at a source line |
-| `break_in { class, method, args? }` | break at method entry (`args` = comma-separated param types, disambiguates overloads) |
+| `break_at { class, line, condition? }` | break at a source line (optional condition: only stop when expression is true) |
+| `break_in { class, method, args?, condition? }` | break at method entry (`args` = comma-separated param types, disambiguates overloads) |
 | `catch { exception, mode? }` | break when an exception is thrown (`mode`: caught \| uncaught \| all) |
 | `breakpoints` · `clear { spec }` | list / remove breakpoints |
+
+Conditional breakpoints are useful when debugging high-traffic code (e.g. a Tomcat handler serving many
+requests) — set `condition` to filter for the specific request you care about:
+```
+break_at { "class": "com.example.CartService", "line": 42, "condition": "userId == 1619458289" }
+```
+The condition is evaluated at the JVM level each time the breakpoint fires; execution automatically
+continues if the condition is false.
 
 ### Execution control (blocking; larger default timeout)
 | Tool | Purpose |

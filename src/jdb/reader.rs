@@ -51,7 +51,7 @@ static RE_VM_EXIT: LazyLock<Regex> = LazyLock::new(|| {
 /// 连接/启动致命错误。
 static RE_FATAL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?m)^(?:Unable to attach to target VM|java\.io\.IOException|Input stream closed)",
+        r"(?m)^(?:Unable to attach to target VM|java\.io\.IOException|Input stream closed|Connection refused)",
     )
     .unwrap()
 });

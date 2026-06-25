@@ -151,15 +151,28 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
 
     let result = match &req.cmd {
         // Breakpoints
-        Command::BreakAt { class, line } => {
-            let r = session.stop_at(class, *line, t);
+        Command::BreakAt { class, line, condition } => {
+            let r = session.stop_at(class, *line, condition.as_deref(), t);
             if r.is_ok() {
                 session.record_break_target(class, *line);
+                if let Some(cond) = condition {
+                    session.add_condition(&format!("{class}:{line}"), cond);
+                }
             }
             r
         }
-        Command::BreakIn { class, method, args } => {
-            session.stop_in(class, method, args.as_deref(), t)
+        Command::BreakIn { class, method, args, condition } => {
+            let r = session.stop_in(class, method, args.as_deref(), condition.as_deref(), t);
+            if r.is_ok() {
+                if let Some(cond) = condition {
+                    let spec = match args {
+                        Some(a) => format!("{class}.{method}({a})"),
+                        None => format!("{class}.{method}"),
+                    };
+                    session.add_condition(&spec, cond);
+                }
+            }
+            r
         }
         Command::Catch { exception, mode } => {
             let cmd = match mode.as_str() {
@@ -188,6 +201,8 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
             };
             match r {
                 Ok(mut resp) => {
+                    // 条件断点：命中时 eval 条件，若 false 则自动 cont（循环直到条件满足或非断点停下）。
+                    resp = eval_condition_loop(&session, resp, t);
                     enrich_stopped(&session, &mut resp);
                     check_line_mismatch(&session, &mut resp);
                     return Response::ok(id, resp);
@@ -243,6 +258,45 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
 }
 
 // ─── Enrichment helpers ─────────────────────────────────────────────────────────
+
+/// 条件断点循环：如果命中的断点有条件且条件为 false，自动 cont 继续。
+/// 最多循环 100 次防止无限 loop。
+fn eval_condition_loop(session: &Session, mut resp: CommandResponse, timeout: Option<u64>) -> CommandResponse {
+    for _ in 0..100 {
+        let spec = match &resp.result {
+            CommandResult::Stopped { event: Event::Breakpoint { location, .. }, .. } => {
+                format!("{}:{}", location.class, location.line)
+            }
+            _ => return resp,
+        };
+
+        let condition = match session.get_condition(&spec) {
+            Some(c) => c,
+            None => return resp,
+        };
+
+        // eval 条件表达式
+        let cond_result = session.print(&condition, Some(5));
+        let should_stop = match cond_result {
+            Ok(ref r) => match &r.result {
+                CommandResult::Value { value, .. } => value.trim() == "true",
+                _ => true, // eval 失败 → 停下让用户看
+            },
+            Err(_) => true,
+        };
+
+        if should_stop {
+            return resp;
+        }
+
+        // 条件不满足，自动 cont
+        match session.cont(timeout) {
+            Ok(next_resp) => resp = next_resp,
+            Err(_) => return resp,
+        }
+    }
+    resp
+}
 
 /// 阻塞命令返回 Stopped 后，自动获取栈帧 + 源码上下文（best-effort）。
 fn enrich_stopped(session: &Session, resp: &mut CommandResponse) {

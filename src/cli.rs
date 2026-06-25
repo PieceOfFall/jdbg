@@ -102,6 +102,9 @@ pub enum Commands {
         class: String,
         /// Line number.
         line: u32,
+        /// Conditional expression — breakpoint only fires when true.
+        #[arg(long, short = 'c')]
+        condition: Option<String>,
     },
 
     /// Set a method breakpoint: stop in Class.method.
@@ -113,6 +116,9 @@ pub enum Commands {
         /// Parameter types for overload disambiguation.
         #[arg(long)]
         args: Option<String>,
+        /// Conditional expression — breakpoint only fires when true.
+        #[arg(long, short = 'c')]
+        condition: Option<String>,
     },
 
     /// Catch an exception.

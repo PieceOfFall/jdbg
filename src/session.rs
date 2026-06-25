@@ -88,6 +88,8 @@ pub struct Session {
     _stderr_handle: JoinHandle<()>,
     /// 最近一次 `break_at` 的目标（class, line），用于命中时比对行号偏差。
     last_break_target: Mutex<Option<(String, u32)>>,
+    /// 活跃的条件断点：key = "Class:line" 或 "Class.method"，value = condition expr。
+    conditions: Mutex<Vec<(String, String)>>,
 }
 
 /// 受命令锁保护的可变状态。
@@ -134,6 +136,7 @@ impl Session {
             stderr,
             _stderr_handle: stderr_handle,
             last_break_target: Mutex::new(None),
+            conditions: Mutex::new(Vec::new()),
         })
     }
 
@@ -148,6 +151,9 @@ impl Session {
         id: String,
         name: Option<String>,
     ) -> Result<Session> {
+        // TCP 探测：快速检查端口可达性，避免 jdb 长时间挂起后才报晦涩错误。
+        probe_tcp(&config.host, config.port)?;
+
         let spawned = spawn_attach(jdb_path, config)?;
         let mut process = spawned.process;
         let jdb_pid = process.pid();
@@ -201,6 +207,7 @@ impl Session {
             stderr,
             _stderr_handle: stderr_handle,
             last_break_target: Mutex::new(None),
+            conditions: Mutex::new(Vec::new()),
         })
     }
 
@@ -303,15 +310,32 @@ impl Session {
         self.last_break_target.lock().expect("break_target mutex poisoned").take()
     }
 
+    /// 注册条件断点：命中 spec 时只有 condition 为 true 才真正停下。
+    pub fn add_condition(&self, spec: &str, condition: &str) {
+        let mut conds = self.conditions.lock().expect("conditions mutex poisoned");
+        conds.retain(|(s, _)| s != spec);
+        conds.push((spec.to_string(), condition.to_string()));
+    }
+
+    /// 查询 spec 对应的条件表达式。
+    pub fn get_condition(&self, spec: &str) -> Option<String> {
+        self.conditions.lock().expect("conditions mutex poisoned")
+            .iter()
+            .find(|(s, _)| s == spec)
+            .map(|(_, c)| c.clone())
+    }
+
     // ── 语义便捷方法（封装 jdb 命令字符串，§7 命令面）──────────────────────────
 
     /// `stop at Class:line`
-    pub fn stop_at(&self, class: &str, line: u32, timeout: Option<u64>) -> Result<CommandResponse> {
+    pub fn stop_at(&self, class: &str, line: u32, _condition: Option<&str>, timeout: Option<u64>) -> Result<CommandResponse> {
+        // 条件断点由 handler 层实现（命中时 eval + 自动 cont），不依赖 jdb 的 if 语法（JDK 8 不支持）。
         self.execute(&format!("stop at {class}:{line}"), CommandKind::normal(CommandHint::BreakpointSet).with_timeout_secs(timeout))
     }
 
     /// `stop in Class.method`（可选签名以区分重载）
-    pub fn stop_in(&self, class: &str, method: &str, args: Option<&str>, timeout: Option<u64>) -> Result<CommandResponse> {
+    pub fn stop_in(&self, class: &str, method: &str, args: Option<&str>, _condition: Option<&str>, timeout: Option<u64>) -> Result<CommandResponse> {
+        // 条件断点由 handler 层实现。
         let spec = match args {
             Some(a) => format!("stop in {class}.{method}({a})"),
             None => format!("stop in {class}.{method}"),
@@ -509,6 +533,26 @@ fn drain_buf(buf: &Arc<Mutex<String>>) -> Option<String> {
     } else {
         Some(std::mem::take(&mut *b))
     }
+}
+
+/// TCP 探测：尝试连接 host:port，超时 3 秒。失败时返回清晰的诊断信息。
+fn probe_tcp(host: &str, port: u16) -> Result<()> {
+    use std::net::{TcpStream, ToSocketAddrs};
+
+    let addr = format!("{host}:{port}");
+    let sock_addr = addr
+        .to_socket_addrs()
+        .map_err(|e| Error::Connection(format!("cannot resolve {addr}: {e}")))?
+        .next()
+        .ok_or_else(|| Error::Connection(format!("cannot resolve {addr}: no addresses")))?;
+
+    TcpStream::connect_timeout(&sock_addr, Duration::from_secs(3)).map_err(|e| {
+        Error::Connection(format!(
+            "port {port} on {host} is not reachable ({e}). \
+             Check: is the target JVM running? Is JDWP enabled with server=y and the correct port?"
+        ))
+    })?;
+    Ok(())
 }
 
 #[cfg(test)]

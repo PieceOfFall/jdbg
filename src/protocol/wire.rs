@@ -85,12 +85,19 @@ pub enum Command {
     Kill,
 
     // ── Breakpoints ──
-    BreakAt { class: String, line: u32 },
+    BreakAt {
+        class: String,
+        line: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        condition: Option<String>,
+    },
     BreakIn {
         class: String,
         method: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         args: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        condition: Option<String>,
     },
     Catch {
         exception: String,

@@ -64,10 +64,12 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             "Set a line breakpoint at Class:line. Execution stops BEFORE this line runs (the line \
              has not yet executed). The actual hit line may differ if the requested line has no \
              executable bytecode (JVM rounds to the nearest valid line). Breakpoints set before \
-             the class loads are deferred and bind on run/cont.",
+             the class loads are deferred and bind on run/cont. Use `condition` to only stop when \
+             a boolean expression is true (e.g. \"userId == 123\").",
             json!({
                 "class": {"type": "string", "description": "Class name, e.g. com.example.Main."},
-                "line": {"type": "integer", "description": "Source line number (must hold executable code)."}
+                "line": {"type": "integer", "description": "Source line number (must hold executable code)."},
+                "condition": {"type": "string", "description": "Optional boolean expression — breakpoint only fires when true (e.g. \"i > 5\", \"name.equals(\\\"test\\\")\")."}
             }),
             &["class", "line"],
             true,
@@ -76,11 +78,12 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         tool(
             "break_in",
             "Set a method-entry breakpoint at Class.method. Use `args` (comma-separated param types) to \
-             disambiguate overloads.",
+             disambiguate overloads. Use `condition` to only stop when a boolean expression is true.",
             json!({
                 "class": {"type": "string", "description": "Class name."},
                 "method": {"type": "string", "description": "Method name."},
-                "args": {"type": "string", "description": "Parameter types for overload disambiguation, e.g. 'int,java.lang.String'."}
+                "args": {"type": "string", "description": "Parameter types for overload disambiguation, e.g. 'int,java.lang.String'."},
+                "condition": {"type": "string", "description": "Optional boolean expression — breakpoint only fires when true."}
             }),
             &["class", "method"],
             true,
@@ -227,11 +230,13 @@ pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> 
         "break_at" => Command::BreakAt {
             class: require_str(args, "class")?,
             line: require_u32(args, "line")?,
+            condition: optional_str(args, "condition"),
         },
         "break_in" => Command::BreakIn {
             class: require_str(args, "class")?,
             method: require_str(args, "method")?,
             args: optional_str(args, "args"),
+            condition: optional_str(args, "condition"),
         },
         "catch" => Command::Catch {
             exception: require_str(args, "exception")?,
@@ -387,7 +392,7 @@ mod tests {
     #[test]
     fn break_at_maps_class_and_line() {
         let req = dispatch_tool("break_at", &json!({"class": "Main", "line": 42})).unwrap();
-        assert!(matches!(req.cmd, Command::BreakAt { ref class, line } if class == "Main" && line == 42));
+        assert!(matches!(req.cmd, Command::BreakAt { ref class, line, .. } if class == "Main" && line == 42));
     }
 
     #[test]
