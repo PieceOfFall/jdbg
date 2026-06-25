@@ -9,6 +9,10 @@
 - **Windows-first, cross-platform** — pure Rust, no Bash/WSL/temp-file dependencies.
 - **Two access paths** — CLI (`jdbg <cmd>`) and MCP server (`jdbg __mcp`) for native tool calls from Claude Code.
 - **Structured output** — human-readable text by default, `--json` for machine consumption.
+- **Auto-enriched stop results** — breakpoint/step hits include source context and top stack frame automatically.
+- **Conditional breakpoints** — filter high-traffic code with boolean expressions (e.g. `userId == 123`).
+- **Collection inspection** — `inspect` shows size + first N elements of any List/array/Map in one call.
+- **Self-update** — `jdbg update` downloads the latest release and re-registers in one step.
 
 ## Get Started
 
@@ -88,6 +92,14 @@ jdbg daemon stop
 
 In Claude Code, just ask it to debug — it drives the same flow through the `mcp__jdbg__*` tools.
 
+### Update to latest version
+
+```bash
+jdbg update
+```
+
+This removes the old registration, downloads and installs the latest release from GitHub, then re-registers. On Windows it handles the running-exe file lock automatically.
+
 ### Uninstall
 
 ```bash
@@ -110,8 +122,8 @@ jdbg status | list | kill [--session ID]
 jdbg daemon start | stop | status
 
 # Breakpoints
-jdbg break-at <Class> <line>
-jdbg break-in <Class> <method> [--args types]
+jdbg break-at <Class> <line> [-c <condition>]
+jdbg break-in <Class> <method> [--args types] [-c <condition>]
 jdbg catch <Exception> [--mode caught|uncaught|all]
 jdbg breakpoints | clear <spec>
 
@@ -120,11 +132,13 @@ jdbg run | cont | step | next | step-out
 
 # Inspection
 jdbg where [--all] | locals | print <expr> | dump <obj> | eval <expr>
+jdbg inspect <expr> [--max-elements N]
 jdbg threads | thread <id> | frame <up|down> [n] | list-source [line]
 jdbg raw <jdb command...>
 
-# Setup / global flags
+# Setup & maintenance
 jdbg setup [--remove] [--print]
+jdbg update
 --session <id>   target a specific session (defaults to the sole live one)
 --json           machine-readable JSON output
 --timeout <secs> override per-command timeout
@@ -133,9 +147,9 @@ jdbg setup [--remove] [--print]
 
 ## MCP Server (Claude Code native tools)
 
-`jdbg __mcp` runs a stdio JSON-RPC 2.0 MCP server, exposing the CLI surface as **25 native tools**
-(`launch`, `break_at`, `run`, `locals`, `cont`, …) so Claude Code can drive a debug session without
-going through Bash. Tools appear as `mcp__jdbg__<tool>`.
+`jdbg __mcp` runs a stdio JSON-RPC 2.0 MCP server, exposing the CLI surface as **26 native tools**
+(`launch`, `break_at`, `run`, `locals`, `cont`, `inspect`, …) so Claude Code can drive a debug session
+without going through Bash. Tools appear as `mcp__jdbg__<tool>`.
 
 `jdbg setup` ([Get Started step 2](#2-register-with-claude-code)) wires this up for you. To configure it
 manually instead — or to point at a **dev build** while hacking on jdbg itself:
@@ -181,7 +195,7 @@ See [`DESIGN.md`](DESIGN.md) for the full design reference (Chinese).
 ```bash
 cargo build          # debug build
 cargo build --release
-cargo test           # 48 unit tests (parser, protocol mapping, MCP tools, session, setup)
+cargo test           # 55 unit + 8 integration tests (parser, protocol, MCP tools, session, setup, e2e)
 ```
 
 The parser is validated against captured real-jdb transcripts under `tests/fixtures/jdb/`. Pure logic
