@@ -5,9 +5,10 @@ use std::sync::Arc;
 
 use interprocess::local_socket::Stream;
 
+use crate::error::Result;
 use crate::jdb::parser::CommandHint;
 use crate::protocol::*;
-use crate::session::CommandKind;
+use crate::session::{CommandKind, Session};
 use super::manager::SessionManager;
 
 /// 处理一条连接（一个 request → 一个 response）。
@@ -150,7 +151,13 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
 
     let result = match &req.cmd {
         // Breakpoints
-        Command::BreakAt { class, line } => session.stop_at(class, *line, t),
+        Command::BreakAt { class, line } => {
+            let r = session.stop_at(class, *line, t);
+            if r.is_ok() {
+                session.record_break_target(class, *line);
+            }
+            r
+        }
         Command::BreakIn { class, method, args } => {
             session.stop_in(class, method, args.as_deref(), t)
         }
@@ -169,14 +176,35 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
             session.execute(&format!("clear {spec}"), CommandKind::normal(CommandHint::Other).with_timeout_secs(t))
         }
 
-        // Execution control
-        Command::Run => session.run(t),
-        Command::Cont => session.cont(t),
-        Command::Step => session.step(t),
-        Command::Next => session.next(t),
-        Command::StepOut => session.step_out(t),
+        // Execution control (blocking — enrich after)
+        Command::Run | Command::Cont | Command::Step | Command::Next | Command::StepOut => {
+            let r = match &req.cmd {
+                Command::Run => session.run(t),
+                Command::Cont => session.cont(t),
+                Command::Step => session.step(t),
+                Command::Next => session.next(t),
+                Command::StepOut => session.step_out(t),
+                _ => unreachable!(),
+            };
+            match r {
+                Ok(mut resp) => {
+                    enrich_stopped(&session, &mut resp);
+                    check_line_mismatch(&session, &mut resp);
+                    return Response::ok(id, resp);
+                }
+                Err(e) => return Response::err(id, e.exit_code(), e.to_string()),
+            }
+        }
 
-        // Inspection
+        // Inspection — inspect (composite, multi-command)
+        Command::Inspect { expr, max_elements } => {
+            match handle_inspect(&session, expr, *max_elements, t) {
+                Ok(resp) => return Response::ok(id, resp),
+                Err(e) => return Response::err(id, e.exit_code(), e.to_string()),
+            }
+        }
+
+        // Inspection (simple)
         Command::Where { all } => {
             let (cmd, hint) = if *all {
                 ("where all", CommandHint::WhereAll)
@@ -212,6 +240,126 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
         Ok(resp) => Response::ok(id, resp),
         Err(e) => Response::err(id, e.exit_code(), e.to_string()),
     }
+}
+
+// ─── Enrichment helpers ─────────────────────────────────────────────────────────
+
+/// 阻塞命令返回 Stopped 后，自动获取栈帧 + 源码上下文（best-effort）。
+fn enrich_stopped(session: &Session, resp: &mut CommandResponse) {
+    let (location_line, frame_ref, source_ref) = match &mut resp.result {
+        CommandResult::Stopped { location, frame, source_context, .. } => {
+            (location.line, frame, source_context)
+        }
+        _ => return,
+    };
+
+    // 填充 frame（top of stack）
+    if frame_ref.is_none() {
+        if let Ok(stack_resp) = session.stack(Some(5)) {
+            if let CommandResult::StackTrace { frames } = &stack_resp.result {
+                if let Some(top) = frames.first() {
+                    *frame_ref = Some(top.clone());
+                }
+            }
+        }
+    }
+
+    // 填充 source_context
+    if source_ref.is_none() && location_line > 0 {
+        if let Ok(src_resp) = session.list_source(Some(location_line), Some(5)) {
+            if let CommandResult::Source { lines, .. } = src_resp.result {
+                *source_ref = Some(lines);
+            }
+        }
+    }
+}
+
+/// 断点命中时，与最近设置的 break_at 行号比对；不匹配则添加 note。
+fn check_line_mismatch(session: &Session, resp: &mut CommandResponse) {
+    let location = match &resp.result {
+        CommandResult::Stopped { event: Event::Breakpoint { .. }, location, .. } => location,
+        _ => return,
+    };
+
+    if let Some((ref cls, req_line)) = session.take_break_target() {
+        if cls == &location.class && req_line != location.line {
+            resp.note = Some(format!(
+                "Breakpoint requested at line {} but hit at line {} — \
+                 JVM rounded to nearest executable bytecode.",
+                req_line, location.line
+            ));
+        }
+    }
+}
+
+/// `inspect` 命令：获取集合/数组的 size + 前 N 个元素。
+fn handle_inspect(
+    session: &Session,
+    expr: &str,
+    max_elements: u32,
+    timeout: Option<u64>,
+) -> Result<CommandResponse> {
+    let max = max_elements.min(50);
+
+    // 尝试获取 size（.size() 优先，fallback .length）
+    let size = try_eval_int(session, &format!("{expr}.size()"), timeout)
+        .or_else(|| try_eval_int(session, &format!("{expr}.length"), timeout));
+
+    let count = match size {
+        Some(s) => s.min(max),
+        None => max,
+    };
+
+    // 逐个取元素
+    let mut elements = Vec::new();
+    for i in 0..count {
+        if let Some(val) = try_get_element(session, expr, i, timeout) {
+            elements.push(val);
+        } else {
+            break;
+        }
+    }
+
+    let truncated = size.map(|s| s > max);
+    Ok(CommandResponse {
+        result: CommandResult::Inspection {
+            expr: expr.to_string(),
+            size,
+            elements,
+            truncated,
+        },
+        stderr: None,
+        note: None,
+    })
+}
+
+fn try_eval_int(session: &Session, expr: &str, timeout: Option<u64>) -> Option<u32> {
+    let resp = session.print(expr, timeout).ok()?;
+    if let CommandResult::Value { ref value, .. } = resp.result {
+        value.trim().parse().ok()
+    } else {
+        None
+    }
+}
+
+fn try_get_element(
+    session: &Session,
+    expr: &str,
+    index: u32,
+    timeout: Option<u64>,
+) -> Option<VarBinding> {
+    for accessor in [format!("{expr}.get({index})"), format!("{expr}[{index}]")] {
+        if let Ok(resp) = session.print(&accessor, timeout) {
+            if let CommandResult::Value { ref value, .. } = resp.result {
+                return Some(VarBinding {
+                    name: format!("[{index}]"),
+                    ty: None,
+                    value: value.clone(),
+                });
+            }
+        }
+    }
+    None
 }
 
 /// 写响应（JSONL：一行 JSON + newline）。

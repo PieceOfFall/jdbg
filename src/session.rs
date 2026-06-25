@@ -86,6 +86,8 @@ pub struct Session {
     /// stderr drain 线程累积的内容（每次 execute 后取出作为 side band）。
     stderr: Arc<Mutex<String>>,
     _stderr_handle: JoinHandle<()>,
+    /// 最近一次 `break_at` 的目标（class, line），用于命中时比对行号偏差。
+    last_break_target: Mutex<Option<(String, u32)>>,
 }
 
 /// 受命令锁保护的可变状态。
@@ -131,6 +133,7 @@ impl Session {
             inner: Mutex::new(inner),
             stderr,
             _stderr_handle: stderr_handle,
+            last_break_target: Mutex::new(None),
         })
     }
 
@@ -197,6 +200,7 @@ impl Session {
             inner: Mutex::new(inner),
             stderr,
             _stderr_handle: stderr_handle,
+            last_break_target: Mutex::new(None),
         })
     }
 
@@ -286,6 +290,17 @@ impl Session {
         } else {
             Some(std::mem::take(&mut *s))
         }
+    }
+
+    /// 记录最近一次 `break_at` 的目标，供命中时比对行号偏差。
+    pub fn record_break_target(&self, class: &str, line: u32) {
+        *self.last_break_target.lock().expect("break_target mutex poisoned") =
+            Some((class.to_string(), line));
+    }
+
+    /// 取出并清空最近的 break target（one-shot 消费）。
+    pub fn take_break_target(&self) -> Option<(String, u32)> {
+        self.last_break_target.lock().expect("break_target mutex poisoned").take()
     }
 
     // ── 语义便捷方法（封装 jdb 命令字符串，§7 命令面）──────────────────────────
@@ -429,7 +444,9 @@ fn event_to_result(ev: DetectedEvent) -> (CommandResult, Event) {
             let loc = Location { class, method, file: None, line };
             let event = Event::Breakpoint { location: loc.clone(), thread: thread.clone() };
             (
-                CommandResult::Stopped { event: event.clone(), location: loc, thread, frame: None },
+                CommandResult::Stopped {
+                    event: event.clone(), location: loc, thread, frame: None, source_context: None,
+                },
                 event,
             )
         }
@@ -437,7 +454,9 @@ fn event_to_result(ev: DetectedEvent) -> (CommandResult, Event) {
             let loc = Location { class, method, file: None, line };
             let event = Event::Step { location: loc.clone(), thread: thread.clone() };
             (
-                CommandResult::Stopped { event: event.clone(), location: loc, thread, frame: None },
+                CommandResult::Stopped {
+                    event: event.clone(), location: loc, thread, frame: None, source_context: None,
+                },
                 event,
             )
         }
@@ -509,7 +528,7 @@ mod tests {
         };
         let (result, event) = event_to_result(ev);
 
-        let CommandResult::Stopped { location, thread, event: inner_event, frame } = result else {
+        let CommandResult::Stopped { location, thread, event: inner_event, frame, source_context } = result else {
             panic!("expected Stopped, got {result:?}");
         };
         assert_eq!(thread, "main");
@@ -517,6 +536,7 @@ mod tests {
         assert_eq!(location.method, "main");
         assert_eq!(location.line, 9);
         assert!(frame.is_none());
+        assert!(source_context.is_none());
         assert!(matches!(inner_event, Event::Breakpoint { .. }));
         assert!(matches!(event, Event::Breakpoint { .. }));
     }

@@ -1,0 +1,370 @@
+//! 集成测试：模拟完整的 daemon handler 流程，验证所有改动在真实 jdb 会话中工作。
+//!
+//! 这些测试需要 JDK（JAVA_HOME 或 PATH 中有 jdb），且需要编译好的 Java fixture。
+//! 运行前确保执行了：javac -g tests/fixtures/java/CollectionTest.java
+
+use std::path::PathBuf;
+use std::sync::Arc;
+
+use java_agent_debugger::protocol::*;
+use java_agent_debugger::session::Session;
+
+/// 辅助：获取 jdb 路径。
+fn jdb_path() -> PathBuf {
+    java_agent_debugger::jdkpath::find_jdb(None).expect("jdb not found — is JAVA_HOME set?")
+}
+
+/// 辅助：fixture 目录。
+fn fixture_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests")
+        .join("fixtures")
+        .join("java")
+}
+
+/// 辅助：launch 一个 fixture 会话。
+fn launch_fixture(main_class: &str) -> Arc<Session> {
+    use java_agent_debugger::jdb::process::LaunchConfig;
+
+    let dir = fixture_dir();
+    let config = LaunchConfig {
+        main_class: main_class.to_string(),
+        classpath: vec![dir.clone()],
+        sourcepath: vec![dir],
+        app_args: vec![],
+        jdb_args: vec![],
+    };
+    let session = Session::launch(&jdb_path(), &config, "test-session".into(), None)
+        .expect("failed to launch jdb session");
+    Arc::new(session)
+}
+
+// ─── Phase 1: Tool descriptions are implicitly tested by existing spec tests ───
+
+// ─── Phase 2: break_target recording and line mismatch ───
+
+#[test]
+fn break_target_record_and_take() {
+    let session = launch_fixture("CollectionTest");
+
+    // 初始状态：无 target
+    assert!(session.take_break_target().is_none());
+
+    // 记录
+    session.record_break_target("CollectionTest", 9);
+    let target = session.take_break_target();
+    assert_eq!(target, Some(("CollectionTest".to_string(), 9)));
+
+    // take 是 one-shot
+    assert!(session.take_break_target().is_none());
+
+    // 清理
+    let _ = session.kill();
+}
+
+// ─── Phase 3: enrich_stopped — breakpoint hit returns source_context + frame ───
+
+#[test]
+fn breakpoint_hit_includes_source_context_and_frame() {
+    let session = launch_fixture("CollectionTest");
+
+    // 设置断点：第 10 行（int size = fruits.size();）
+    let bp_resp = session
+        .stop_at("CollectionTest", 10, None)
+        .expect("stop_at failed");
+    assert!(
+        matches!(bp_resp.result, CommandResult::BreakpointSet { .. }),
+        "expected BreakpointSet, got {:?}",
+        bp_resp.result
+    );
+
+    // 运行
+    let run_resp = session.run(Some(30)).expect("run failed");
+
+    // run 返回的是原始 Stopped（session 层不做 enrichment，enrichment 在 handler 层）
+    // 所以我们手动模拟 handler 的 enrich 逻辑
+    let mut resp = run_resp;
+    enrich_stopped_test_helper(&session, &mut resp);
+
+    match &resp.result {
+        CommandResult::Stopped { location, frame, source_context, .. } => {
+            assert_eq!(location.class, "CollectionTest");
+            assert_eq!(location.method, "main");
+            assert!(location.line > 0, "line should be nonzero");
+
+            // frame 应该被填充
+            assert!(frame.is_some(), "frame should be enriched, got None");
+            let f = frame.as_ref().unwrap();
+            assert_eq!(f.index, 1); // jdb 用 1-based frame indices
+            assert_eq!(f.location.class, "CollectionTest");
+
+            // source_context 应该被填充（如果 sourcepath 正确）
+            assert!(
+                source_context.is_some(),
+                "source_context should be enriched, got None"
+            );
+            let lines = source_context.as_ref().unwrap();
+            assert!(!lines.is_empty(), "source lines should not be empty");
+            // 应该包含断点行
+            assert!(
+                lines.iter().any(|l| l.number == location.line),
+                "source_context should contain the breakpoint line {}",
+                location.line
+            );
+        }
+        other => panic!("expected Stopped, got {other:?}"),
+    }
+
+    let _ = session.kill();
+}
+
+// ─── Phase 2+3: line mismatch check ───
+
+#[test]
+fn line_mismatch_note_when_hit_differs() {
+    let session = launch_fixture("CollectionTest");
+
+    // 设置断点并记录 target
+    session
+        .stop_at("CollectionTest", 10, None)
+        .expect("stop_at failed");
+    session.record_break_target("CollectionTest", 10);
+
+    let run_resp = session.run(Some(30)).expect("run failed");
+    let mut resp = run_resp;
+
+    // 模拟 check_line_mismatch
+    check_line_mismatch_test_helper(&session, &mut resp);
+
+    // 如果实际命中行 == 请求行，note 应为 None
+    if let CommandResult::Stopped { location, .. } = &resp.result {
+        if location.line == 10 {
+            // 行号匹配，不应有 note
+            assert!(
+                resp.note.is_none(),
+                "no mismatch note expected when lines match"
+            );
+        } else {
+            // 行号不匹配，应有 note
+            assert!(
+                resp.note.is_some(),
+                "mismatch note expected when lines differ"
+            );
+            let note = resp.note.as_ref().unwrap();
+            assert!(note.contains("requested at line 10"));
+            assert!(note.contains(&format!("hit at line {}", location.line)));
+        }
+    }
+
+    let _ = session.kill();
+}
+
+// ─── Phase 4: inspect tool ───
+
+#[test]
+fn inspect_collection_returns_elements() {
+    let session = launch_fixture("CollectionTest");
+
+    // 断点到集合已填充之后（line 10: int size = fruits.size();）
+    session
+        .stop_at("CollectionTest", 10, None)
+        .expect("stop_at failed");
+    let run_resp = session.run(Some(30)).expect("run failed");
+    assert!(
+        matches!(run_resp.result, CommandResult::Stopped { .. }),
+        "expected Stopped, got {:?}",
+        run_resp.result
+    );
+
+    // 调用 inspect
+    let inspect_resp = handle_inspect_test_helper(&session, "fruits", 10, None);
+    match &inspect_resp.result {
+        CommandResult::Inspection { expr, size, elements, truncated } => {
+            assert_eq!(expr, "fruits");
+            assert_eq!(*size, Some(3), "fruits.size() should be 3");
+            assert_eq!(elements.len(), 3, "should have 3 elements");
+            // 验证元素内容
+            assert!(
+                elements[0].value.contains("apple"),
+                "first element should be apple, got: {}",
+                elements[0].value
+            );
+            assert!(
+                elements[1].value.contains("banana"),
+                "second element should be banana, got: {}",
+                elements[1].value
+            );
+            assert!(
+                elements[2].value.contains("cherry"),
+                "third element should be cherry, got: {}",
+                elements[2].value
+            );
+            assert_eq!(*truncated, Some(false), "should not be truncated");
+        }
+        other => panic!("expected Inspection, got {other:?}"),
+    }
+
+    let _ = session.kill();
+}
+
+#[test]
+fn inspect_with_max_elements_truncates() {
+    let session = launch_fixture("CollectionTest");
+
+    session
+        .stop_at("CollectionTest", 10, None)
+        .expect("stop_at failed");
+    let run_resp = session.run(Some(30)).expect("run failed");
+    assert!(matches!(run_resp.result, CommandResult::Stopped { .. }));
+
+    // 只取 2 个元素
+    let inspect_resp = handle_inspect_test_helper(&session, "fruits", 2, None);
+    match &inspect_resp.result {
+        CommandResult::Inspection { size, elements, truncated, .. } => {
+            assert_eq!(*size, Some(3));
+            assert_eq!(elements.len(), 2, "should only have 2 elements with max=2");
+            assert_eq!(*truncated, Some(true), "should be marked truncated");
+        }
+        other => panic!("expected Inspection, got {other:?}"),
+    }
+
+    let _ = session.kill();
+}
+
+#[test]
+fn inspect_empty_returns_size_zero() {
+    let session = launch_fixture("CollectionTest");
+
+    // 断点到 line 7 — fruits 刚创建还是空的
+    // line 6: List<String> fruits = new ArrayList<>();
+    // line 7: fruits.add("apple");
+    session
+        .stop_at("CollectionTest", 7, None)
+        .expect("stop_at failed");
+    let run_resp = session.run(Some(30)).expect("run failed");
+    assert!(matches!(run_resp.result, CommandResult::Stopped { .. }));
+
+    let inspect_resp = handle_inspect_test_helper(&session, "fruits", 10, None);
+    match &inspect_resp.result {
+        CommandResult::Inspection { size, elements, .. } => {
+            assert_eq!(*size, Some(0));
+            assert!(elements.is_empty());
+        }
+        other => panic!("expected Inspection, got {other:?}"),
+    }
+
+    let _ = session.kill();
+}
+
+// ─── Test helpers that mirror handler.rs logic (can't import private fns) ───
+
+fn enrich_stopped_test_helper(session: &Session, resp: &mut CommandResponse) {
+    let (location_line, frame_ref, source_ref) = match &mut resp.result {
+        CommandResult::Stopped { location, frame, source_context, .. } => {
+            (location.line, frame, source_context)
+        }
+        _ => return,
+    };
+
+    if frame_ref.is_none() {
+        if let Ok(stack_resp) = session.stack(Some(5)) {
+            if let CommandResult::StackTrace { frames } = &stack_resp.result {
+                if let Some(top) = frames.first() {
+                    *frame_ref = Some(top.clone());
+                }
+            }
+        }
+    }
+
+    if source_ref.is_none() && location_line > 0 {
+        if let Ok(src_resp) = session.list_source(Some(location_line), Some(5)) {
+            if let CommandResult::Source { lines, .. } = src_resp.result {
+                *source_ref = Some(lines);
+            }
+        }
+    }
+}
+
+fn check_line_mismatch_test_helper(session: &Session, resp: &mut CommandResponse) {
+    let location = match &resp.result {
+        CommandResult::Stopped { event: Event::Breakpoint { .. }, location, .. } => location.clone(),
+        _ => return,
+    };
+
+    if let Some((ref cls, req_line)) = session.take_break_target() {
+        if cls == &location.class && req_line != location.line {
+            resp.note = Some(format!(
+                "Breakpoint requested at line {} but hit at line {} — \
+                 JVM rounded to nearest executable bytecode.",
+                req_line, location.line
+            ));
+        }
+    }
+}
+
+fn handle_inspect_test_helper(
+    session: &Session,
+    expr: &str,
+    max_elements: u32,
+    timeout: Option<u64>,
+) -> CommandResponse {
+    let max = max_elements.min(50);
+
+    let size = try_eval_int_helper(session, &format!("{expr}.size()"), timeout)
+        .or_else(|| try_eval_int_helper(session, &format!("{expr}.length"), timeout));
+
+    let count = match size {
+        Some(s) => s.min(max),
+        None => max,
+    };
+
+    let mut elements = Vec::new();
+    for i in 0..count {
+        if let Some(val) = try_get_element_helper(session, expr, i, timeout) {
+            elements.push(val);
+        } else {
+            break;
+        }
+    }
+
+    let truncated = size.map(|s| s > max);
+    CommandResponse {
+        result: CommandResult::Inspection {
+            expr: expr.to_string(),
+            size,
+            elements,
+            truncated,
+        },
+        stderr: None,
+        note: None,
+    }
+}
+
+fn try_eval_int_helper(session: &Session, expr: &str, timeout: Option<u64>) -> Option<u32> {
+    let resp = session.print(expr, timeout).ok()?;
+    if let CommandResult::Value { ref value, .. } = resp.result {
+        value.trim().parse().ok()
+    } else {
+        None
+    }
+}
+
+fn try_get_element_helper(
+    session: &Session,
+    expr: &str,
+    index: u32,
+    timeout: Option<u64>,
+) -> Option<VarBinding> {
+    for accessor in [format!("{expr}.get({index})"), format!("{expr}[{index}]")] {
+        if let Ok(resp) = session.print(&accessor, timeout) {
+            if let CommandResult::Value { ref value, .. } = resp.result {
+                return Some(VarBinding {
+                    name: format!("[{index}]"),
+                    ty: None,
+                    value: value.clone(),
+                });
+            }
+        }
+    }
+    None
+}

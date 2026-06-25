@@ -117,6 +117,7 @@ pub enum Command {
     Thread { id: String },
     Frame { direction: String, #[serde(default = "default_one")] n: u32 },
     ListSource { #[serde(skip_serializing_if = "Option::is_none")] line: Option<u32> },
+    Inspect { expr: String, #[serde(default = "default_max_elements")] max_elements: u32 },
     Raw { command: String },
 
     // ── Daemon control ──
@@ -128,6 +129,7 @@ fn default_host() -> String { "localhost".into() }
 fn default_port() -> u16 { 5005 }
 fn default_catch_mode() -> String { "all".into() }
 fn default_one() -> u32 { 1 }
+fn default_max_elements() -> u32 { 10 }
 
 // ─── impl ───────────────────────────────────────────────────────────────────────
 

@@ -54,16 +54,23 @@ fn render_result(result: &CommandResult) -> String {
                 breakpoints.join("\n")
             }
         }
-        CommandResult::Stopped { event, location, thread, .. } => {
+        CommandResult::Stopped { event, location, thread, source_context, .. } => {
             let kind = match event {
                 Event::Breakpoint { .. } => "Breakpoint hit",
                 Event::Step { .. } => "Step completed",
                 _ => "Stopped",
             };
-            format!(
+            let mut out = format!(
                 "{kind}: {}.{}() line={} thread={thread}",
                 location.class, location.method, location.line
-            )
+            );
+            if let Some(lines) = source_context {
+                for l in lines {
+                    let marker = if l.number == location.line { "=>" } else { "  " };
+                    out.push_str(&format!("\n{marker} {:>4}  {}", l.number, l.text));
+                }
+            }
+            out
         }
         CommandResult::ExceptionCaught { exception, caught, location, thread } => {
             let mode = if *caught { "caught" } else { "uncaught" };
@@ -154,6 +161,111 @@ fn render_result(result: &CommandResult) -> String {
                 format!("{:>4}  {}", l.number, l.text)
             }).collect::<Vec<_>>().join("\n")
         }
+        CommandResult::Inspection { expr, size, elements, truncated } => {
+            let sz = size.map(|s| format!(" (size={s})")).unwrap_or_default();
+            let mut out = format!("{expr}{sz}:");
+            if elements.is_empty() {
+                out.push_str(" (empty or inaccessible)");
+            } else {
+                for el in elements {
+                    out.push_str(&format!("\n  {} = {}", el.name, el.value));
+                }
+            }
+            if *truncated == Some(true) {
+                out.push_str("\n  ... (truncated)");
+            }
+            out
+        }
         CommandResult::Raw { text } => text.clone(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stopped_with_source_context_renders_markers() {
+        let resp = CommandResponse {
+            result: CommandResult::Stopped {
+                event: Event::Breakpoint {
+                    location: Location { class: "Main".into(), method: "main".into(), file: None, line: 10 },
+                    thread: "main".into(),
+                },
+                location: Location { class: "Main".into(), method: "main".into(), file: None, line: 10 },
+                thread: "main".into(),
+                frame: None,
+                source_context: Some(vec![
+                    SourceLine { number: 9, text: "int x = 1;".into() },
+                    SourceLine { number: 10, text: "int y = 2;".into() },
+                    SourceLine { number: 11, text: "return x + y;".into() },
+                ]),
+            },
+            stderr: None,
+            note: None,
+        };
+        let out = render(&resp, false);
+        assert!(out.contains("Breakpoint hit: Main.main() line=10 thread=main"));
+        assert!(out.contains("=>   10  int y = 2;"));
+        assert!(out.contains("     9  int x = 1;"));
+        assert!(out.contains("    11  return x + y;"));
+    }
+
+    #[test]
+    fn stopped_without_source_context_is_one_line() {
+        let resp = CommandResponse {
+            result: CommandResult::Stopped {
+                event: Event::Step {
+                    location: Location { class: "Foo".into(), method: "bar".into(), file: None, line: 5 },
+                    thread: "t1".into(),
+                },
+                location: Location { class: "Foo".into(), method: "bar".into(), file: None, line: 5 },
+                thread: "t1".into(),
+                frame: None,
+                source_context: None,
+            },
+            stderr: None,
+            note: None,
+        };
+        let out = render(&resp, false);
+        assert_eq!(out, "Step completed: Foo.bar() line=5 thread=t1");
+    }
+
+    #[test]
+    fn inspection_renders_elements_and_truncation() {
+        let resp = CommandResponse {
+            result: CommandResult::Inspection {
+                expr: "myList".into(),
+                size: Some(3),
+                elements: vec![
+                    VarBinding { name: "[0]".into(), ty: None, value: "\"hello\"".into() },
+                    VarBinding { name: "[1]".into(), ty: None, value: "\"world\"".into() },
+                ],
+                truncated: Some(true),
+            },
+            stderr: None,
+            note: None,
+        };
+        let out = render(&resp, false);
+        assert!(out.contains("myList (size=3):"));
+        assert!(out.contains("[0] = \"hello\""));
+        assert!(out.contains("[1] = \"world\""));
+        assert!(out.contains("... (truncated)"));
+    }
+
+    #[test]
+    fn inspection_empty_shows_placeholder() {
+        let resp = CommandResponse {
+            result: CommandResult::Inspection {
+                expr: "emptyList".into(),
+                size: Some(0),
+                elements: vec![],
+                truncated: Some(false),
+            },
+            stderr: None,
+            note: None,
+        };
+        let out = render(&resp, false);
+        assert!(out.contains("emptyList (size=0): (empty or inaccessible)"));
     }
 }

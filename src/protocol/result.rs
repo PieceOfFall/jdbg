@@ -128,6 +128,8 @@ pub enum CommandResult {
         thread: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         frame: Option<StackFrame>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_context: Option<Vec<SourceLine>>,
     },
     ExceptionCaught {
         exception: String,
@@ -173,6 +175,15 @@ pub enum CommandResult {
     Source {
         around_line: u32,
         lines: Vec<SourceLine>,
+    },
+    /// `inspect` 结果：集合/数组的 size + 前 N 个元素。
+    Inspection {
+        expr: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        size: Option<u32>,
+        elements: Vec<VarBinding>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        truncated: Option<bool>,
     },
 
     // ── fallback ──

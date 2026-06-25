@@ -191,6 +191,14 @@ pub enum Commands {
         /// Center on this line number.
         line: Option<u32>,
     },
+    /// Inspect a collection/array: show size and first N elements.
+    Inspect {
+        /// Collection expression.
+        expr: String,
+        /// Max elements to show (default 10, max 50).
+        #[arg(long, default_value_t = 10)]
+        max_elements: u32,
+    },
     /// Send a raw jdb command (escape hatch).
     Raw {
         /// The jdb command string.

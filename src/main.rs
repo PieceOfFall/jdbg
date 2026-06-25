@@ -135,6 +135,7 @@ fn build_command(cli: &Cli) -> anyhow::Result<Command> {
         Commands::Thread { id } => Command::Thread { id: id.clone() },
         Commands::Frame { direction, n } => Command::Frame { direction: direction.clone(), n: *n },
         Commands::ListSource { line } => Command::ListSource { line: *line },
+        Commands::Inspect { expr, max_elements } => Command::Inspect { expr: expr.clone(), max_elements: *max_elements },
         Commands::Raw { command } => Command::Raw { command: command.join(" ") },
         Commands::Daemon { .. } => unreachable!("handled above"),
         Commands::Setup { .. } => unreachable!("handled above"),

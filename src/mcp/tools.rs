@@ -61,8 +61,10 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         // ── 断点 ──
         tool(
             "break_at",
-            "Set a line breakpoint at Class:line. Breakpoints set before the class loads are deferred \
-             (normal) and bind on run/cont.",
+            "Set a line breakpoint at Class:line. Execution stops BEFORE this line runs (the line \
+             has not yet executed). The actual hit line may differ if the requested line has no \
+             executable bytecode (JVM rounds to the nearest valid line). Breakpoints set before \
+             the class loads are deferred and bind on run/cont.",
             json!({
                 "class": {"type": "string", "description": "Class name, e.g. com.example.Main."},
                 "line": {"type": "integer", "description": "Source line number (must hold executable code)."}
@@ -105,11 +107,11 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             false,
         ),
         // ── 执行控制（阻塞，较大默认超时）──
-        tool("run", "Start the debugged application (launch mode only). Blocks until a breakpoint, exception, or exit.", json!({}), &[], true, true),
-        tool("cont", "Continue execution until the next stop (breakpoint, exception, or program exit).", json!({}), &[], true, true),
-        tool("step", "Step into the next line, entering called methods.", json!({}), &[], true, true),
-        tool("next", "Step over the next line, without entering called methods.", json!({}), &[], true, true),
-        tool("step_out", "Run until the current method returns.", json!({}), &[], true, true),
+        tool("run", "Start the debugged application (launch mode only). Blocks until a breakpoint, exception, or exit. Returns the stop location with source context and top stack frame when available.", json!({}), &[], true, true),
+        tool("cont", "Continue execution until the next stop (breakpoint, exception, or program exit). Returns the stop location with source context and top stack frame when available.", json!({}), &[], true, true),
+        tool("step", "Step into the next line, entering called methods. Returns the stop location with source context and top stack frame when available.", json!({}), &[], true, true),
+        tool("next", "Step over the next line, without entering called methods. Returns the stop location with source context and top stack frame when available.", json!({}), &[], true, true),
+        tool("step_out", "Run until the current method returns. Returns the stop location with source context and top stack frame when available.", json!({}), &[], true, true),
         // ── 检查（快）──
         tool(
             "where",
@@ -169,6 +171,19 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             "Show source code around the current location, or around a given line.",
             json!({"line": {"type": "integer", "description": "Center on this line (default: current location)."}}),
             &[],
+            true,
+            false,
+        ),
+        tool(
+            "inspect",
+            "Inspect a collection, array, or list: shows its size and first N elements. \
+             Works with ArrayList, HashMap.keySet()/values(), arrays, and any object with \
+             .size()/.length + .get(i)/[i] accessors.",
+            json!({
+                "expr": {"type": "string", "description": "Collection expression to inspect."},
+                "max_elements": {"type": "integer", "description": "Max elements to show (default 10, max 50)."}
+            }),
+            &["expr"],
             true,
             false,
         ),
@@ -241,6 +256,10 @@ pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> 
             n: optional_u32(args, "n").unwrap_or(1),
         },
         "list_source" => Command::ListSource { line: optional_u32(args, "line") },
+        "inspect" => Command::Inspect {
+            expr: require_str(args, "expr")?,
+            max_elements: optional_u32(args, "max_elements").unwrap_or(10),
+        },
         "raw" => Command::Raw { command: require_str(args, "command")? },
         _ => return Err(JsonRpcError::new(METHOD_NOT_FOUND, format!("unknown tool: {name}"))),
     };
@@ -330,8 +349,8 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn exposes_25_tools() {
-        assert_eq!(tool_specs().len(), 25);
+    fn exposes_26_tools() {
+        assert_eq!(tool_specs().len(), 26);
     }
 
     #[test]
@@ -438,5 +457,17 @@ mod tests {
         assert!(matches!(dispatch_tool("status", &json!({})).unwrap().cmd, Command::Status));
         assert!(matches!(dispatch_tool("list", &json!({})).unwrap().cmd, Command::List));
         assert!(matches!(dispatch_tool("run", &json!({})).unwrap().cmd, Command::Run));
+    }
+
+    #[test]
+    fn inspect_maps_expr_and_defaults_max() {
+        let req = dispatch_tool("inspect", &json!({"expr": "myList"})).unwrap();
+        assert!(matches!(req.cmd, Command::Inspect { ref expr, max_elements } if expr == "myList" && max_elements == 10));
+    }
+
+    #[test]
+    fn inspect_accepts_custom_max_elements() {
+        let req = dispatch_tool("inspect", &json!({"expr": "arr", "max_elements": 5})).unwrap();
+        assert!(matches!(req.cmd, Command::Inspect { ref expr, max_elements } if expr == "arr" && max_elements == 5));
     }
 }
