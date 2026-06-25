@@ -1,42 +1,49 @@
-import java.util.concurrent.CountDownLatch;
-
 /**
- * Fixture for thread-suspend-policy tests.
- * Two threads: "worker" hits the breakpoint, "heartbeat" keeps running.
+ * Fixture for thread-suspend-policy tests (jdb native `stop thread`).
+ *
+ * - "worker" hits the breakpoint in doWork() and gets suspended.
+ * - "heartbeat" keeps incrementing heartbeatCount forever. It writes NOTHING
+ *   to stdout, so the debuggee never interleaves output with jdb's event
+ *   banner while a thread breakpoint is being reported.
+ * - main() blocks forever (sleep) so the VM stays alive after "worker" is
+ *   suspended. Under a thread-suspend policy main/heartbeat must keep running;
+ *   the program must NOT self-terminate (that would race VM exit against the
+ *   debugger and corrupt the captured transcript).
  */
 public class ThreadTest {
-    static volatile boolean heartbeatAlive = true;
+    static volatile boolean alive = true;
     static volatile int heartbeatCount = 0;
 
     public static void main(String[] args) throws Exception {
-        CountDownLatch latch = new CountDownLatch(1);
-
         Thread heartbeat = new Thread(() -> {
-            latch.countDown();
-            while (heartbeatAlive) {
+            while (alive) {
                 heartbeatCount++;
-                try { Thread.sleep(50); } catch (InterruptedException e) { break; }
+                try { Thread.sleep(20); } catch (InterruptedException e) { break; }
             }
         }, "heartbeat");
-
-        Thread worker = new Thread(() -> {
-            try { latch.await(); } catch (InterruptedException e) { return; }
-            doWork();
-        }, "worker");
-
         heartbeat.setDaemon(true);
         heartbeat.start();
+
+        Thread worker = new Thread(() -> doWork(), "worker");
+        worker.setDaemon(true);
         worker.start();
-        worker.join(10000);
-        heartbeatAlive = false;
-        heartbeat.join(2000);
-        System.out.println("done heartbeatCount=" + heartbeatCount);
+
+        // Keep the VM alive without depending on worker/heartbeat finishing:
+        // under thread policy main is NOT suspended, so it runs to here and
+        // parks in sleep (the test kills the jdb session when done).
+        Thread.sleep(600000);
     }
 
     static void doWork() {
         int x = 1;
         int y = x + 1;
         int z = y + 1;
-        System.out.println("worker result=" + z);
+        // Block forever so "worker" stays parked and visible in `threads`
+        // even if the breakpoint fails to arm (rules out the race where worker
+        // runs doWork to completion and the thread disappears). No stdout, so
+        // it cannot interleave with jdb's event banner.
+        while (alive) {
+            try { Thread.sleep(100); } catch (InterruptedException e) { break; }
+        }
     }
 }

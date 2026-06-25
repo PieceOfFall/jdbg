@@ -91,6 +91,22 @@ pub fn spawn_attach(jdb_path: &Path, config: &AttachConfig) -> Result<Spawned> {
     spawn(jdb_path, &args)
 }
 
+/// 规范化 attach 目标主机名：把 `localhost`（大小写不敏感）替换为 IPv4 环回字面量
+/// `127.0.0.1`，其它主机名（含已是字面 IP、`::1`、远程主机）原样返回。
+///
+/// **为什么必要**：双栈机器上 `localhost` 常优先解析到 IPv6 `::1`，而 JDWP 默认（`address=5005`
+/// 或 `*:5005`）通常只在 IPv4 `0.0.0.0` 监听。结果 `probe_tcp` 与 jdb 的
+/// `SocketAttach:hostname=localhost` 都会连到 `::1` 被拒（connection refused），attach 失败。
+/// 强制 IPv4 环回字面量绕过 DNS 的 IPv6 优先，匹配 JDWP 实际监听的地址族。
+/// 用户若显式要 IPv6 环回，传 `::1` 即按原样保留。
+pub fn normalize_attach_host(host: &str) -> String {
+    if host.eq_ignore_ascii_case("localhost") {
+        "127.0.0.1".to_string()
+    } else {
+        host.to_string()
+    }
+}
+
 /// 构造 attach 模式的完整参数列表（不含 jdb 可执行文件本身）。
 pub fn build_attach_args(config: &AttachConfig) -> Vec<String> {
     let mut args: Vec<String> = LOCALE_FLAGS.iter().map(|s| s.to_string()).collect();
@@ -229,5 +245,23 @@ mod tests {
         );
         assert!(!args.iter().any(|a| a == "-attach"), "must not use -attach: {args:?}");
         assert!(args.iter().any(|a| a == "-sourcepath"), "args: {args:?}");
+    }
+
+    #[test]
+    fn normalize_attach_host_maps_localhost_to_ipv4_loopback() {
+        // 双栈机器上 localhost→::1，但 JDWP 多数只在 IPv4 监听 → 必须连 127.0.0.1。
+        assert_eq!(normalize_attach_host("localhost"), "127.0.0.1");
+        // 大小写不敏感（DNS 名不区分大小写）。
+        assert_eq!(normalize_attach_host("LocalHost"), "127.0.0.1");
+        assert_eq!(normalize_attach_host("LOCALHOST"), "127.0.0.1");
+    }
+
+    #[test]
+    fn normalize_attach_host_leaves_other_hosts_untouched() {
+        // 已是字面 IP、远程主机、显式 IPv6 环回都原样保留。
+        assert_eq!(normalize_attach_host("127.0.0.1"), "127.0.0.1");
+        assert_eq!(normalize_attach_host("::1"), "::1");
+        assert_eq!(normalize_attach_host("10.0.0.5"), "10.0.0.5");
+        assert_eq!(normalize_attach_host("debug.example.com"), "debug.example.com");
     }
 }

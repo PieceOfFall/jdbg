@@ -17,8 +17,8 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use crate::error::{Error, Result};
-use crate::jdb::parser::{CommandHint, classify_output};
-use crate::jdb::process::{AttachConfig, JdbProcess, LaunchConfig, spawn_attach, spawn_launch};
+use crate::jdb::parser::{CommandHint, classify_output, parse_threads, parse_where};
+use crate::jdb::process::{AttachConfig, JdbProcess, LaunchConfig, normalize_attach_host, spawn_attach, spawn_launch};
 use crate::jdb::reader::{DetectedEvent, PromptReader, ReadMode, ReadOutcome};
 use crate::protocol::*;
 
@@ -90,8 +90,6 @@ pub struct Session {
     last_break_target: Mutex<Option<(String, u32)>>,
     /// 活跃的条件断点：key = "Class:line" 或 "Class.method"，value = condition expr。
     conditions: Mutex<Vec<(String, String)>>,
-    /// 每个断点的 suspend policy：key = "Class:line" 或 "Class.method"，value = "thread" | "all"。
-    suspend_policies: Mutex<Vec<(String, String)>>,
 }
 
 /// 受命令锁保护的可变状态。
@@ -139,7 +137,6 @@ impl Session {
             _stderr_handle: stderr_handle,
             last_break_target: Mutex::new(None),
             conditions: Mutex::new(Vec::new()),
-            suspend_policies: Mutex::new(Vec::new()),
         })
     }
 
@@ -154,6 +151,15 @@ impl Session {
         id: String,
         name: Option<String>,
     ) -> Result<Session> {
+        // localhost 在双栈机器上常被解析到 IPv6 `::1`，而 JDWP 默认（`address=5005` / `*:5005`）
+        // 多数只在 IPv4 `0.0.0.0` 监听 → probe_tcp 与 jdb SocketAttach 都会连 `::1` 被拒。
+        // 入口处一次性规范化为 127.0.0.1，使探测、spawn、meta.target 全部用真实可达地址。
+        let normalized = AttachConfig {
+            host: normalize_attach_host(&config.host),
+            ..config.clone()
+        };
+        let config = &normalized;
+
         // TCP 探测：快速检查端口可达性，避免 jdb 长时间挂起后才报晦涩错误。
         probe_tcp(&config.host, config.port)?;
 
@@ -211,7 +217,6 @@ impl Session {
             _stderr_handle: stderr_handle,
             last_break_target: Mutex::new(None),
             conditions: Mutex::new(Vec::new()),
-            suspend_policies: Mutex::new(Vec::new()),
         })
     }
 
@@ -255,7 +260,15 @@ impl Session {
         }
 
         let stderr = self.take_stderr();
-        Ok(inner.map_outcome(outcome, kind.hint, stderr))
+        let mut response = inner.map_outcome(outcome, kind.hint, stderr);
+
+        // PartialStop 补全：截断 banner（SUSPEND_THREAD）命中后 thread/location 全未知，
+        // 在同一锁内用 threads→thread<id>→where 自动填充。
+        if is_partial_stopped(&response) {
+            enrich_partial_stop_inner(&mut inner, &mut response);
+        }
+
+        Ok(response)
     }
 
     /// 当前运行状态。
@@ -329,46 +342,28 @@ impl Session {
             .map(|(_, c)| c.clone())
     }
 
-    /// 注册断点的 suspend policy。
-    pub fn set_suspend_policy(&self, spec: &str, policy: &str) {
-        let mut pols = self.suspend_policies.lock().expect("suspend_policies mutex poisoned");
-        pols.retain(|(s, _)| s != spec);
-        pols.push((spec.to_string(), policy.to_string()));
-    }
-
-    /// 查询 spec 对应的 suspend policy（None 表示未设置 = 默认 "all"）。
-    pub fn get_suspend_policy(&self, spec: &str) -> Option<String> {
-        self.suspend_policies.lock().expect("suspend_policies mutex poisoned")
-            .iter()
-            .find(|(s, _)| s == spec)
-            .map(|(_, p)| p.clone())
-    }
-
-    /// 通过 `threads` 命令解析线程名对应的 hex ID。
-    pub fn resolve_thread_id(&self, thread_name: &str, timeout: Option<u64>) -> Option<String> {
-        let resp = self.threads(timeout).ok()?;
-        if let CommandResult::Threads { threads } = &resp.result {
-            if let Some(t) = threads.iter().find(|t| t.name == thread_name) {
-                return Some(t.id.clone());
-            }
-        }
-        None
-    }
-
     // ── 语义便捷方法（封装 jdb 命令字符串，§7 命令面）──────────────────────────
 
-    /// `stop at Class:line`
-    pub fn stop_at(&self, class: &str, line: u32, _condition: Option<&str>, timeout: Option<u64>) -> Result<CommandResponse> {
+    /// `stop at Class:line`；`suspend == Some("thread")` 时改用 `stop thread at`
+    /// （jdb 原生 SUSPEND_THREAD policy：命中时只挂起触发线程，VM 其余线程继续运行）。
+    pub fn stop_at(&self, class: &str, line: u32, suspend: Option<&str>, timeout: Option<u64>) -> Result<CommandResponse> {
         // 条件断点由 handler 层实现（命中时 eval + 自动 cont），不依赖 jdb 的 if 语法（JDK 8 不支持）。
-        self.execute(&format!("stop at {class}:{line}"), CommandKind::normal(CommandHint::BreakpointSet).with_timeout_secs(timeout))
+        let cmd = if suspend == Some("thread") {
+            format!("stop thread at {class}:{line}")
+        } else {
+            format!("stop at {class}:{line}")
+        };
+        self.execute(&cmd, CommandKind::normal(CommandHint::BreakpointSet).with_timeout_secs(timeout))
     }
 
-    /// `stop in Class.method`（可选签名以区分重载）
-    pub fn stop_in(&self, class: &str, method: &str, args: Option<&str>, _condition: Option<&str>, timeout: Option<u64>) -> Result<CommandResponse> {
+    /// `stop in Class.method`（可选签名以区分重载）；`suspend == Some("thread")` 时
+    /// 改用 `stop thread in`（SUSPEND_THREAD policy：命中时只挂起触发线程）。
+    pub fn stop_in(&self, class: &str, method: &str, args: Option<&str>, suspend: Option<&str>, timeout: Option<u64>) -> Result<CommandResponse> {
         // 条件断点由 handler 层实现。
+        let kw = if suspend == Some("thread") { "stop thread in" } else { "stop in" };
         let spec = match args {
-            Some(a) => format!("stop in {class}.{method}({a})"),
-            None => format!("stop in {class}.{method}"),
+            Some(a) => format!("{kw} {class}.{method}({a})"),
+            None => format!("{kw} {class}.{method}"),
         };
         self.execute(&spec, CommandKind::normal(CommandHint::BreakpointSet).with_timeout_secs(timeout))
     }
@@ -439,6 +434,19 @@ impl Session {
 }
 
 impl SessionInner {
+    /// 在持锁状态下发一条普通（Normal 模式）jdb 命令并返回其 prompt 之前的原始输出文本。
+    /// 仅用于 PartialStop 补全（threads/thread/where）——不推进状态机、不做 classify。
+    /// 任何非 Prompt 结局（超时/EOF/VM退出/致命）都返回 None，由调用方写 WARNING 兜底。
+    fn run_query(&mut self, raw: &str) -> Option<String> {
+        if self.process.write_command(raw).is_err() {
+            return None;
+        }
+        match self.reader.read_until_prompt(Duration::from_secs(5), ReadMode::Normal) {
+            ReadOutcome::Prompt { output, .. } => Some(output),
+            _ => None,
+        }
+    }
+
     /// 把 reader 的 `ReadOutcome` 映射为 `CommandResponse`，并推进状态机。
     fn map_outcome(
         &mut self,
@@ -542,10 +550,120 @@ fn event_to_result(ev: DetectedEvent) -> (CommandResult, Event) {
                 event,
             )
         }
+        // JDK 8 SUSPEND_THREAD 截断 banner：thread/location 全未知，先用空占位，
+        // 由 `enrich_partial_stop`（threads→thread<id>→where）补全。
+        DetectedEvent::PartialStop { is_step } => {
+            let loc = Location { class: String::new(), method: String::new(), file: None, line: 0 };
+            let event = if is_step {
+                Event::Step { location: loc.clone(), thread: String::new() }
+            } else {
+                Event::Breakpoint { location: loc.clone(), thread: String::new() }
+            };
+            (
+                CommandResult::Stopped {
+                    event: event.clone(), location: loc, thread: String::new(), frame: None, source_context: None,
+                },
+                event,
+            )
+        }
     }
 }
 
-/// 起一个后台线程把 jdb stderr 逐行 drain 到共享缓冲。
+/// PartialStop 标志：thread 与 location 全空的 `Stopped`（截断 banner 经 `event_to_result` 后的形态）。
+fn is_partial_stopped(resp: &CommandResponse) -> bool {
+    matches!(
+        &resp.result,
+        CommandResult::Stopped { thread, location, .. }
+            if thread.is_empty() && location.class.is_empty() && location.line == 0
+    )
+}
+
+/// 把 WARNING 追加到 response 的 note（与 handler 层 `append_note` 同语义：绝不静默 fallback）。
+fn append_warning(resp: &mut CommandResponse, msg: &str) {
+    match &mut resp.note {
+        Some(existing) => {
+            existing.push('\n');
+            existing.push_str(msg);
+        }
+        None => resp.note = Some(msg.to_string()),
+    }
+}
+
+/// 补全 PartialStop（JDK 8 SUSPEND_THREAD 截断 banner）的 thread/location：
+/// `threads`（找 `(at breakpoint)` 线程）→ `thread <id>`（切当前线程）→ `where`（取栈顶帧）。
+/// 在持有命令锁的 `SessionInner` 上执行（与命中是同一次 execute）。失败任一步即写 WARNING 并保留空字段。
+fn enrich_partial_stop_inner(inner: &mut SessionInner, resp: &mut CommandResponse) {
+    // 1. threads → 找命中线程（state 含 "at breakpoint"）。
+    let Some(threads_out) = inner.run_query("threads") else {
+        append_warning(resp, "WARNING: thread breakpoint hit, but `threads` query failed; thread/location unknown. Run `threads` manually.");
+        return;
+    };
+    let hit = match parse_threads(&threads_out) {
+        CommandResult::Threads { threads } => {
+            threads.into_iter().find(|t| t.state.contains("at breakpoint"))
+        }
+        _ => None,
+    };
+    let Some(hit) = hit else {
+        append_warning(resp, "WARNING: thread breakpoint hit, but no thread is marked `(at breakpoint)` in `threads` output; location unknown.");
+        return;
+    };
+
+    // 回填线程名（即便 where 失败也能给出触发线程）。
+    if let CommandResult::Stopped { thread, event, .. } = &mut resp.result {
+        *thread = hit.name.clone();
+        set_event_thread(event, &hit.name);
+    }
+
+    // 2. thread <id> → 切到命中线程（否则 where 报 "No thread specified."）。
+    if inner.run_query(&format!("thread {}", hit.id)).is_none() {
+        append_warning(resp, "WARNING: failed to select the hit thread (`thread <id>`); location unknown.");
+        return;
+    }
+
+    // 3. where → 栈顶帧给出 class/method/file/line。
+    let Some(where_out) = inner.run_query("where") else {
+        append_warning(resp, "WARNING: `where` query failed after selecting the hit thread; location unknown.");
+        return;
+    };
+    let top = match parse_where(&where_out) {
+        CommandResult::StackTrace { frames } => frames.into_iter().next(),
+        _ => None,
+    };
+    let Some(top) = top else {
+        append_warning(resp, "WARNING: could not parse the hit thread's stack (`where`); location unknown.");
+        return;
+    };
+
+    // 回填 location + frame（frame 直接复用，省得 handler 的 enrich_stopped 再查一次 where）。
+    if let CommandResult::Stopped { location, frame, event, .. } = &mut resp.result {
+        *location = top.location.clone();
+        set_event_location(event, &top.location);
+        *frame = Some(top);
+    }
+}
+
+/// 把补全到的线程名写回事件（Breakpoint/Step 的 thread 字段）。
+fn set_event_thread(event: &mut Event, thread: &str) {
+    match event {
+        Event::Breakpoint { thread: t, .. } | Event::Step { thread: t, .. } => {
+            *t = thread.to_string();
+        }
+        _ => {}
+    }
+}
+
+/// 把补全到的位置写回事件（Breakpoint/Step 的 location 字段）。
+fn set_event_location(event: &mut Event, loc: &Location) {
+    match event {
+        Event::Breakpoint { location, .. } | Event::Step { location, .. } => {
+            *location = loc.clone();
+        }
+        _ => {}
+    }
+}
+
+
 fn spawn_stderr_drain(stderr: ChildStderr) -> (Arc<Mutex<String>>, JoinHandle<()>) {
     use std::io::{BufRead, BufReader};
     let buf = Arc::new(Mutex::new(String::new()));
@@ -679,79 +797,5 @@ mod tests {
         assert_eq!(custom.timeout.as_secs(), 5);
     }
 
-    // ─── suspend_policies unit tests ─────────────────────────────────────────
-
-    /// Helper: build a minimal Session-like struct to test suspend_policies in isolation.
-    /// Since Session requires a real jdb process, we test the Mutex<Vec> logic directly.
-    mod suspend_policy_logic {
-        #[test]
-        fn set_and_get_policy() {
-            let policies: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
-
-            // set
-            {
-                let mut pols = policies.lock().unwrap();
-                pols.retain(|(s, _)| s != "Main:10");
-                pols.push(("Main:10".to_string(), "thread".to_string()));
-            }
-
-            // get
-            let result = policies.lock().unwrap()
-                .iter()
-                .find(|(s, _)| s == "Main:10")
-                .map(|(_, p)| p.clone());
-            assert_eq!(result, Some("thread".to_string()));
-        }
-
-        #[test]
-        fn set_overwrites_previous() {
-            let policies: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
-
-            // set "all"
-            {
-                let mut pols = policies.lock().unwrap();
-                pols.push(("Main:10".to_string(), "all".to_string()));
-            }
-            // overwrite with "thread"
-            {
-                let mut pols = policies.lock().unwrap();
-                pols.retain(|(s, _)| s != "Main:10");
-                pols.push(("Main:10".to_string(), "thread".to_string()));
-            }
-
-            let result = policies.lock().unwrap()
-                .iter()
-                .find(|(s, _)| s == "Main:10")
-                .map(|(_, p)| p.clone());
-            assert_eq!(result, Some("thread".to_string()));
-            assert_eq!(policies.lock().unwrap().len(), 1);
-        }
-
-        #[test]
-        fn get_nonexistent_returns_none() {
-            let policies: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
-            let result = policies.lock().unwrap()
-                .iter()
-                .find(|(s, _)| s == "Main:99")
-                .map(|(_, p)| p.clone());
-            assert_eq!(result, None);
-        }
-
-        #[test]
-        fn multiple_specs_independent() {
-            let policies: std::sync::Mutex<Vec<(String, String)>> = std::sync::Mutex::new(Vec::new());
-
-            {
-                let mut pols = policies.lock().unwrap();
-                pols.push(("Main:10".to_string(), "thread".to_string()));
-                pols.push(("Main:20".to_string(), "all".to_string()));
-                pols.push(("Foo.bar".to_string(), "thread".to_string()));
-            }
-
-            let pols = policies.lock().unwrap();
-            assert_eq!(pols.iter().find(|(s, _)| s == "Main:10").map(|(_, p)| p.as_str()), Some("thread"));
-            assert_eq!(pols.iter().find(|(s, _)| s == "Main:20").map(|(_, p)| p.as_str()), Some("all"));
-            assert_eq!(pols.iter().find(|(s, _)| s == "Foo.bar").map(|(_, p)| p.as_str()), Some("thread"));
-        }
-    }
+    // ─── execute behavior tests would require a real jdb process (see integration tests) ───
 }

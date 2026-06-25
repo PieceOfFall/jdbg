@@ -127,9 +127,21 @@ pub enum DetectedEvent {
         method: String,
         line: u32,
     },
+    /// JDK 8 SUSPEND_THREAD 截断 banner：jdb 写出 `"Breakpoint hit: "` 或 `"Step completed: "`
+    /// 前缀后不再继续（无 thread/location/thread-prompt）。Session 层需自动补全。
+    PartialStop {
+        is_step: bool,
+    },
 }
 
 // ─── PromptReader ────────────────────────────────────────────────────────────────
+
+/// 截断 banner patience window：检测到截断前缀后等此时长仍无后续字节即判定为 PartialStop。
+/// SUSPEND_ALL 的完整 banner 在数 ms 内全部到达，500ms 极为保守。
+const PARTIAL_BANNER_PATIENCE: Duration = Duration::from_millis(500);
+
+/// Patience 窗口期间 recv_timeout 的轮询粒度。
+const PARTIAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// 后台读线程发来的数据块；`None` 表示 EOF。
 type Chunk = Option<Vec<u8>>;
@@ -145,6 +157,10 @@ pub struct PromptReader {
     /// 归一化（`\r\n`→`\n`）+ UTF-8 lossy 解码后的文本，匹配都基于它。
     text: String,
     eof: bool,
+    /// 截断 banner（`Breakpoint hit: ` / `Step completed: `，JDK 8 SUSPEND_THREAD）首次出现在缓冲尾部的时刻。
+    /// 用于 patience window：等 [`PARTIAL_BANNER_PATIENCE`] 仍无后续字节才判定为 PartialStop；
+    /// 新字节到达即重置（完整 banner 会续写后半部分，不会误判）。
+    partial_banner_since: Option<Instant>,
     _handle: std::thread::JoinHandle<()>,
 }
 
@@ -177,6 +193,7 @@ impl PromptReader {
             raw: Vec::new(),
             text: String::new(),
             eof: false,
+            partial_banner_since: None,
             _handle: handle,
         }
     }
@@ -191,6 +208,22 @@ impl PromptReader {
             if let Some(outcome) = self.try_match(mode) {
                 return outcome;
             }
+
+            // Patience window：Blocking 模式下缓冲尾部是截断 banner（JDK 8 SUSPEND_THREAD），
+            // 等 PARTIAL_BANNER_PATIENCE 仍无后续字节即判定 PartialStop（jdb 不会再写 location）。
+            if mode == ReadMode::Blocking && self.tail_is_partial_banner() {
+                match self.partial_banner_since {
+                    None => self.partial_banner_since = Some(Instant::now()),
+                    Some(since) if since.elapsed() >= PARTIAL_BANNER_PATIENCE => {
+                        return self.emit_partial_stop();
+                    }
+                    Some(_) => {}
+                }
+            } else {
+                // 尾部不再是截断 banner（续写了完整 banner，或其它输出）→ 重置计时。
+                self.partial_banner_since = None;
+            }
+
             if self.eof {
                 return ReadOutcome::Eof {
                     output: self.take_text(),
@@ -201,10 +234,20 @@ impl PromptReader {
                     partial: self.text.clone(),
                 };
             };
-            match self.rx.recv_timeout(remaining) {
+            // 处于 patience 窗口时用小粒度轮询，使窗口到期能及时判定 PartialStop。
+            let wait = if self.partial_banner_since.is_some() {
+                remaining.min(PARTIAL_POLL_INTERVAL)
+            } else {
+                remaining
+            };
+            match self.rx.recv_timeout(wait) {
                 Ok(Some(bytes)) => self.push(&bytes),
                 Ok(None) => self.eof = true,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // patience 窗口内的轮询超时不算命令超时——继续循环重新评估。
+                    if self.partial_banner_since.is_some() && Instant::now() < deadline {
+                        continue;
+                    }
                     return ReadOutcome::Timeout {
                         partial: self.text.clone(),
                     };
@@ -215,10 +258,12 @@ impl PromptReader {
     }
 
     /// 追加原始字节，重新归一化解码（缓冲不大，重复解码可接受）。
+    /// 新字节到达 → 重置 partial banner patience（完整 banner 正在续写）。
     fn push(&mut self, bytes: &[u8]) {
         self.raw.extend_from_slice(bytes);
         let decoded = String::from_utf8_lossy(&self.raw);
         self.text = decoded.replace("\r\n", "\n").replace('\r', "\n");
+        self.partial_banner_since = None;
     }
 
     /// 取出并清空当前文本缓冲。
@@ -292,6 +337,28 @@ impl PromptReader {
 
         // Blocking 模式下出现裸 prompt：忽略它，继续等待真正的停下信号。
         None
+    }
+
+    /// 缓冲尾部是否为截断事件 banner 前缀（`"Breakpoint hit: "` 或 `"Step completed: "`）。
+    /// JDK 8 在 SUSPEND_THREAD policy 下命中断点/完成单步后，jdb 只写此前缀、不续写
+    /// thread/location、也不发 thread-prompt——光标停在冒号空格后等待输入。
+    fn tail_is_partial_banner(&self) -> bool {
+        let last_line = self.text.rsplit('\n').next().unwrap_or("");
+        last_line == "Breakpoint hit: " || last_line == "Step completed: "
+    }
+
+    /// Patience 窗口到期，确认截断 banner——发射 PartialStop 事件。
+    fn emit_partial_stop(&mut self) -> ReadOutcome {
+        let last_line = self.text.rsplit('\n').next().unwrap_or("");
+        let is_step = last_line.starts_with("Step completed:");
+        let cut = self.text.len() - last_line.len();
+        let output = self.text[..cut].trim_end_matches('\n').to_string();
+        let _ = self.take_text();
+        self.partial_banner_since = None;
+        ReadOutcome::Prompt {
+            output,
+            event: Some(DetectedEvent::PartialStop { is_step }),
+        }
     }
 }
 
@@ -393,5 +460,75 @@ mod tests {
         let output = "Breakpoint hit: \"thread=main\", Main.main(), line=9 bci=0";
         let event = detect_event(output, Some("main"));
         assert!(matches!(event, Some(DetectedEvent::Breakpoint { .. })));
+    }
+
+    /// 一个只产出一次预设字节、之后永久阻塞（不 EOF）的 Reader，
+    /// 模拟 JDK 8 SUSPEND_THREAD 命中后 jdb 写出截断前缀就不再写、也不关闭管道。
+    struct StallingReader {
+        data: Vec<u8>,
+        sent: bool,
+    }
+
+    impl std::io::Read for StallingReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            if !self.sent {
+                self.sent = true;
+                let n = self.data.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.data[..n]);
+                return Ok(n);
+            }
+            // 之后永久阻塞：模拟 jdb 命中后停在截断 banner、不再有任何输出、也不 EOF。
+            std::thread::sleep(Duration::from_secs(3600));
+            Ok(0)
+        }
+    }
+
+    #[test]
+    fn partial_breakpoint_banner_emits_partial_stop_in_blocking_mode() {
+        // JDK 8 SUSPEND_THREAD 截断 banner：前面有正常的启动输出，最后一行是 `Breakpoint hit: `
+        // （冒号空格结尾、无换行、无后续）。
+        let truncated = b"VM Started: Set deferred breakpoint ThreadTest.doWork\n\nBreakpoint hit: ";
+        let reader = StallingReader { data: truncated.to_vec(), sent: false };
+        let mut pr = PromptReader::new(reader);
+
+        // Blocking 模式：patience window（500ms）后应判定为 PartialStop，而不是等到超时。
+        let start = Instant::now();
+        let outcome = pr.read_until_prompt(Duration::from_secs(30), ReadMode::Blocking);
+        let elapsed = start.elapsed();
+
+        match outcome {
+            ReadOutcome::Prompt { event: Some(DetectedEvent::PartialStop { is_step }), output } => {
+                assert!(!is_step, "should be a breakpoint, not a step");
+                assert!(
+                    output.contains("VM Started"),
+                    "output should retain pre-banner text, got: {output:?}"
+                );
+                assert!(
+                    !output.contains("Breakpoint hit:"),
+                    "the truncated banner line itself should be cut off, got: {output:?}"
+                );
+            }
+            other => panic!("expected PartialStop, got {other:?}"),
+        }
+        // 应在 patience window 略多一点（远小于 30s 超时）就返回。
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "should resolve via patience window (~500ms), not block until timeout; took {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn partial_step_banner_emits_partial_stop() {
+        let truncated = b"Step completed: ";
+        let reader = StallingReader { data: truncated.to_vec(), sent: false };
+        let mut pr = PromptReader::new(reader);
+
+        let outcome = pr.read_until_prompt(Duration::from_secs(30), ReadMode::Blocking);
+        match outcome {
+            ReadOutcome::Prompt { event: Some(DetectedEvent::PartialStop { is_step }), .. } => {
+                assert!(is_step, "should be flagged as a step");
+            }
+            other => panic!("expected PartialStop step, got {other:?}"),
+        }
     }
 }

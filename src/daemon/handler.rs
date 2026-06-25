@@ -79,7 +79,16 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
                         target: session.meta.target.clone(),
                         state: session.state(),
                     };
-                    Response::ok(id, CommandResponse { result, stderr: None, note: None })
+                    // 若入口处把 localhost 规范化成了 127.0.0.1，明确告知（不静默）：
+                    // 双栈机器 localhost→::1 而 JDWP 多在 IPv4 监听，规范化避免 connection refused。
+                    let note = crate::jdb::process::normalize_attach_host(host)
+                        .ne(host)
+                        .then(|| format!(
+                            "host '{host}' normalized to 127.0.0.1 (IPv4 loopback): on dual-stack \
+                             hosts 'localhost' may resolve to IPv6 [::1] but JDWP usually listens \
+                             only on IPv4. target shows the address actually connected."
+                        ));
+                    Response::ok(id, CommandResponse { result, stderr: None, note })
                 }
                 Err(e) => Response::err(id, e.exit_code(), e.to_string()),
             }
@@ -152,21 +161,19 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
     let result = match &req.cmd {
         // Breakpoints
         Command::BreakAt { class, line, condition, suspend } => {
-            let r = session.stop_at(class, *line, condition.as_deref(), t);
+            // suspend policy 在设断点时就编码进 jdb 命令（`stop thread at`），命中后无需补救。
+            let r = session.stop_at(class, *line, suspend.as_deref(), t);
             if r.is_ok() {
                 session.record_break_target(class, *line);
                 let spec = format!("{class}:{line}");
                 if let Some(cond) = condition {
                     session.add_condition(&spec, cond);
                 }
-                if let Some(sp) = suspend {
-                    session.set_suspend_policy(&spec, sp);
-                }
             }
             r
         }
         Command::BreakIn { class, method, args, condition, suspend } => {
-            let r = session.stop_in(class, method, args.as_deref(), condition.as_deref(), t);
+            let r = session.stop_in(class, method, args.as_deref(), suspend.as_deref(), t);
             if r.is_ok() {
                 let spec = match args {
                     Some(a) => format!("{class}.{method}({a})"),
@@ -174,9 +181,6 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
                 };
                 if let Some(cond) = condition {
                     session.add_condition(&spec, cond);
-                }
-                if let Some(sp) = suspend {
-                    session.set_suspend_policy(&spec, sp);
                 }
             }
             r
@@ -220,7 +224,6 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
             match r {
                 Ok(mut resp) => {
                     resp = eval_condition_loop(&session, resp, t);
-                    apply_suspend_policy(&session, &mut resp, t);
                     enrich_stopped(&session, &mut resp);
                     check_line_mismatch(&session, &mut resp);
                     return Response::ok(id, resp);
@@ -308,61 +311,6 @@ fn append_note(resp: &mut CommandResponse, msg: &str) {
         Some(existing) => { existing.push('\n'); existing.push_str(msg); }
         None => resp.note = Some(msg.to_string()),
     }
-}
-
-/// 线程级 suspend：仅保持命中线程挂起，恢复其他线程（ZK 心跳等）。
-/// 利用 suspend count 技巧：先 suspend <id>（count +1），再 resume all（count -1）。
-/// 失败时退回 SUSPEND_ALL 并在 note 中报告 warning。
-fn apply_suspend_policy(session: &Session, resp: &mut CommandResponse, timeout: Option<u64>) {
-    let (spec, thread_name) = match &resp.result {
-        CommandResult::Stopped { event: Event::Breakpoint { location, .. }, thread, .. } => {
-            (format!("{}:{}", location.class, location.line), thread.clone())
-        }
-        _ => return,
-    };
-
-    let policy = session.get_suspend_policy(&spec).unwrap_or_else(|| "all".into());
-    if policy != "thread" {
-        return;
-    }
-
-    let hex_id = match session.resolve_thread_id(&thread_name, timeout) {
-        Some(id) => id,
-        None => {
-            append_note(resp, &format!(
-                "WARNING: suspend policy is 'thread' but could not resolve thread \"{}\" to a hex ID — \
-                 falling back to suspend=all (all threads frozen).",
-                thread_name
-            ));
-            return;
-        }
-    };
-
-    // suspend count +1（命中线程 → count=2）
-    if let Err(e) = session.raw(&format!("suspend {hex_id}"), timeout) {
-        append_note(resp, &format!(
-            "WARNING: suspend policy is 'thread' but `suspend {}` failed ({}) — \
-             falling back to suspend=all (all threads frozen).",
-            hex_id, e
-        ));
-        return;
-    }
-
-    // resume all（全部 count -1：命中线程 2→1 仍挂，其他 1→0 恢复）
-    if let Err(e) = session.raw("resume", timeout) {
-        let _ = session.raw(&format!("resume {hex_id}"), timeout);
-        append_note(resp, &format!(
-            "WARNING: suspend policy is 'thread' but `resume` (all) failed ({}) — \
-             rolled back suspend count; falling back to suspend=all (all threads frozen).",
-            e
-        ));
-        return;
-    }
-
-    append_note(resp, &format!(
-        "Suspend policy: thread — only \"{}\" ({}) is suspended; other threads continue.",
-        thread_name, hex_id
-    ));
 }
 
 /// 条件断点循环：如果命中的断点有条件且条件为 false，自动 cont 继续。

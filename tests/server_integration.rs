@@ -262,10 +262,10 @@ fn inspect_empty_returns_size_zero() {
 fn conditional_breakpoint_set_accepted() {
     let session = launch_fixture("CollectionTest");
 
-    // 验证带条件的断点能被 jdb 接受（不报错）
+    // 验证断点能被 jdb 接受（stop_at 层不处理条件——条件断点逻辑在 handler 层）
     let bp_resp = session
-        .stop_at("CollectionTest", 10, Some("true"), None)
-        .expect("conditional stop_at failed");
+        .stop_at("CollectionTest", 10, None, None)
+        .expect("stop_at failed");
     assert!(
         matches!(bp_resp.result, CommandResult::BreakpointSet { .. }),
         "conditional breakpoint should be accepted, got {:?}",
@@ -309,94 +309,100 @@ fn attach_to_unreachable_port_gives_clear_error() {
     );
 }
 
-// ─── Phase: thread suspend policy (per-breakpoint) ───
-
+/// 回归：attach 入口把 `localhost` 规范化为 `127.0.0.1`，且规范化贯穿到 `probe_tcp`。
+/// 双栈机器上 `localhost` 可能解析到 IPv6 `[::1]`，而 JDWP 多在 IPv4 监听 → 连接被拒。
+/// 用不可达端口触发 probe_tcp 失败，错误信息里应出现规范化后的 `127.0.0.1`（而非原始 `localhost`），
+/// 证明 probe 与后续 spawn 用的都是 IPv4 字面量。
 #[test]
-fn suspend_policy_stored_and_retrieved() {
-    let session = launch_fixture("CollectionTest");
+fn attach_normalizes_localhost_to_ipv4_loopback() {
+    use java_agent_debugger::jdb::process::AttachConfig;
 
-    // 初始无 policy
-    assert_eq!(session.get_suspend_policy("CollectionTest:10"), None);
+    let config = AttachConfig {
+        host: "localhost".to_string(),
+        port: 19999, // 没有 JDWP 在这个端口监听
+        sourcepath: vec![],
+    };
+    let result = Session::attach(&jdb_path(), &config, "test-localhost-norm".into(), None);
+    let msg = match result {
+        Err(e) => e.to_string(),
+        Ok(_) => panic!("should fail on unreachable port"),
+    };
 
-    // 设置 thread policy
-    session.set_suspend_policy("CollectionTest:10", "thread");
-    assert_eq!(session.get_suspend_policy("CollectionTest:10"), Some("thread".to_string()));
-
-    // 设置 all policy
-    session.set_suspend_policy("CollectionTest:10", "all");
-    assert_eq!(session.get_suspend_policy("CollectionTest:10"), Some("all".to_string()));
-
-    // 不同 spec 独立
-    session.set_suspend_policy("Foo.bar", "thread");
-    assert_eq!(session.get_suspend_policy("Foo.bar"), Some("thread".to_string()));
-    assert_eq!(session.get_suspend_policy("CollectionTest:10"), Some("all".to_string()));
-
-    let _ = session.kill();
+    assert!(
+        msg.contains("127.0.0.1"),
+        "error should show the normalized IPv4 loopback, got: {msg}"
+    );
+    assert!(
+        !msg.contains("localhost"),
+        "raw 'localhost' must have been normalized away, got: {msg}"
+    );
 }
 
+// ─── Phase: thread suspend policy (jdb 原生 `stop thread`) ───
+
+/// thread policy 断点：`stop thread at` 语法被 jdb 接受，命中后正常解析为 Stopped，
+/// 触发线程是 "worker"（事件 banner 与普通断点一致，parser 兼容）。
 #[test]
-fn thread_breakpoint_stops_and_notes_thread_policy() {
+fn thread_breakpoint_hit_resolves_worker() {
     let session = launch_fixture("ThreadTest");
 
-    // 在 doWork 第一行设置 thread breakpoint
-    let bp_resp = session
-        .stop_at("ThreadTest", 37, None, None)
-        .expect("stop_at failed");
+    // suspend="thread" → jdb 发 `stop thread at`（SUSPEND_THREAD policy）
+    let bp = session
+        .stop_in("ThreadTest", "doWork", None, Some("thread"), None)
+        .expect("stop_in failed");
     assert!(
-        matches!(bp_resp.result, CommandResult::BreakpointSet { .. }),
-        "expected BreakpointSet, got {:?}",
-        bp_resp.result
+        matches!(bp.result, CommandResult::BreakpointSet { .. }),
+        "thread breakpoint should be accepted, got {:?}",
+        bp.result
     );
 
-    // 注册 thread suspend policy
-    session.set_suspend_policy("ThreadTest:37", "thread");
-
-    // 运行
     let run_resp = session.run(Some(30)).expect("run failed");
-
-    // 应该停在 doWork 里
+    // PartialStop 补全：截断 banner（JDK 8 SUSPEND_THREAD）经 session 层
+    // threads→thread<id>→where 自动补全 thread/location/frame。
     match &run_resp.result {
-        CommandResult::Stopped { location, thread, .. } => {
+        CommandResult::Stopped { location, thread, frame, .. } => {
             assert_eq!(location.class, "ThreadTest");
             assert_eq!(location.method, "doWork");
-            // thread 应该是 "worker"
-            assert_eq!(thread, "worker");
+            assert_eq!(thread, "worker", "the hit thread should be 'worker'");
+            // frame 应已被 session 层从 `where` 回填（供 handler 跳过重复 where 查询）。
+            let f = frame.as_ref().expect("frame should be enriched by session layer");
+            assert_eq!(f.location.class, "ThreadTest");
+            assert_eq!(f.location.method, "doWork");
+            assert!(f.location.line > 0, "enriched frame line should be nonzero");
         }
-        other => panic!("expected Stopped in doWork, got {other:?}"),
+        other => panic!("expected Stopped in worker/doWork, got {other:?}"),
     }
 
-    // 模拟 apply_suspend_policy
+    // 走 handler 层 enrich：基于 session 已填的 frame，补 source_context（list）。
     let mut resp = run_resp;
-    apply_suspend_policy_test_helper(&session, &mut resp, None);
-
-    // 验证 note 中包含 suspend policy 信息
-    assert!(
-        resp.note.is_some(),
-        "thread suspend policy should produce a note"
-    );
-    let note = resp.note.as_ref().unwrap();
-    assert!(
-        note.contains("thread"),
-        "note should mention 'thread', got: {note}"
-    );
-    assert!(
-        note.contains("worker"),
-        "note should mention the thread name 'worker', got: {note}"
-    );
+    enrich_stopped_test_helper(&session, &mut resp);
+    match &resp.result {
+        CommandResult::Stopped { source_context, location, .. } => {
+            let lines = source_context
+                .as_ref()
+                .expect("source_context should be enriched via handler layer");
+            assert!(
+                lines.iter().any(|l| l.number == location.line),
+                "source_context should contain the hit line {}",
+                location.line
+            );
+        }
+        other => panic!("expected Stopped after enrich, got {other:?}"),
+    }
 
     let _ = session.kill();
 }
 
+/// 核心回归：thread policy 下 VM 不会 SUSPEND_ALL —— worker 挂在断点时，daemon
+/// 线程 heartbeat 仍持续递增 heartbeatCount，证明其它线程没有被冻结。
+/// （旧的 suspend-count 模拟方案在此会因 spec 不匹配静默退回 all，冻结全部线程。）
 #[test]
-fn thread_breakpoint_other_threads_resume() {
+fn thread_breakpoint_keeps_other_threads_running() {
     let session = launch_fixture("ThreadTest");
 
-    // 在 doWork 第一行设置 thread breakpoint
     session
-        .stop_at("ThreadTest", 37, None, None)
-        .expect("stop_at failed");
-    session.set_suspend_policy("ThreadTest:37", "thread");
-
+        .stop_in("ThreadTest", "doWork", None, Some("thread"), None)
+        .expect("stop_in failed");
     let run_resp = session.run(Some(30)).expect("run failed");
     assert!(
         matches!(&run_resp.result, CommandResult::Stopped { .. }),
@@ -404,118 +410,21 @@ fn thread_breakpoint_other_threads_resume() {
         run_resp.result
     );
 
-    // 应用 thread suspend policy
-    let mut resp = run_resp;
-    apply_suspend_policy_test_helper(&session, &mut resp, None);
-
-    // 验证 heartbeat 线程在 apply 后是 running（不再 suspended）
-    // 获取线程列表
-    let threads_resp = session.threads(Some(5)).expect("threads failed");
-    if let CommandResult::Threads { threads } = &threads_resp.result {
-        let heartbeat = threads.iter().find(|t| t.name == "heartbeat");
-        assert!(
-            heartbeat.is_some(),
-            "heartbeat thread should exist in thread list"
-        );
-        let hb = heartbeat.unwrap();
-        // heartbeat 不应该是 "at breakpoint" 状态 — 它应该是 running/sleeping
-        assert!(
-            !hb.state.contains("breakpoint"),
-            "heartbeat should NOT be at breakpoint, state: {}",
-            hb.state
-        );
+    // worker 已挂在断点；读 heartbeatCount 两次，中间用 jdb 往返制造时间窗口
+    // （heartbeat 每 ~50ms 递增）。thread policy 下计数必须继续增长。
+    let c1 = try_eval_int_helper(&session, "ThreadTest.heartbeatCount", Some(5))
+        .expect("should read heartbeatCount (c1)");
+    for _ in 0..15 {
+        let _ = session.threads(Some(5));
     }
-
-    // worker 线程应该仍然 suspended
-    let threads_resp2 = session.threads(Some(5)).expect("threads failed");
-    if let CommandResult::Threads { threads } = &threads_resp2.result {
-        let worker = threads.iter().find(|t| t.name == "worker");
-        assert!(
-            worker.is_some(),
-            "worker thread should exist in thread list"
-        );
-    }
-
-    let _ = session.kill();
-}
-
-#[test]
-fn default_suspend_all_does_not_produce_note() {
-    let session = launch_fixture("ThreadTest");
-
-    // 设置断点但不设置 suspend policy（默认 "all"）
-    session
-        .stop_at("ThreadTest", 37, None, None)
-        .expect("stop_at failed");
-
-    let run_resp = session.run(Some(30)).expect("run failed");
-    assert!(matches!(&run_resp.result, CommandResult::Stopped { .. }));
-
-    // apply_suspend_policy 不应改变什么（policy 默认 = "all"）
-    let mut resp = run_resp;
-    apply_suspend_policy_test_helper(&session, &mut resp, None);
-
-    // 不应有 suspend policy note
-    assert!(
-        resp.note.is_none(),
-        "default 'all' policy should not produce a note, got: {:?}",
-        resp.note
-    );
-
-    let _ = session.kill();
-}
-
-#[test]
-fn explicit_suspend_all_does_not_produce_note() {
-    let session = launch_fixture("ThreadTest");
-
-    session
-        .stop_at("ThreadTest", 37, None, None)
-        .expect("stop_at failed");
-    // 显式设置 "all"
-    session.set_suspend_policy("ThreadTest:37", "all");
-
-    let run_resp = session.run(Some(30)).expect("run failed");
-    assert!(matches!(&run_resp.result, CommandResult::Stopped { .. }));
-
-    let mut resp = run_resp;
-    apply_suspend_policy_test_helper(&session, &mut resp, None);
+    let c2 = try_eval_int_helper(&session, "ThreadTest.heartbeatCount", Some(5))
+        .expect("should read heartbeatCount (c2)");
 
     assert!(
-        resp.note.is_none(),
-        "explicit 'all' policy should not produce a note, got: {:?}",
-        resp.note
+        c2 > c1,
+        "heartbeat must keep counting under thread policy (c1={c1}, c2={c2}); \
+         if equal, the whole VM was frozen — a SUSPEND_ALL regression"
     );
-
-    let _ = session.kill();
-}
-
-#[test]
-fn resolve_thread_id_finds_worker() {
-    let session = launch_fixture("ThreadTest");
-
-    // 在 doWork 里停住，这时 "worker" 线程存在
-    session
-        .stop_at("ThreadTest", 37, None, None)
-        .expect("stop_at failed");
-    let run_resp = session.run(Some(30)).expect("run failed");
-    assert!(matches!(&run_resp.result, CommandResult::Stopped { .. }));
-
-    // resolve_thread_id 应该找到 "worker"
-    let hex_id = session.resolve_thread_id("worker", Some(5));
-    assert!(
-        hex_id.is_some(),
-        "should resolve 'worker' thread to a hex id"
-    );
-    let id = hex_id.unwrap();
-    assert!(
-        id.starts_with("0x"),
-        "thread id should be hex format (0x...), got: {id}"
-    );
-
-    // 不存在的线程名返回 None
-    let bogus = session.resolve_thread_id("nonexistent-thread-xyz", Some(5));
-    assert!(bogus.is_none(), "nonexistent thread should return None");
 
     let _ = session.kill();
 }
@@ -770,64 +679,4 @@ fn try_get_element_helper(
         }
     }
     None
-}
-
-fn append_note_helper(resp: &mut CommandResponse, msg: &str) {
-    match &mut resp.note {
-        Some(existing) => { existing.push('\n'); existing.push_str(msg); }
-        None => resp.note = Some(msg.to_string()),
-    }
-}
-
-/// Mirror of handler.rs `apply_suspend_policy` — thread-level suspend via suspend-count trick.
-fn apply_suspend_policy_test_helper(session: &Session, resp: &mut CommandResponse, timeout: Option<u64>) {
-    let (spec, thread_name) = match &resp.result {
-        CommandResult::Stopped { event: Event::Breakpoint { location, .. }, thread, .. } => {
-            (format!("{}:{}", location.class, location.line), thread.clone())
-        }
-        _ => return,
-    };
-
-    let policy = session.get_suspend_policy(&spec).unwrap_or_else(|| "all".into());
-    if policy != "thread" {
-        return;
-    }
-
-    let hex_id = match session.resolve_thread_id(&thread_name, timeout) {
-        Some(id) => id,
-        None => {
-            append_note_helper(resp, &format!(
-                "WARNING: suspend policy is 'thread' but could not resolve thread \"{}\" to a hex ID — \
-                 falling back to suspend=all (all threads frozen).",
-                thread_name
-            ));
-            return;
-        }
-    };
-
-    // suspend count +1
-    if let Err(e) = session.raw(&format!("suspend {hex_id}"), timeout) {
-        append_note_helper(resp, &format!(
-            "WARNING: suspend policy is 'thread' but `suspend {}` failed ({}) — \
-             falling back to suspend=all (all threads frozen).",
-            hex_id, e
-        ));
-        return;
-    }
-
-    // resume all (count -1)
-    if let Err(e) = session.raw("resume", timeout) {
-        let _ = session.raw(&format!("resume {hex_id}"), timeout);
-        append_note_helper(resp, &format!(
-            "WARNING: suspend policy is 'thread' but `resume` (all) failed ({}) — \
-             rolled back suspend count; falling back to suspend=all (all threads frozen).",
-            e
-        ));
-        return;
-    }
-
-    append_note_helper(resp, &format!(
-        "Suspend policy: thread — only \"{}\" ({}) is suspended; other threads continue.",
-        thread_name, hex_id
-    ));
 }
