@@ -9,7 +9,18 @@ use anyhow::{Context, Result, bail};
 
 use crate::setup;
 
+use crate::client;
+use crate::protocol::{Command, Request};
+
 const REPO: &str = "PieceOfFall/jdbg";
+
+/// Best-effort: stop the background daemon so it releases its handle on jdbg.exe.
+fn stop_daemon_if_running() {
+    let req = Request::new(Command::DaemonStop, None);
+    let _ = client::send_request(&req);
+    // Give the daemon a moment to exit.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+}
 
 /// 检测当前平台，返回对应的安装命令。
 fn install_command() -> (String, Vec<String>) {
@@ -38,17 +49,28 @@ fn install_command() -> (String, Vec<String>) {
     }
 }
 
-/// Windows：把当前正在运行的 exe 重命名为 `.old`，让 installer 能写入新文件。
-/// 返回 old path（用于安装后清理）。Non-Windows 上不做任何操作。
+/// Windows: rename the running exe out of the way so the installer can write the new one.
+/// Returns the old path for post-install cleanup. On non-Windows this is a no-op.
 #[cfg(windows)]
 fn move_self_aside() -> Result<Option<std::path::PathBuf>> {
     let current_exe = std::env::current_exe().context("cannot determine current exe path")?;
     let old_path = current_exe.with_extension("exe.old");
-    // 如果上次遗留了 .old，先删掉
+
+    // Try removing a leftover .old from a previous update.
     let _ = std::fs::remove_file(&old_path);
-    std::fs::rename(&current_exe, &old_path)
-        .with_context(|| format!("cannot rename {} to {}", current_exe.display(), old_path.display()))?;
-    Ok(Some(old_path))
+
+    // Attempt the primary rename.
+    match std::fs::rename(&current_exe, &old_path) {
+        Ok(()) => return Ok(Some(old_path)),
+        Err(_) => {}
+    }
+
+    // .old may be locked by another process (e.g. daemon). Use a unique suffix.
+    let unique_path = current_exe.with_extension(format!("exe.old.{}", std::process::id()));
+    std::fs::rename(&current_exe, &unique_path)
+        .with_context(|| format!("cannot rename {} (tried .old and .old.{} — is another jdbg process running? Stop the daemon with `jdbg daemon stop` first)",
+            current_exe.display(), std::process::id()))?;
+    Ok(Some(unique_path))
 }
 
 #[cfg(not(windows))]
@@ -64,6 +86,9 @@ fn cleanup_old(old_path: Option<std::path::PathBuf>) {
 }
 
 pub fn run_update() -> Result<()> {
+    // Step 0: Stop the daemon if running (its handle on jdbg.exe blocks rename on Windows)
+    stop_daemon_if_running();
+
     // Step 1: Remove old setup
     println!("[1/3] Removing old jdbg registration...");
     setup::run_setup(true, false)?;

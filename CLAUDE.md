@@ -75,15 +75,32 @@ These are settled decisions. Changing them needs explicit user sign-off.
   (`-connect com.sun.jdi.SocketAttach:hostname=H,port=P`), **not** `jdb -attach host:port` — on Windows the
   latter defaults to shared-memory (dt_shmem) and fails against a dt_socket JDWP target.
 
-## Release checklist
+## CI / Release
 
-Before bumping version and tagging a release:
+Release builds use **cargo-dist** + GitHub Actions (`.github/workflows/release.yml`).
+
+**Trigger:** pushing a **git tag** matching `**[0-9]+.[0-9]+.[0-9]+*` (e.g. `v0.7.0`). A plain branch
+push does NOT trigger a release build. PRs trigger a plan-only dry-run (no publish).
+
+**Release checklist:**
 1. `cargo test` passes (all unit + integration).
 2. **Check `skills/jdbg/SKILL.md`** — if any tool was added/removed/renamed, parameters changed, or
    behavior semantics changed (e.g. new fields in responses, new notes), update the skill file:
    `allowed-tools` list, tool reference table, "Reading results" section, "Common mistakes", etc.
 3. Bump `metadata.version` in `SKILL.md` when it changes.
-4. Commit SKILL.md update **before** the version-bump commit (or in the same commit).
+4. Bump `version` in `Cargo.toml`.
+5. Commit all changes (SKILL.md + Cargo.toml + README can share one commit).
+6. **Tag and push** — this is the only action that triggers the CI release:
+   ```
+   git tag v<version>
+   git push origin main --tags
+   ```
+7. The workflow runs automatically: plan → build (Windows/Linux/macOS) → create GitHub Release with
+   platform artifacts.
+
+**Workflow output:** per-platform binary archives + installer scripts (.sh/.ps1), attached to the
+GitHub Release page. The `jdbg update` command downloads the latest release artifact for the current
+platform and self-updates.
 
 ## Build & test conventions
 
