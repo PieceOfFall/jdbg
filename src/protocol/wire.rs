@@ -108,6 +108,14 @@ pub enum Command {
         #[serde(default = "default_catch_mode")]
         mode: String,
     },
+    Watch {
+        field: String,
+        #[serde(default = "default_watch_mode")]
+        mode: String,
+    },
+    Unwatch {
+        field: String,
+    },
     Breakpoints,
     Clear { spec: String },
 
@@ -117,6 +125,15 @@ pub enum Command {
     Step,
     Next,
     StepOut,
+
+    // ── Class/method search ──
+    Classes {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pattern: Option<String>,
+    },
+    Methods {
+        class: String,
+    },
 
     // ── Inspection ──
     Where { #[serde(default)] all: bool },
@@ -139,6 +156,7 @@ pub enum Command {
 fn default_host() -> String { "localhost".into() }
 fn default_port() -> u16 { 5005 }
 fn default_catch_mode() -> String { "all".into() }
+fn default_watch_mode() -> String { "modification".into() }
 fn default_one() -> u32 { 1 }
 fn default_max_elements() -> u32 { 10 }
 

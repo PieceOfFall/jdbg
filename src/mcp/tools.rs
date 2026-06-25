@@ -104,6 +104,29 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             true,
             false,
         ),
+        tool(
+            "watch",
+            "Set a field watchpoint — execution stops when the field is accessed or modified. \
+             Use mode 'modification' (default) to catch writes, 'access' for reads, 'all' for both. \
+             The field spec is Class.field (fully-qualified). Use `classes` to find the exact class name first.",
+            json!({
+                "field": {"type": "string", "description": "Field spec: fully-qualified Class.field, e.g. com.example.Service.name."},
+                "mode": {"type": "string", "enum": ["access", "modification", "all"], "description": "Watch mode (default: modification)."}
+            }),
+            &["field"],
+            true,
+            false,
+        ),
+        tool(
+            "unwatch",
+            "Remove a field watchpoint.",
+            json!({
+                "field": {"type": "string", "description": "Field spec to unwatch, e.g. com.example.Service.name."}
+            }),
+            &["field"],
+            true,
+            false,
+        ),
         tool("breakpoints", "List the currently set breakpoints.", json!({}), &[], true, false),
         tool(
             "clear",
@@ -154,6 +177,29 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             false,
         ),
         tool("threads", "List all threads with id, name, group, and state.", json!({}), &[], true, false),
+        tool(
+            "classes",
+            "Search loaded classes by substring pattern. Without a pattern lists ALL loaded classes \
+             (can be thousands — always pass a pattern). Use this to find CGLIB proxies, inner classes, \
+             or confirm a class is loaded before setting breakpoints.",
+            json!({
+                "pattern": {"type": "string", "description": "Case-sensitive substring filter (e.g. 'Service', 'EnhancerBySpringCGLIB', 'Controller')."}
+            }),
+            &[],
+            true,
+            false,
+        ),
+        tool(
+            "methods",
+            "List all methods of a loaded class (with parameter types). Use after `classes` to find \
+             the exact method signature for `break_in`.",
+            json!({
+                "class": {"type": "string", "description": "Fully-qualified class name (from `classes` output)."}
+            }),
+            &["class"],
+            true,
+            false,
+        ),
         tool(
             "thread",
             "Switch the current thread.",
@@ -248,6 +294,11 @@ pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> 
             exception: require_str(args, "exception")?,
             mode: optional_str(args, "mode").unwrap_or_else(|| "all".to_string()),
         },
+        "watch" => Command::Watch {
+            field: require_str(args, "field")?,
+            mode: optional_str(args, "mode").unwrap_or_else(|| "modification".to_string()),
+        },
+        "unwatch" => Command::Unwatch { field: require_str(args, "field")? },
         "breakpoints" => Command::Breakpoints,
         "clear" => Command::Clear { spec: require_str(args, "spec")? },
         "run" => Command::Run,
@@ -261,6 +312,8 @@ pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> 
         "dump" => Command::Dump { expr: require_str(args, "expr")? },
         "eval" => Command::Eval { expr: require_str(args, "expr")? },
         "threads" => Command::Threads,
+        "classes" => Command::Classes { pattern: optional_str(args, "pattern") },
+        "methods" => Command::Methods { class: require_str(args, "class")? },
         "thread" => Command::Thread { id: require_str(args, "id")? },
         "frame" => Command::Frame {
             direction: require_str(args, "direction")?,
@@ -360,8 +413,8 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn exposes_26_tools() {
-        assert_eq!(tool_specs().len(), 26);
+    fn exposes_30_tools() {
+        assert_eq!(tool_specs().len(), 30);
     }
 
     #[test]
@@ -480,6 +533,70 @@ mod tests {
     fn inspect_accepts_custom_max_elements() {
         let req = dispatch_tool("inspect", &json!({"expr": "arr", "max_elements": 5})).unwrap();
         assert!(matches!(req.cmd, Command::Inspect { ref expr, max_elements } if expr == "arr" && max_elements == 5));
+    }
+
+    // ─── suspend parameter tests ─────────────────────────────────────────────
+
+    // ─── classes / methods / watch / unwatch tests ─────────────────────────
+
+    #[test]
+    fn classes_without_pattern() {
+        let req = dispatch_tool("classes", &json!({})).unwrap();
+        assert!(matches!(req.cmd, Command::Classes { pattern: None }));
+    }
+
+    #[test]
+    fn classes_with_pattern() {
+        let req = dispatch_tool("classes", &json!({"pattern": "Service"})).unwrap();
+        match req.cmd {
+            Command::Classes { pattern } => assert_eq!(pattern, Some("Service".to_string())),
+            other => panic!("expected Classes, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn methods_requires_class() {
+        let err = dispatch_tool("methods", &json!({})).unwrap_err();
+        assert_eq!(err.code, INVALID_PARAMS);
+    }
+
+    #[test]
+    fn methods_maps_class() {
+        let req = dispatch_tool("methods", &json!({"class": "java.lang.String"})).unwrap();
+        match req.cmd {
+            Command::Methods { class } => assert_eq!(class, "java.lang.String"),
+            other => panic!("expected Methods, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn watch_defaults_mode_to_modification() {
+        let req = dispatch_tool("watch", &json!({"field": "Main.x"})).unwrap();
+        match req.cmd {
+            Command::Watch { field, mode } => {
+                assert_eq!(field, "Main.x");
+                assert_eq!(mode, "modification");
+            }
+            other => panic!("expected Watch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn watch_with_access_mode() {
+        let req = dispatch_tool("watch", &json!({"field": "Main.x", "mode": "access"})).unwrap();
+        match req.cmd {
+            Command::Watch { mode, .. } => assert_eq!(mode, "access"),
+            other => panic!("expected Watch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unwatch_maps_field() {
+        let req = dispatch_tool("unwatch", &json!({"field": "Main.x"})).unwrap();
+        match req.cmd {
+            Command::Unwatch { field } => assert_eq!(field, "Main.x"),
+            other => panic!("expected Unwatch, got {other:?}"),
+        }
     }
 
     // ─── suspend parameter tests ─────────────────────────────────────────────

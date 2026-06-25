@@ -12,6 +12,8 @@
 - **Auto-enriched stop results** — breakpoint/step hits include source context and top stack frame automatically.
 - **Conditional breakpoints** — filter high-traffic code with boolean expressions (e.g. `userId == 123`).
 - **Thread breakpoints** — `suspend: "thread"` only holds the hit thread; heartbeat/ZK/Dubbo threads keep running (like IDEA's thread breakpoint).
+- **Class/method search** — `classes` finds CGLIB proxies and runtime-generated classes; `methods` lists exact signatures for `break_in`.
+- **Field watchpoints** — `watch` breaks on field access or modification (find out *who* changed a field and *when*).
 - **Collection inspection** — `inspect` shows size + first N elements of any List/array/Map in one call.
 - **Self-update** — `jdbg update` downloads the latest release and re-registers in one step.
 
@@ -122,11 +124,17 @@ jdbg attach [--host H] [--port P] [--sourcepath SP] [--name N]
 jdbg status | list | kill [--session ID]
 jdbg daemon start | stop | status
 
-# Breakpoints
+# Breakpoints & watchpoints
 jdbg break-at <Class> <line> [-c <condition>] [-s thread|all]
 jdbg break-in <Class> <method> [--args types] [-c <condition>] [-s thread|all]
 jdbg catch <Exception> [--mode caught|uncaught|all]
+jdbg watch <Class.field> [--mode access|modification|all]
+jdbg unwatch <Class.field>
 jdbg breakpoints | clear <spec>
+
+# Class/method search
+jdbg classes [pattern]
+jdbg methods <Class>
 
 # Execution control
 jdbg run | cont | step | next | step-out
@@ -148,7 +156,7 @@ jdbg update
 
 ## MCP Server (Claude Code native tools)
 
-`jdbg __mcp` runs a stdio JSON-RPC 2.0 MCP server, exposing the CLI surface as **26 native tools**
+`jdbg __mcp` runs a stdio JSON-RPC 2.0 MCP server, exposing the CLI surface as **30 native tools**
 (`launch`, `break_at`, `run`, `locals`, `cont`, `inspect`, …) so Claude Code can drive a debug session
 without going through Bash. Tools appear as `mcp__jdbg__<tool>`.
 
@@ -196,7 +204,7 @@ See [`DESIGN.md`](DESIGN.md) for the full design reference (Chinese).
 ```bash
 cargo build          # debug build
 cargo build --release
-cargo test           # 65 unit + 14 integration tests (parser, protocol, MCP tools, session, suspend policy, e2e)
+cargo test           # 84 unit + 18 integration tests (parser, reader, MCP tools, session, classes/methods, watch, e2e)
 ```
 
 The parser is validated against captured real-jdb transcripts under `tests/fixtures/jdb/`. Pure logic

@@ -77,6 +77,9 @@ pub enum CommandHint {
     ListSource,
     Breakpoints,
     BreakpointSet,
+    Classes,
+    Methods,
+    WatchSet,
     Run,
     Cont,
     Step,
@@ -107,6 +110,9 @@ pub fn classify_output(output: &str, hint: CommandHint) -> (CommandResult, Optio
         CommandHint::ListSource => parse_source(output),
         CommandHint::Breakpoints => parse_breakpoint_list(output),
         CommandHint::BreakpointSet => parse_breakpoint_set(output),
+        CommandHint::Classes => parse_classes(output),
+        CommandHint::Methods => parse_methods(output),
+        CommandHint::WatchSet => parse_watch_set(output),
         _ => CommandResult::Raw { text: output.to_string() },
     };
     (result, note)
@@ -347,6 +353,44 @@ pub fn parse_breakpoint_set(output: &str) -> CommandResult {
     }
 }
 
+// ─── classes / methods / watch 解析器 ──────────────────────────────────────────
+
+/// 解析 `classes [pattern]` 输出——每行一个全限定类名。
+pub fn parse_classes(output: &str) -> CommandResult {
+    let classes: Vec<String> = output
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with("**"))
+        .map(|l| l.to_string())
+        .collect();
+    CommandResult::Classes { classes }
+}
+
+/// 解析 `methods <class>` 输出——每行一个方法签名。
+pub fn parse_methods(output: &str) -> CommandResult {
+    let methods: Vec<String> = output
+        .lines()
+        .map(|l| l.trim())
+        .filter(|l| !l.is_empty() && !l.starts_with("**"))
+        .map(|l| l.to_string())
+        .collect();
+    CommandResult::Methods { class: String::new(), methods }
+}
+
+/// 解析 `watch` 设置确认。
+pub fn parse_watch_set(output: &str) -> CommandResult {
+    let text = output.trim();
+    let deferred = text.contains("Deferring") || text.contains("deferred");
+    let mode = if text.contains("access") && text.contains("modification") {
+        "all".to_string()
+    } else if text.contains("access") {
+        "access".to_string()
+    } else {
+        "modification".to_string()
+    };
+    CommandResult::WatchSet { spec: text.to_string(), mode, deferred }
+}
+
 // ─── 工具函数 ────────────────────────────────────────────────────────────────────
 
 /// 解析栈帧括号内容 `(File.java:42)` → (file, line, is_native)。
@@ -577,6 +621,124 @@ It will be set after the class is loaded.";
             panic!("expected BreakpointSet, got {result:?}");
         };
         assert_eq!(bp_kind, BreakpointKind::Line);
+        assert!(deferred);
+    }
+
+    // ─── classes / methods / watch 测试 ──────────────────────────────────────
+
+    const CLASSES_OUTPUT: &str = "\
+** classes list **
+java.lang.Object
+java.lang.String
+com.example.Service
+com.example.Service$$EnhancerBySpringCGLIB$$abc123
+java.util.ArrayList";
+
+    const CLASSES_FILTERED: &str = "\
+com.example.Service
+com.example.Service$$EnhancerBySpringCGLIB$$abc123";
+
+    const METHODS_OUTPUT: &str = "\
+** methods list **
+java.lang.String <init>(byte[], int, int)
+java.lang.String charAt(int)
+java.lang.String length()
+java.lang.String toString()";
+
+    const WATCH_SET_MODIFICATION: &str = "Set watch modification of com.example.Service.name";
+    const WATCH_SET_ACCESS: &str = "Set watch access of com.example.Service.name";
+    const WATCH_SET_ALL: &str = "Set watch all access and modification of com.example.Service.name";
+    const WATCH_SET_DEFERRED: &str = "\
+Deferring watch modification of com.example.Service.name.
+It will be set after the class is loaded.";
+
+    #[test]
+    fn classes_parses_with_header() {
+        let result = parse_classes(CLASSES_OUTPUT);
+        let CommandResult::Classes { classes } = result else {
+            panic!("expected Classes, got {result:?}");
+        };
+        assert_eq!(classes.len(), 5);
+        assert_eq!(classes[0], "java.lang.Object");
+        assert_eq!(classes[3], "com.example.Service$$EnhancerBySpringCGLIB$$abc123");
+    }
+
+    #[test]
+    fn classes_parses_filtered() {
+        let result = parse_classes(CLASSES_FILTERED);
+        let CommandResult::Classes { classes } = result else {
+            panic!("expected Classes, got {result:?}");
+        };
+        assert_eq!(classes.len(), 2);
+        assert!(classes[1].contains("CGLIB"));
+    }
+
+    #[test]
+    fn classes_empty_returns_empty_vec() {
+        let result = parse_classes("");
+        let CommandResult::Classes { classes } = result else {
+            panic!("expected Classes, got {result:?}");
+        };
+        assert!(classes.is_empty());
+    }
+
+    #[test]
+    fn methods_parses_with_header() {
+        let result = parse_methods(METHODS_OUTPUT);
+        let CommandResult::Methods { methods, .. } = result else {
+            panic!("expected Methods, got {result:?}");
+        };
+        assert_eq!(methods.len(), 4);
+        assert!(methods[0].contains("<init>"));
+        assert!(methods[2].contains("length()"));
+    }
+
+    #[test]
+    fn methods_empty_returns_empty_vec() {
+        let result = parse_methods("");
+        let CommandResult::Methods { methods, .. } = result else {
+            panic!("expected Methods, got {result:?}");
+        };
+        assert!(methods.is_empty());
+    }
+
+    #[test]
+    fn watch_set_modification() {
+        let result = parse_watch_set(WATCH_SET_MODIFICATION);
+        let CommandResult::WatchSet { mode, deferred, .. } = result else {
+            panic!("expected WatchSet, got {result:?}");
+        };
+        assert_eq!(mode, "modification");
+        assert!(!deferred);
+    }
+
+    #[test]
+    fn watch_set_access() {
+        let result = parse_watch_set(WATCH_SET_ACCESS);
+        let CommandResult::WatchSet { mode, deferred, .. } = result else {
+            panic!("expected WatchSet, got {result:?}");
+        };
+        assert_eq!(mode, "access");
+        assert!(!deferred);
+    }
+
+    #[test]
+    fn watch_set_all() {
+        let result = parse_watch_set(WATCH_SET_ALL);
+        let CommandResult::WatchSet { mode, deferred, .. } = result else {
+            panic!("expected WatchSet, got {result:?}");
+        };
+        assert_eq!(mode, "all");
+        assert!(!deferred);
+    }
+
+    #[test]
+    fn watch_set_deferred() {
+        let result = parse_watch_set(WATCH_SET_DEFERRED);
+        let CommandResult::WatchSet { mode, deferred, .. } = result else {
+            panic!("expected WatchSet, got {result:?}");
+        };
+        assert_eq!(mode, "modification");
         assert!(deferred);
     }
 }

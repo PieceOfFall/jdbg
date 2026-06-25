@@ -58,6 +58,9 @@ fn render_result(result: &CommandResult) -> String {
             let kind = match event {
                 Event::Breakpoint { .. } => "Breakpoint hit",
                 Event::Step { .. } => "Step completed",
+                Event::FieldWatch { field, access_type, .. } => {
+                    return format_field_watch_stopped(field, access_type, thread, location, source_context);
+                }
                 _ => "Stopped",
             };
             let mut out = format!(
@@ -176,8 +179,51 @@ fn render_result(result: &CommandResult) -> String {
             }
             out
         }
+        CommandResult::Classes { classes } => {
+            if classes.is_empty() {
+                "No matching classes.".into()
+            } else {
+                format!("{} classes:\n{}", classes.len(), classes.join("\n"))
+            }
+        }
+        CommandResult::Methods { class, methods } => {
+            if methods.is_empty() {
+                format!("No methods found for {class}.")
+            } else {
+                format!("{} ({} methods):\n{}", class, methods.len(), methods.join("\n"))
+            }
+        }
+        CommandResult::WatchSet { spec, mode, deferred } => {
+            let d = if *deferred { " (deferred)" } else { "" };
+            format!("Watch set ({mode}){d}: {spec}")
+        }
         CommandResult::Raw { text } => text.clone(),
     }
+}
+
+fn format_field_watch_stopped(
+    field: &str,
+    access_type: &str,
+    thread: &str,
+    location: &Location,
+    source_context: &Option<Vec<SourceLine>>,
+) -> String {
+    let mut out = format!(
+        "Field watchpoint hit ({access_type}): {field} thread={thread}"
+    );
+    if location.line > 0 {
+        out.push_str(&format!(
+            "\n  at {}.{}() line={}",
+            location.class, location.method, location.line
+        ));
+    }
+    if let Some(lines) = source_context {
+        for l in lines {
+            let marker = if l.number == location.line { "=>" } else { "  " };
+            out.push_str(&format!("\n{marker} {:>4}  {}", l.number, l.text));
+        }
+    }
+    out
 }
 
 #[cfg(test)]

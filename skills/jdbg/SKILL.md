@@ -2,9 +2,9 @@
 name: jdbg
 description: Use when you need a Java program's real runtime state instead of reading source or adding print statements — the actual value of a variable/field/expression at a line, why an exception or NullPointerException is thrown (with stack + locals at the throw site), what a thread is blocked or deadlocked on, or how execution reaches some code. Also for stepping through Java line by line, or attaching to an already-running JVM that has JDWP enabled. Cross-platform, native on Windows, no IDE.
 compatibility: Requires a JDK 8+ (provides the `jdb` command). Debugging is driven through the `jdbg` MCP server (tools named `launch`, `break_at`, `run`, `locals`, …). Native on Windows, Linux, macOS.
-allowed-tools: mcp__jdbg__launch, mcp__jdbg__attach, mcp__jdbg__status, mcp__jdbg__list, mcp__jdbg__kill, mcp__jdbg__break_at, mcp__jdbg__break_in, mcp__jdbg__catch, mcp__jdbg__breakpoints, mcp__jdbg__clear, mcp__jdbg__run, mcp__jdbg__cont, mcp__jdbg__step, mcp__jdbg__next, mcp__jdbg__step_out, mcp__jdbg__where, mcp__jdbg__locals, mcp__jdbg__print, mcp__jdbg__dump, mcp__jdbg__eval, mcp__jdbg__threads, mcp__jdbg__thread, mcp__jdbg__frame, mcp__jdbg__list_source, mcp__jdbg__inspect, mcp__jdbg__raw, Bash(javac:*), Bash(java:*), Read
+allowed-tools: mcp__jdbg__launch, mcp__jdbg__attach, mcp__jdbg__status, mcp__jdbg__list, mcp__jdbg__kill, mcp__jdbg__break_at, mcp__jdbg__break_in, mcp__jdbg__catch, mcp__jdbg__watch, mcp__jdbg__unwatch, mcp__jdbg__breakpoints, mcp__jdbg__clear, mcp__jdbg__run, mcp__jdbg__cont, mcp__jdbg__step, mcp__jdbg__next, mcp__jdbg__step_out, mcp__jdbg__where, mcp__jdbg__locals, mcp__jdbg__print, mcp__jdbg__dump, mcp__jdbg__eval, mcp__jdbg__threads, mcp__jdbg__classes, mcp__jdbg__methods, mcp__jdbg__thread, mcp__jdbg__frame, mcp__jdbg__list_source, mcp__jdbg__inspect, mcp__jdbg__raw, Bash(javac:*), Bash(java:*), Read
 metadata:
-  version: "2.2"
+  version: "2.3"
 ---
 
 # jdbg — interactive Java debugging for agents
@@ -82,12 +82,14 @@ found via `JAVA_HOME/bin` → PATH → common install dirs).
 > Daemon management is automatic: the daemon starts on the first tool call and persists. There is no MCP tool
 > to start/stop it — it is an implementation detail, not part of the debugging surface.
 
-### Breakpoints
+### Breakpoints & watchpoints
 | Tool | Purpose |
 |---|---|
 | `break_at { class, line, condition?, suspend? }` | break at a source line |
 | `break_in { class, method, args?, condition?, suspend? }` | break at method entry (`args` = comma-separated param types) |
 | `catch { exception, mode? }` | break when an exception is thrown (`mode`: caught \| uncaught \| all) |
+| `watch { field, mode? }` | break when a field is accessed or modified (`mode`: access \| modification \| all; default: modification) |
+| `unwatch { field }` | remove a field watchpoint |
 | `breakpoints` · `clear { spec }` | list / remove breakpoints |
 
 **Conditional breakpoints** — filter for a specific request in high-traffic code:
@@ -131,7 +133,9 @@ call `list_source` or `where` separately after stopping — the information is a
 | `threads` · `thread { id }` | list threads / switch the current thread |
 | `frame { direction, n? }` | move within the call stack (`direction`: up \| down) |
 | `list_source { line? }` | show source around a line |
-| `raw { command }` | escape hatch: send a literal jdb command (`monitor`, `fields`, `methods`, `classes`, `redefine`, `trace`, …) |
+| `classes { pattern? }` | search loaded classes by substring — find CGLIB proxies, inner classes, or confirm a class is loaded |
+| `methods { class }` | list all methods of a loaded class (with param types) — find exact signature for `break_in` |
+| `raw { command }` | escape hatch: send a literal jdb command (`monitor`, `fields`, `redefine`, `trace`, …) |
 
 ## Reading results & deciding what to do next
 Every tool returns a typed result. The ones that drive the next move:
@@ -158,6 +162,37 @@ inspect { "expr": "map.keySet()", "max_elements": 20 }  → first 20 keys
 Works with `ArrayList`, `HashMap.values()`, `HashMap.keySet()`, arrays, and any object with
 `.size()`/`.length` + `.get(i)`/`[i]` accessors. Returns structured output: size, elements list, and
 whether the result was truncated.
+
+## Finding classes and methods (Spring/CGLIB/Tomcat)
+
+Use `classes` to discover runtime class names — essential when Spring wraps beans in CGLIB proxies:
+```
+classes { "pattern": "CartService" }
+→ ["com.example.CartService", "com.example.CartService$$EnhancerBySpringCGLIB$$a1b2c3"]
+```
+
+Then use `methods` to find the exact method signature for `break_in`:
+```
+methods { "class": "com.example.CartService" }
+→ ["void addItem(java.lang.String, int)", "java.util.List getItems()", ...]
+```
+
+**Always pass a pattern to `classes`** — without one it returns ALL loaded classes (thousands in a Tomcat JVM).
+
+## Field watchpoints
+
+Use `watch` to find out *who* modifies a field and *when*:
+```
+watch { "field": "com.example.Config.timeout", "mode": "modification" }
+cont
+→ Stopped (FieldWatch): field modified at Config.setTimeout() line=42
+```
+
+Modes: `modification` (default, catch writes), `access` (catch reads), `all` (both).
+Remove with `unwatch { "field": "com.example.Config.timeout" }`.
+
+Field watchpoints fire during blocking commands (`run`/`cont`/`step`/`next`/`step_out`) — the response
+includes the location, thread, and enriched source context just like breakpoint hits.
 
 ## Common mistakes
 - **`locals` empty / "information not available"** → the class was compiled without debug info. Recompile

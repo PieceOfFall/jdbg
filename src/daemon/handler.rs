@@ -189,6 +189,17 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
             };
             session.execute(&cmd, CommandKind::normal(CommandHint::BreakpointSet).with_timeout_secs(t))
         }
+        Command::Watch { field, mode } => {
+            let cmd = match mode.as_str() {
+                "access" => format!("watch access {field}"),
+                "all" => format!("watch all {field}"),
+                _ => format!("watch {field}"),
+            };
+            session.execute(&cmd, CommandKind::normal(CommandHint::WatchSet).with_timeout_secs(t))
+        }
+        Command::Unwatch { field } => {
+            session.execute(&format!("unwatch {field}"), CommandKind::normal(CommandHint::Other).with_timeout_secs(t))
+        }
         Command::Breakpoints => {
             session.execute("clear", CommandKind::normal(CommandHint::Breakpoints).with_timeout_secs(t))
         }
@@ -224,6 +235,31 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
                 Ok(resp) => return Response::ok(id, resp),
                 Err(e) => return Response::err(id, e.exit_code(), e.to_string()),
             }
+        }
+
+        // Class/method search
+        Command::Classes { pattern } => {
+            let cmd = match pattern {
+                Some(p) => format!("classes {p}"),
+                None => "classes".to_string(),
+            };
+            let mut r = session.execute(&cmd, CommandKind::normal(CommandHint::Classes).with_timeout_secs(t));
+            // handler 注入 class 名到 Methods 结果（parser 无上下文）。
+            if let Ok(ref mut resp) = r {
+                if let CommandResult::Methods { ref mut class, .. } = resp.result {
+                    if let Some(p) = pattern { *class = p.clone(); }
+                }
+            }
+            r
+        }
+        Command::Methods { class } => {
+            let mut r = session.execute(&format!("methods {class}"), CommandKind::normal(CommandHint::Methods).with_timeout_secs(t));
+            if let Ok(ref mut resp) = r {
+                if let CommandResult::Methods { class: ref mut c, .. } = resp.result {
+                    *c = class.clone();
+                }
+            }
+            r
         }
 
         // Inspection (simple)
@@ -423,8 +459,15 @@ fn enrich_stopped(session: &Session, resp: &mut CommandResponse) {
         }
     }
 
-    if needs_source && location_line > 0 {
-        match session.list_source(Some(location_line), Some(5)) {
+    // 确定用于 source_context 的行号——如果 location.line==0（如 FieldWatch），从 frame 回填。
+    let effective_line = if location_line > 0 {
+        location_line
+    } else {
+        frame_data.as_ref().map(|f| f.location.line).unwrap_or(0)
+    };
+
+    if needs_source && effective_line > 0 {
+        match session.list_source(Some(effective_line), Some(5)) {
             Ok(src_resp) => {
                 if let CommandResult::Source { lines, .. } = src_resp.result {
                     source_data = Some(lines);
@@ -439,9 +482,18 @@ fn enrich_stopped(session: &Session, resp: &mut CommandResponse) {
     }
 
     // 写回结果。
-    if let CommandResult::Stopped { frame, source_context, .. } = &mut resp.result {
+    if let CommandResult::Stopped { location, frame, source_context, .. } = &mut resp.result {
         if frame.is_none() {
-            *frame = frame_data;
+            *frame = frame_data.clone();
+        }
+        // 如果 location 是空的（FieldWatch），从 frame 回填。
+        if location.line == 0 {
+            if let Some(ref f) = frame_data {
+                location.class = f.location.class.clone();
+                location.method = f.location.method.clone();
+                location.file = f.location.file.clone();
+                location.line = f.location.line;
+            }
         }
         if source_context.is_none() {
             *source_context = source_data;
@@ -452,7 +504,7 @@ fn enrich_stopped(session: &Session, resp: &mut CommandResponse) {
                 "WARNING: could not retrieve stack frame (enrichment skipped — `where` may return unexpected format).".into()
             );
         }
-        if source_context.is_none() && needs_source && location_line > 0 {
+        if source_context.is_none() && needs_source && effective_line > 0 {
             warnings.push(
                 "WARNING: could not retrieve source context (enrichment skipped — is sourcepath set and class compiled with -g?).".into()
             );

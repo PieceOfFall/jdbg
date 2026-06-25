@@ -43,6 +43,17 @@ static RE_EXCEPTION: LazyLock<Regex> = LazyLock::new(|| {
         .unwrap()
 });
 
+/// Field watchpoint hit (real jdb format, JDK 8–21+).
+/// Modification: `Field (Cls.field) is <old>, will be <new>: "thread=T", Cls.method(), line=N bci=M`
+/// Access:       `Field (Cls.field) is <value>: "thread=T", Cls.method(), line=N bci=M`
+/// The detail may contain colons inside quoted values, so match `: "thread=` as the separator.
+static RE_FIELD_WATCH: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?m)^Field \((?P<field>[^)]+)\) (?P<detail>.+): "thread=(?P<thread>[^"]+)", (?P<class>\S+)\.(?P<method>\S+)\(\), line=(?P<line>\d+)"#,
+    )
+    .unwrap()
+});
+
 /// VM 退出 / 断开。
 static RE_VM_EXIT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"(?m)^The application (?:exited|has been disconnected)").unwrap()
@@ -107,6 +118,14 @@ pub enum DetectedEvent {
         thread: String,
         exception: String,
         caught: bool,
+    },
+    FieldWatch {
+        thread: String,
+        field: String,
+        access_type: String,
+        class: String,
+        method: String,
+        line: u32,
     },
 }
 
@@ -299,6 +318,22 @@ fn detect_event(output: &str, prompt_thread: Option<&str>) -> Option<DetectedEve
             caught: &c["caught"] == "caught",
         });
     }
+    if let Some(c) = RE_FIELD_WATCH.captures(output) {
+        let detail = &c["detail"];
+        let access_type = if detail.contains("will be") {
+            "modified".to_string()
+        } else {
+            "accessed".to_string()
+        };
+        return Some(DetectedEvent::FieldWatch {
+            thread: c["thread"].to_string(),
+            field: c["field"].to_string(),
+            access_type,
+            class: c["class"].to_string(),
+            method: c["method"].to_string(),
+            line: c["line"].parse().unwrap_or(0),
+        });
+    }
     None
 }
 
@@ -315,4 +350,48 @@ fn current_line(text: &str, pos: usize) -> &str {
     let start = text[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
     let end = text[pos..].find('\n').map(|i| pos + i).unwrap_or(text.len());
     &text[start..end]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detect_field_watch_modification() {
+        // Real jdb format: Field (Class.field) is <old>, will be <new>: "thread=T", Class.method(), line=N bci=M
+        let output = r#"Field (WatchTest.name) is null, will be "initial": "thread=main", WatchTest.<clinit>(), line=6 bci=2"#;
+        let event = detect_event(output, Some("main"));
+        let Some(DetectedEvent::FieldWatch { thread, field, access_type, class, method, line }) = event else {
+            panic!("expected FieldWatch, got {event:?}");
+        };
+        assert_eq!(thread, "main");
+        assert_eq!(field, "WatchTest.name");
+        assert_eq!(access_type, "modified");
+        assert_eq!(class, "WatchTest");
+        assert_eq!(method, "<clinit>");
+        assert_eq!(line, 6);
+    }
+
+    #[test]
+    fn detect_field_watch_access() {
+        // Access format: no "will be" in the detail
+        let output = r#"Field (com.example.Service.name) is "hello": "thread=worker-1", com.example.Service.getName(), line=15 bci=0"#;
+        let event = detect_event(output, Some("worker-1"));
+        let Some(DetectedEvent::FieldWatch { thread, field, access_type, class, method, line }) = event else {
+            panic!("expected FieldWatch, got {event:?}");
+        };
+        assert_eq!(thread, "worker-1");
+        assert_eq!(field, "com.example.Service.name");
+        assert_eq!(access_type, "accessed");
+        assert_eq!(class, "com.example.Service");
+        assert_eq!(method, "getName");
+        assert_eq!(line, 15);
+    }
+
+    #[test]
+    fn detect_breakpoint_takes_priority_over_field_watch() {
+        let output = "Breakpoint hit: \"thread=main\", Main.main(), line=9 bci=0";
+        let event = detect_event(output, Some("main"));
+        assert!(matches!(event, Some(DetectedEvent::Breakpoint { .. })));
+    }
 }

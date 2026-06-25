@@ -126,8 +126,12 @@ fn build_command(cli: &Cli) -> anyhow::Result<Command> {
         Commands::Catch { exception, mode } => {
             Command::Catch { exception: exception.clone(), mode: mode.clone() }
         }
+        Commands::Watch { field, mode } => Command::Watch { field: field.clone(), mode: mode.clone() },
+        Commands::Unwatch { field } => Command::Unwatch { field: field.clone() },
         Commands::Breakpoints => Command::Breakpoints,
         Commands::Clear { spec } => Command::Clear { spec: spec.clone() },
+        Commands::Classes { pattern } => Command::Classes { pattern: pattern.clone() },
+        Commands::Methods { class } => Command::Methods { class: class.clone() },
         Commands::Run => Command::Run,
         Commands::Cont => Command::Cont,
         Commands::Step => Command::Step,

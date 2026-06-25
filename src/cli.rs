@@ -142,6 +142,21 @@ pub enum Commands {
     /// List current breakpoints.
     Breakpoints,
 
+    /// Set a field watchpoint (break on access/modification).
+    Watch {
+        /// Field spec: Class.field (e.g. com.example.Service.name).
+        field: String,
+        /// Watch mode: access, modification (default), or all.
+        #[arg(long, default_value = "modification")]
+        mode: String,
+    },
+
+    /// Remove a field watchpoint.
+    Unwatch {
+        /// Field spec: Class.field.
+        field: String,
+    },
+
     /// Clear a breakpoint (Class:line or Class.method).
     Clear {
         /// Breakpoint spec to clear.
@@ -160,6 +175,20 @@ pub enum Commands {
     Next,
     /// Step out (run until current method returns).
     StepOut,
+
+    // ── Class/method search ──
+
+    /// Search loaded classes (filter by substring pattern).
+    Classes {
+        /// Substring pattern to filter class names.
+        pattern: Option<String>,
+    },
+
+    /// List all methods of a loaded class.
+    Methods {
+        /// Fully-qualified class name.
+        class: String,
+    },
 
     // ── Inspection ──
 

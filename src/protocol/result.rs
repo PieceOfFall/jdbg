@@ -82,6 +82,7 @@ pub enum Event {
     Breakpoint { location: Location, thread: String },
     Step { location: Location, thread: String },
     Exception { exception: String, caught: bool, location: Option<Location>, thread: String },
+    FieldWatch { field: String, access_type: String, thread: String },
     VmExit,
 }
 
@@ -184,6 +185,22 @@ pub enum CommandResult {
         elements: Vec<VarBinding>,
         #[serde(skip_serializing_if = "Option::is_none")]
         truncated: Option<bool>,
+    },
+
+    // ── class/method search ──
+    Classes {
+        classes: Vec<String>,
+    },
+    Methods {
+        class: String,
+        methods: Vec<String>,
+    },
+
+    // ── field watchpoint ──
+    WatchSet {
+        spec: String,
+        mode: String,
+        deferred: bool,
     },
 
     // ── fallback ──

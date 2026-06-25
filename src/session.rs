@@ -528,6 +528,20 @@ fn event_to_result(ev: DetectedEvent) -> (CommandResult, Event) {
                 event,
             )
         }
+        DetectedEvent::FieldWatch { thread, field, access_type, class, method, line } => {
+            let loc = Location { class: class.clone(), method: method.clone(), file: None, line };
+            let event = Event::FieldWatch {
+                field: field.clone(),
+                access_type: access_type.clone(),
+                thread: thread.clone(),
+            };
+            (
+                CommandResult::Stopped {
+                    event: event.clone(), location: loc, thread, frame: None, source_context: None,
+                },
+                event,
+            )
+        }
     }
 }
 

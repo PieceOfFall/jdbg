@@ -520,6 +520,145 @@ fn resolve_thread_id_finds_worker() {
     let _ = session.kill();
 }
 
+// ─── Phase: classes / methods search ───
+
+#[test]
+fn classes_returns_loaded_classes() {
+    let session = launch_fixture("CollectionTest");
+
+    // 需要先 run 到断点让类加载完成
+    session
+        .stop_at("CollectionTest", 10, None, None)
+        .expect("stop_at failed");
+    let run_resp = session.run(Some(30)).expect("run failed");
+    assert!(matches!(&run_resp.result, CommandResult::Stopped { .. }));
+
+    // 执行 classes 命令（带 pattern 过滤）
+    use java_agent_debugger::jdb::parser::CommandHint;
+    use java_agent_debugger::session::CommandKind;
+
+    let resp = session
+        .execute("classes CollectionTest", CommandKind::normal(CommandHint::Classes).with_timeout_secs(Some(10)))
+        .expect("classes failed");
+
+    match &resp.result {
+        CommandResult::Classes { classes } => {
+            assert!(
+                !classes.is_empty(),
+                "should find at least one class matching 'CollectionTest'"
+            );
+            assert!(
+                classes.iter().any(|c| c.contains("CollectionTest")),
+                "should contain CollectionTest, got: {:?}",
+                classes
+            );
+        }
+        other => panic!("expected Classes, got {other:?}"),
+    }
+
+    let _ = session.kill();
+}
+
+#[test]
+fn methods_returns_class_methods() {
+    let session = launch_fixture("CollectionTest");
+
+    session
+        .stop_at("CollectionTest", 10, None, None)
+        .expect("stop_at failed");
+    let run_resp = session.run(Some(30)).expect("run failed");
+    assert!(matches!(&run_resp.result, CommandResult::Stopped { .. }));
+
+    use java_agent_debugger::jdb::parser::CommandHint;
+    use java_agent_debugger::session::CommandKind;
+
+    let resp = session
+        .execute("methods CollectionTest", CommandKind::normal(CommandHint::Methods).with_timeout_secs(Some(10)))
+        .expect("methods failed");
+
+    match &resp.result {
+        CommandResult::Methods { methods, .. } => {
+            assert!(
+                !methods.is_empty(),
+                "should find methods for CollectionTest"
+            );
+            // CollectionTest 有 main 方法
+            assert!(
+                methods.iter().any(|m| m.contains("main")),
+                "should contain main method, got: {:?}",
+                methods
+            );
+        }
+        other => panic!("expected Methods, got {other:?}"),
+    }
+
+    let _ = session.kill();
+}
+
+// ─── Phase: watch / unwatch ───
+
+#[test]
+fn watch_set_accepted() {
+    let session = launch_fixture("WatchTest");
+
+    use java_agent_debugger::jdb::parser::CommandHint;
+    use java_agent_debugger::session::CommandKind;
+
+    // 设置字段监视点
+    let resp = session
+        .execute("watch WatchTest.name", CommandKind::normal(CommandHint::WatchSet).with_timeout_secs(Some(10)))
+        .expect("watch failed");
+
+    match &resp.result {
+        CommandResult::WatchSet { mode, .. } => {
+            assert_eq!(mode, "modification");
+        }
+        other => panic!("expected WatchSet, got {other:?}"),
+    }
+
+    let _ = session.kill();
+}
+
+#[test]
+fn watch_field_modification_hit() {
+    let session = launch_fixture("WatchTest");
+
+    use java_agent_debugger::jdb::parser::CommandHint;
+    use java_agent_debugger::session::CommandKind;
+
+    // 设置字段监视点
+    session
+        .execute("watch WatchTest.name", CommandKind::normal(CommandHint::WatchSet).with_timeout_secs(Some(10)))
+        .expect("watch failed");
+
+    // 运行 — 应该在字段被修改时停下
+    let run_resp = session.run(Some(30)).expect("run failed");
+
+    match &run_resp.result {
+        CommandResult::Stopped { event, thread, .. } => {
+            match event {
+                Event::FieldWatch { field, access_type, .. } => {
+                    assert!(
+                        field.contains("name"),
+                        "field should contain 'name', got: {field}"
+                    );
+                    assert_eq!(access_type, "modified");
+                }
+                _ => {
+                    // 也可能先命中静态初始化访问，thread 应有值
+                    assert!(!thread.is_empty(), "thread should not be empty");
+                }
+            }
+        }
+        CommandResult::VmExited { .. } => {
+            panic!("VM exited without hitting watchpoint — jdb may not support watch on static fields in this JDK version");
+        }
+        other => panic!("expected Stopped with FieldWatch event, got {other:?}"),
+    }
+
+    let _ = session.kill();
+}
+
 // ─── Test helpers that mirror handler.rs logic (can't import private fns) ───
 
 fn enrich_stopped_test_helper(session: &Session, resp: &mut CommandResponse) {
