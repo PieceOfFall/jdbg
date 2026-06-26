@@ -360,15 +360,36 @@ fn thread_breakpoint_hit_resolves_worker() {
     // PartialStop 补全：截断 banner（JDK 8 SUSPEND_THREAD）经 session 层
     // threads→thread<id>→where 自动补全 thread/location/frame。
     match &run_resp.result {
-        CommandResult::Stopped { location, thread, frame, .. } => {
+        CommandResult::Stopped { location, thread, thread_id, frame, .. } => {
             assert_eq!(location.class, "ThreadTest");
             assert_eq!(location.method, "doWork");
             assert_eq!(thread, "worker", "the hit thread should be 'worker'");
+            // PartialStop 路径应在 session 层零额外开销地回填命中线程 id（复用那次 `threads`）。
+            let tid = thread_id.as_ref().expect("thread_id should be filled on a thread-policy hit");
+            assert!(!tid.is_empty(), "thread_id should be non-empty");
             // frame 应已被 session 层从 `where` 回填（供 handler 跳过重复 where 查询）。
             let f = frame.as_ref().expect("frame should be enriched by session layer");
             assert_eq!(f.location.class, "ThreadTest");
             assert_eq!(f.location.method, "doWork");
             assert!(f.location.line > 0, "enriched frame line should be nonzero");
+
+            // 回填的 id 必须能真正切换到该线程（即 transcript 里失败的那一步）。
+            let sw = session
+                .execute(
+                    &format!("thread {tid}"),
+                    java_agent_debugger::session::CommandKind::normal(
+                        java_agent_debugger::jdb::parser::CommandHint::Other,
+                    )
+                    .with_timeout_secs(Some(5)),
+                )
+                .expect("thread switch failed");
+            // jdb 接受 → 不应是 "not a valid thread id" 之类错误文本。
+            if let CommandResult::Raw { text } = &sw.result {
+                assert!(
+                    !text.contains("not a valid thread id"),
+                    "thread <{tid}> rejected by jdb: {text:?}"
+                );
+            }
         }
         other => panic!("expected Stopped in worker/doWork, got {other:?}"),
     }
@@ -425,6 +446,56 @@ fn thread_breakpoint_keeps_other_threads_running() {
         "heartbeat must keep counting under thread policy (c1={c1}, c2={c2}); \
          if equal, the whole VM was frozen — a SUSPEND_ALL regression"
     );
+
+    let _ = session.kill();
+}
+
+// ─── Phase: new commands (suspend/resume/set/ignore/lock/threadlocks) ───
+
+/// 验证 6 个新命令的语法被真实 jdb 接受（尤其 `set <lvalue> = <expr>`）。
+/// 在 doWork 命中后，逐条执行并断言输出不含明显的 jdb 报错。
+#[test]
+fn new_commands_accepted_by_jdb() {
+    use java_agent_debugger::jdb::parser::CommandHint;
+    use java_agent_debugger::session::CommandKind;
+
+    let session = launch_fixture("ThreadTest");
+    session
+        .stop_in("ThreadTest", "doWork", None, Some("thread"), None)
+        .expect("stop_in failed");
+    let run_resp = session.run(Some(30)).expect("run failed");
+    let tid = match &run_resp.result {
+        CommandResult::Stopped { thread_id, .. } => {
+            thread_id.clone().expect("thread_id should be populated")
+        }
+        other => panic!("expected Stopped, got {other:?}"),
+    };
+
+    let exec = |cmd: &str| {
+        session
+            .execute(cmd, CommandKind::normal(CommandHint::Other).with_timeout_secs(Some(5)))
+            .unwrap_or_else(|e| panic!("`{cmd}` errored: {e}"))
+    };
+    // jdb 对无法识别的命令会回 "Unrecognized command ..."；语法错回 "Usage: ..."。
+    let assert_ok = |cmd: &str, resp: &CommandResponse| {
+        if let CommandResult::Raw { text } = &resp.result {
+            assert!(
+                !text.contains("Unrecognized command") && !text.starts_with("Usage:"),
+                "`{cmd}` rejected by jdb: {text:?}"
+            );
+        }
+    };
+
+    for cmd in [
+        format!("suspend {tid}"),
+        format!("resume {tid}"),
+        "set x = 99".to_string(),       // doWork 的局部 int x
+        "ignore java.lang.NullPointerException".to_string(),
+        "threadlocks".to_string(),
+    ] {
+        let r = exec(&cmd);
+        assert_ok(&cmd, &r);
+    }
 
     let _ = session.kill();
 }

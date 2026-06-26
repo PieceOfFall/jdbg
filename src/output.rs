@@ -54,17 +54,18 @@ fn render_result(result: &CommandResult) -> String {
                 breakpoints.join("\n")
             }
         }
-        CommandResult::Stopped { event, location, thread, source_context, .. } => {
+        CommandResult::Stopped { event, location, thread, thread_id, source_context, .. } => {
+            let id_suffix = thread_id.as_deref().map(|i| format!(" (id={i})")).unwrap_or_default();
             let kind = match event {
                 Event::Breakpoint { .. } => "Breakpoint hit",
                 Event::Step { .. } => "Step completed",
                 Event::FieldWatch { field, access_type, .. } => {
-                    return format_field_watch_stopped(field, access_type, thread, location, source_context);
+                    return format_field_watch_stopped(field, access_type, thread, &id_suffix, location, source_context);
                 }
                 _ => "Stopped",
             };
             let mut out = format!(
-                "{kind}: {}.{}() line={} thread={thread}",
+                "{kind}: {}.{}() line={} thread={thread}{id_suffix}",
                 location.class, location.method, location.line
             );
             if let Some(lines) = source_context {
@@ -75,10 +76,11 @@ fn render_result(result: &CommandResult) -> String {
             }
             out
         }
-        CommandResult::ExceptionCaught { exception, caught, location, thread } => {
+        CommandResult::ExceptionCaught { exception, caught, location, thread, thread_id } => {
             let mode = if *caught { "caught" } else { "uncaught" };
+            let id_suffix = thread_id.as_deref().map(|i| format!(" (id={i})")).unwrap_or_default();
             format!(
-                "Exception ({mode}): {exception} at {}.{}() line={} thread={thread}",
+                "Exception ({mode}): {exception} at {}.{}() line={} thread={thread}{id_suffix}",
                 location.class, location.method, location.line
             )
         }
@@ -155,7 +157,9 @@ fn render_result(result: &CommandResult) -> String {
                     lines.push(format!("Group {group}:"));
                     last_group = Some(group);
                 }
-                lines.push(format!("  {} {:<24} {}", t.id, t.name, t.state));
+                // 命中线程（state 含 "at breakpoint"）用 `*` 前缀标出，方便一眼定位。
+                let marker = if t.state.contains("at breakpoint") { "*" } else { " " };
+                lines.push(format!("{marker} {} {:<24} {}", t.id, t.name, t.state));
             }
             lines.join("\n")
         }
@@ -205,11 +209,12 @@ fn format_field_watch_stopped(
     field: &str,
     access_type: &str,
     thread: &str,
+    id_suffix: &str,
     location: &Location,
     source_context: &Option<Vec<SourceLine>>,
 ) -> String {
     let mut out = format!(
-        "Field watchpoint hit ({access_type}): {field} thread={thread}"
+        "Field watchpoint hit ({access_type}): {field} thread={thread}{id_suffix}"
     );
     if location.line > 0 {
         out.push_str(&format!(
@@ -240,6 +245,7 @@ mod tests {
                 },
                 location: Location { class: "Main".into(), method: "main".into(), file: None, line: 10 },
                 thread: "main".into(),
+                thread_id: Some("0x1".into()),
                 frame: None,
                 source_context: Some(vec![
                     SourceLine { number: 9, text: "int x = 1;".into() },
@@ -251,7 +257,7 @@ mod tests {
             note: None,
         };
         let out = render(&resp, false);
-        assert!(out.contains("Breakpoint hit: Main.main() line=10 thread=main"));
+        assert!(out.contains("Breakpoint hit: Main.main() line=10 thread=main (id=0x1)"));
         assert!(out.contains("=>   10  int y = 2;"));
         assert!(out.contains("     9  int x = 1;"));
         assert!(out.contains("    11  return x + y;"));
@@ -267,6 +273,7 @@ mod tests {
                 },
                 location: Location { class: "Foo".into(), method: "bar".into(), file: None, line: 5 },
                 thread: "t1".into(),
+                thread_id: None,
                 frame: None,
                 source_context: None,
             },

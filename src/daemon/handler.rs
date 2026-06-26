@@ -225,6 +225,7 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
                 Ok(mut resp) => {
                     resp = eval_condition_loop(&session, resp, t);
                     enrich_stopped(&session, &mut resp);
+                    enrich_thread_id(&session, &mut resp);
                     check_line_mismatch(&session, &mut resp);
                     return Response::ok(id, resp);
                 }
@@ -282,7 +283,16 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
         Command::Eval { expr } => {
             session.execute(&format!("eval {expr}"), CommandKind::normal(CommandHint::Eval).with_timeout_secs(t))
         }
-        Command::Threads => session.threads(t),
+        Command::Threads { filter } => {
+            let mut r = session.threads(t);
+            // parser 返回全量；过滤在 handler 层做（保持 parser 纯粹，作为测试 oracle）。
+            if let Ok(ref mut resp) = r {
+                if let CommandResult::Threads { threads } = &mut resp.result {
+                    *threads = filter_threads(std::mem::take(threads), filter.as_deref());
+                }
+            }
+            r
+        }
         Command::Thread { id: tid } => {
             session.execute(&format!("thread {tid}"), CommandKind::normal(CommandHint::Other).with_timeout_secs(t))
         }
@@ -292,6 +302,44 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
         }
         Command::ListSource { line } => session.list_source(*line, t),
         Command::Raw { command } => session.raw(command, t),
+
+        // Thread control / state mutation / locks — all Normal commands, Raw passthrough.
+        Command::Suspend { id } => {
+            let cmd = match id {
+                Some(i) => format!("suspend {i}"),
+                None => "suspend".to_string(),
+            };
+            session.execute(&cmd, CommandKind::normal(CommandHint::Other).with_timeout_secs(t))
+        }
+        Command::Resume { id } => {
+            let cmd = match id {
+                Some(i) => format!("resume {i}"),
+                None => "resume".to_string(),
+            };
+            session.execute(&cmd, CommandKind::normal(CommandHint::Other).with_timeout_secs(t))
+        }
+        Command::Set { lvalue, value } => {
+            session.execute(&format!("set {lvalue} = {value}"), CommandKind::normal(CommandHint::Other).with_timeout_secs(t))
+        }
+        Command::Ignore { exception, mode } => {
+            // 镜像 Catch 的 mode dispatch（对称的异常断点移除）。
+            let cmd = match mode.as_str() {
+                "caught" => format!("ignore caught {exception}"),
+                "uncaught" => format!("ignore uncaught {exception}"),
+                _ => format!("ignore {exception}"),
+            };
+            session.execute(&cmd, CommandKind::normal(CommandHint::Other).with_timeout_secs(t))
+        }
+        Command::Lock { expr } => {
+            session.execute(&format!("lock {expr}"), CommandKind::normal(CommandHint::Other).with_timeout_secs(t))
+        }
+        Command::ThreadLocks { id } => {
+            let cmd = match id {
+                Some(i) => format!("threadlocks {i}"),
+                None => "threadlocks".to_string(),
+            };
+            session.execute(&cmd, CommandKind::normal(CommandHint::Other).with_timeout_secs(t))
+        }
 
         // 不应走到这里（lifecycle/daemon/attach commands 已在上层处理）
         _ => return Response::err(id, 400, "unexpected command in session dispatch"),
@@ -464,6 +512,48 @@ fn enrich_stopped(session: &Session, resp: &mut CommandResponse) {
     }
 }
 
+/// 命中（Stopped / ExceptionCaught）后回填命中线程的 jdb id，供 `thread <id>` 直接切换。
+///
+/// PartialStop 路径已在 session 层填好 id（复用那次 `threads` 查询），此处只处理完整 banner
+/// 路径：若 `thread_id` 仍为 None 且事件带线程名/有 at-breakpoint 线程，则跑一次 `threads`
+/// 用 `thread_id_for` 反查。查不到写 WARNING（绝不静默）。
+fn enrich_thread_id(session: &Session, resp: &mut CommandResponse) {
+    // 取出当前线程名 + 是否已有 id（避免长生命周期借用）。
+    let (have_id, name) = match &resp.result {
+        CommandResult::Stopped { thread_id, thread, .. }
+        | CommandResult::ExceptionCaught { thread_id, thread, .. } => {
+            (thread_id.is_some(), thread.clone())
+        }
+        _ => return,
+    };
+    if have_id {
+        return; // PartialStop 路径已填。
+    }
+
+    let found = match session.threads(None) {
+        Ok(r) => match r.result {
+            CommandResult::Threads { threads } => thread_id_for(&threads, &name),
+            _ => None,
+        },
+        Err(_) => None,
+    };
+
+    match found {
+        Some(tid) => {
+            if let CommandResult::Stopped { thread_id, .. }
+            | CommandResult::ExceptionCaught { thread_id, .. } = &mut resp.result
+            {
+                *thread_id = Some(tid);
+            }
+        }
+        None => append_note(
+            resp,
+            "WARNING: could not resolve the hit thread's id (`threads` lookup failed or no match); \
+             run `threads` and pass the id to `thread` manually.",
+        ),
+    }
+}
+
 /// 断点命中时，与最近设置的 break_at 行号比对；不匹配则添加 note。
 fn check_line_mismatch(session: &Session, resp: &mut CommandResponse) {
     let location = match &resp.result {
@@ -559,4 +649,106 @@ fn write_response(mut stream: &Stream, resp: &Response) -> anyhow::Result<()> {
     stream.write_all(b"\n")?;
     stream.flush()?;
     Ok(())
+}
+
+// ─── Thread 辅助纯函数 ────────────────────────────────────────────────────────────
+
+/// 在 `threads` 列表里找出命中线程的 id。
+///
+/// - `name` 非空 → 优先按线程名**精确**匹配；唯一命中即返回其 id。
+/// - 名字为空（PartialStop 截断 banner 兜底）、或同名多个 → 退而取 state 含
+///   `"at breakpoint"` 的线程。
+/// - 都找不到 → `None`（调用方写 WARNING，绝不静默）。
+fn thread_id_for(threads: &[ThreadInfo], name: &str) -> Option<String> {
+    if !name.is_empty() {
+        let mut matches = threads.iter().filter(|t| t.name == name);
+        if let Some(first) = matches.next() {
+            // 唯一同名 → 直接用；多个同名 → 落到 at-breakpoint 兜底。
+            if matches.next().is_none() {
+                return Some(first.id.clone());
+            }
+        }
+    }
+    threads
+        .iter()
+        .find(|t| t.state.contains("at breakpoint"))
+        .map(|t| t.id.clone())
+}
+
+/// 按线程名**大小写不敏感子串**过滤；`filter` 为 None/空串时原样返回全部。
+fn filter_threads(threads: Vec<ThreadInfo>, filter: Option<&str>) -> Vec<ThreadInfo> {
+    match filter {
+        Some(f) if !f.is_empty() => {
+            let needle = f.to_lowercase();
+            threads
+                .into_iter()
+                .filter(|t| t.name.to_lowercase().contains(&needle))
+                .collect()
+        }
+        _ => threads,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ti(id: &str, name: &str, state: &str) -> ThreadInfo {
+        ThreadInfo { id: id.into(), name: name.into(), group: None, state: state.into() }
+    }
+
+    #[test]
+    fn thread_id_for_exact_name_match() {
+        let threads = vec![
+            ti("0x1", "main", "running"),
+            ti("18315", "http-nio-9702-exec-1", "running (at breakpoint)"),
+            ti("18316", "http-nio-9702-exec-2", "cond. waiting"),
+        ];
+        assert_eq!(thread_id_for(&threads, "http-nio-9702-exec-2").as_deref(), Some("18316"));
+    }
+
+    #[test]
+    fn thread_id_for_empty_name_falls_back_to_at_breakpoint() {
+        let threads = vec![
+            ti("0x1", "main", "running"),
+            ti("18315", "http-nio-9702-exec-1", "running (at breakpoint)"),
+        ];
+        assert_eq!(thread_id_for(&threads, "").as_deref(), Some("18315"));
+    }
+
+    #[test]
+    fn thread_id_for_duplicate_names_uses_at_breakpoint() {
+        // 两个同名线程（线程池常见）→ 精确匹配有歧义，落到 at-breakpoint 那个。
+        let threads = vec![
+            ti("0xaa", "worker", "cond. waiting"),
+            ti("0xbb", "worker", "running (at breakpoint)"),
+        ];
+        assert_eq!(thread_id_for(&threads, "worker").as_deref(), Some("0xbb"));
+    }
+
+    #[test]
+    fn thread_id_for_no_match_returns_none() {
+        let threads = vec![ti("0x1", "main", "running")];
+        assert_eq!(thread_id_for(&threads, "nonexistent"), None);
+    }
+
+    #[test]
+    fn filter_threads_case_insensitive_substring() {
+        let threads = vec![
+            ti("0x1", "main", "running"),
+            ti("18315", "http-nio-9702-exec-1", "running (at breakpoint)"),
+            ti("18316", "HTTP-nio-9702-exec-2", "cond. waiting"),
+            ti("0x2", "redisson-netty-2-1", "running"),
+        ];
+        let out = filter_threads(threads, Some("http-nio"));
+        assert_eq!(out.len(), 2);
+        assert!(out.iter().all(|t| t.name.to_lowercase().contains("http-nio")));
+    }
+
+    #[test]
+    fn filter_threads_none_returns_all() {
+        let threads = vec![ti("0x1", "main", "running"), ti("0x2", "worker", "running")];
+        assert_eq!(filter_threads(threads.clone(), None).len(), 2);
+        assert_eq!(filter_threads(threads, Some("")).len(), 2);
+    }
 }

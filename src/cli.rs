@@ -215,8 +215,12 @@ pub enum Commands {
         /// Expression.
         expr: String,
     },
-    /// List threads.
-    Threads,
+    /// List threads (optionally filter by name substring).
+    Threads {
+        /// Case-insensitive substring to filter thread names (e.g. "http-nio").
+        #[arg(long)]
+        filter: Option<String>,
+    },
     /// Switch to a thread by ID.
     Thread {
         /// Thread ID (hex from `threads` output).
@@ -248,6 +252,44 @@ pub enum Commands {
         /// The jdb command string.
         #[arg(trailing_var_arg = true)]
         command: Vec<String>,
+    },
+
+    // ── Thread control / state mutation / locks ──
+
+    /// Suspend a thread (or all threads if no id given).
+    Suspend {
+        /// Thread id (from `threads` output). Omit to suspend all threads.
+        id: Option<String>,
+    },
+    /// Resume a thread (or all threads if no id given).
+    Resume {
+        /// Thread id (from `threads` output). Omit to resume all threads.
+        id: Option<String>,
+    },
+    /// Assign a value to a variable, field, or array element.
+    Set {
+        /// Left-hand side: local var, field, or array element (e.g. "x", "this.count", "arr[0]").
+        lvalue: String,
+        /// Right-hand side expression (e.g. "42", "\"hello\"", "null").
+        value: String,
+    },
+    /// Stop catching an exception (removes a `catch` breakpoint).
+    Ignore {
+        /// Exception class name or pattern.
+        exception: String,
+        /// Mode: caught, uncaught, or all (must match how it was caught).
+        #[arg(long, default_value = "all")]
+        mode: String,
+    },
+    /// Show monitor/lock info for an object.
+    Lock {
+        /// Object expression.
+        expr: String,
+    },
+    /// Show locks held and awaited by a thread.
+    ThreadLocks {
+        /// Thread id (from `threads` output). Omit for the current thread.
+        id: Option<String>,
     },
 
     /// Hidden: run as daemon (auto-spawned by CLI).

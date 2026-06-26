@@ -176,7 +176,18 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             true,
             false,
         ),
-        tool("threads", "List all threads with id, name, group, and state.", json!({}), &[], true, false),
+        tool(
+            "threads",
+            "List all threads with id, name, group, and state. Optionally filter by a \
+             case-insensitive substring of the thread name (e.g. \"http-nio\") to cut through \
+             the noise of a large app's thread list. The hit thread (if any) is marked with `*`.",
+            json!({
+                "filter": {"type": "string", "description": "Case-insensitive substring of the thread name to filter by (e.g. \"http-nio\", \"worker\"). Omit to list all threads."}
+            }),
+            &[],
+            true,
+            false,
+        ),
         tool(
             "classes",
             "Search loaded classes by substring pattern. Without a pattern lists ALL loaded classes \
@@ -249,6 +260,68 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             true,
             false,
         ),
+        tool(
+            "suspend",
+            "Suspend a thread by id, or all threads if no id is given. Pairs with `resume` for \
+             fine-grained thread control (e.g. freezing one worker while inspecting a race).",
+            json!({"id": {"type": "string", "description": "Thread id from `threads` output. Omit to suspend all threads."}}),
+            &[],
+            true,
+            false,
+        ),
+        tool(
+            "resume",
+            "Resume a thread by id, or all threads if no id is given. Unlike `cont` (which resumes \
+             the whole VM from a breakpoint and waits for the next stop), `resume` just clears a \
+             prior `suspend` and returns immediately.",
+            json!({"id": {"type": "string", "description": "Thread id from `threads` output. Omit to resume all threads."}}),
+            &[],
+            true,
+            false,
+        ),
+        tool(
+            "set",
+            "Assign a value to a variable, field, or array element in the suspended frame — \
+             MUTATES live program state. Use to test a fix hypothesis or force a branch before \
+             continuing. e.g. lvalue \"this.count\", value \"42\".",
+            json!({
+                "lvalue": {"type": "string", "description": "Left-hand side: local var, field, or array element (e.g. \"x\", \"this.count\", \"arr[0]\")."},
+                "value": {"type": "string", "description": "Right-hand side expression (e.g. \"42\", \"\\\"hello\\\"\", \"null\")."}
+            }),
+            &["lvalue", "value"],
+            true,
+            false,
+        ),
+        tool(
+            "ignore",
+            "Stop catching an exception — removes a breakpoint previously set with `catch`. \
+             The mode must match how it was caught.",
+            json!({
+                "exception": {"type": "string", "description": "Exception class name or pattern (as passed to `catch`)."},
+                "mode": {"type": "string", "enum": ["caught", "uncaught", "all"], "description": "Must match the mode used with `catch` (default: all)."}
+            }),
+            &["exception"],
+            true,
+            false,
+        ),
+        tool(
+            "lock",
+            "Show monitor/lock info for an object: which thread owns its monitor and which threads \
+             are waiting on it. Useful for diagnosing contention and deadlocks.",
+            json!({"expr": {"type": "string", "description": "Object expression to inspect the monitor of."}}),
+            &["expr"],
+            true,
+            false,
+        ),
+        tool(
+            "threadlocks",
+            "Show the locks a thread currently owns and the monitor it is blocked on — the core \
+             command for deadlock diagnosis. Omit id for the current thread.",
+            json!({"id": {"type": "string", "description": "Thread id from `threads` output. Omit for the current thread."}}),
+            &[],
+            true,
+            false,
+        ),
     ]
 }
 
@@ -311,7 +384,7 @@ pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> 
         "print" => Command::Print { expr: require_str(args, "expr")? },
         "dump" => Command::Dump { expr: require_str(args, "expr")? },
         "eval" => Command::Eval { expr: require_str(args, "expr")? },
-        "threads" => Command::Threads,
+        "threads" => Command::Threads { filter: optional_str(args, "filter") },
         "classes" => Command::Classes { pattern: optional_str(args, "pattern") },
         "methods" => Command::Methods { class: require_str(args, "class")? },
         "thread" => Command::Thread { id: require_str(args, "id")? },
@@ -325,6 +398,18 @@ pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> 
             max_elements: optional_u32(args, "max_elements").unwrap_or(10),
         },
         "raw" => Command::Raw { command: require_str(args, "command")? },
+        "suspend" => Command::Suspend { id: optional_str(args, "id") },
+        "resume" => Command::Resume { id: optional_str(args, "id") },
+        "set" => Command::Set {
+            lvalue: require_str(args, "lvalue")?,
+            value: require_str(args, "value")?,
+        },
+        "ignore" => Command::Ignore {
+            exception: require_str(args, "exception")?,
+            mode: optional_str(args, "mode").unwrap_or_else(|| "all".to_string()),
+        },
+        "lock" => Command::Lock { expr: require_str(args, "expr")? },
+        "threadlocks" => Command::ThreadLocks { id: optional_str(args, "id") },
         _ => return Err(JsonRpcError::new(METHOD_NOT_FOUND, format!("unknown tool: {name}"))),
     };
 
@@ -413,8 +498,8 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn exposes_30_tools() {
-        assert_eq!(tool_specs().len(), 30);
+    fn exposes_36_tools() {
+        assert_eq!(tool_specs().len(), 36);
     }
 
     #[test]
@@ -659,6 +744,97 @@ mod tests {
                 assert_eq!(suspend, Some("thread".to_string()));
             }
             other => panic!("expected BreakAt, got {other:?}"),
+        }
+    }
+
+    // ─── new commands: threads filter + thread control / set / ignore / locks ───
+
+    #[test]
+    fn threads_with_filter_maps() {
+        let req = dispatch_tool("threads", &json!({"filter": "http-nio"})).unwrap();
+        match req.cmd {
+            Command::Threads { filter } => assert_eq!(filter, Some("http-nio".to_string())),
+            other => panic!("expected Threads, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn threads_without_filter_is_none() {
+        let req = dispatch_tool("threads", &json!({})).unwrap();
+        match req.cmd {
+            Command::Threads { filter } => assert_eq!(filter, None),
+            other => panic!("expected Threads, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn suspend_with_and_without_id() {
+        match dispatch_tool("suspend", &json!({"id": "0x1"})).unwrap().cmd {
+            Command::Suspend { id } => assert_eq!(id, Some("0x1".to_string())),
+            other => panic!("expected Suspend, got {other:?}"),
+        }
+        match dispatch_tool("suspend", &json!({})).unwrap().cmd {
+            Command::Suspend { id } => assert_eq!(id, None),
+            other => panic!("expected Suspend, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resume_maps() {
+        match dispatch_tool("resume", &json!({"id": "18315"})).unwrap().cmd {
+            Command::Resume { id } => assert_eq!(id, Some("18315".to_string())),
+            other => panic!("expected Resume, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_maps_lvalue_and_value() {
+        match dispatch_tool("set", &json!({"lvalue": "this.count", "value": "42"})).unwrap().cmd {
+            Command::Set { lvalue, value } => {
+                assert_eq!(lvalue, "this.count");
+                assert_eq!(value, "42");
+            }
+            other => panic!("expected Set, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_missing_value_is_error() {
+        assert!(dispatch_tool("set", &json!({"lvalue": "x"})).is_err());
+    }
+
+    #[test]
+    fn ignore_maps_with_mode_default() {
+        match dispatch_tool("ignore", &json!({"exception": "java.lang.NPE"})).unwrap().cmd {
+            Command::Ignore { exception, mode } => {
+                assert_eq!(exception, "java.lang.NPE");
+                assert_eq!(mode, "all");
+            }
+            other => panic!("expected Ignore, got {other:?}"),
+        }
+        match dispatch_tool("ignore", &json!({"exception": "E", "mode": "uncaught"})).unwrap().cmd {
+            Command::Ignore { mode, .. } => assert_eq!(mode, "uncaught"),
+            other => panic!("expected Ignore, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn lock_maps_expr() {
+        match dispatch_tool("lock", &json!({"expr": "this.mutex"})).unwrap().cmd {
+            Command::Lock { expr } => assert_eq!(expr, "this.mutex"),
+            other => panic!("expected Lock, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn threadlocks_with_and_without_id() {
+        match dispatch_tool("threadlocks", &json!({"id": "0xbb"})).unwrap().cmd {
+            Command::ThreadLocks { id } => assert_eq!(id, Some("0xbb".to_string())),
+            other => panic!("expected ThreadLocks, got {other:?}"),
+        }
+        match dispatch_tool("threadlocks", &json!({})).unwrap().cmd {
+            Command::ThreadLocks { id } => assert_eq!(id, None),
+            other => panic!("expected ThreadLocks, got {other:?}"),
         }
     }
 }

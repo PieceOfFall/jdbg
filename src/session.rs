@@ -509,7 +509,7 @@ fn event_to_result(ev: DetectedEvent) -> (CommandResult, Event) {
             let event = Event::Breakpoint { location: loc.clone(), thread: thread.clone() };
             (
                 CommandResult::Stopped {
-                    event: event.clone(), location: loc, thread, frame: None, source_context: None,
+                    event: event.clone(), location: loc, thread, thread_id: None, frame: None, source_context: None,
                 },
                 event,
             )
@@ -519,7 +519,7 @@ fn event_to_result(ev: DetectedEvent) -> (CommandResult, Event) {
             let event = Event::Step { location: loc.clone(), thread: thread.clone() };
             (
                 CommandResult::Stopped {
-                    event: event.clone(), location: loc, thread, frame: None, source_context: None,
+                    event: event.clone(), location: loc, thread, thread_id: None, frame: None, source_context: None,
                 },
                 event,
             )
@@ -534,7 +534,7 @@ fn event_to_result(ev: DetectedEvent) -> (CommandResult, Event) {
                 thread: thread.clone(),
             };
             (
-                CommandResult::ExceptionCaught { exception, caught, location: loc, thread },
+                CommandResult::ExceptionCaught { exception, caught, location: loc, thread, thread_id: None },
                 event,
             )
         }
@@ -547,7 +547,7 @@ fn event_to_result(ev: DetectedEvent) -> (CommandResult, Event) {
             };
             (
                 CommandResult::Stopped {
-                    event: event.clone(), location: loc, thread, frame: None, source_context: None,
+                    event: event.clone(), location: loc, thread, thread_id: None, frame: None, source_context: None,
                 },
                 event,
             )
@@ -563,7 +563,7 @@ fn event_to_result(ev: DetectedEvent) -> (CommandResult, Event) {
             };
             (
                 CommandResult::Stopped {
-                    event: event.clone(), location: loc, thread: String::new(), frame: None, source_context: None,
+                    event: event.clone(), location: loc, thread: String::new(), thread_id: None, frame: None, source_context: None,
                 },
                 event,
             )
@@ -611,9 +611,10 @@ fn enrich_partial_stop_inner(inner: &mut SessionInner, resp: &mut CommandRespons
         return;
     };
 
-    // 回填线程名（即便 where 失败也能给出触发线程）。
-    if let CommandResult::Stopped { thread, event, .. } = &mut resp.result {
+    // 回填线程名 + id（即便 where 失败也能给出触发线程及其 id，供 `thread <id>` 切换）。
+    if let CommandResult::Stopped { thread, thread_id, event, .. } = &mut resp.result {
         *thread = hit.name.clone();
+        *thread_id = Some(hit.id.clone());
         set_event_thread(event, &hit.name);
     }
 
@@ -736,7 +737,7 @@ mod tests {
         };
         let (result, event) = event_to_result(ev);
 
-        let CommandResult::Stopped { location, thread, event: inner_event, frame, source_context } = result else {
+        let CommandResult::Stopped { location, thread, event: inner_event, frame, source_context, .. } = result else {
             panic!("expected Stopped, got {result:?}");
         };
         assert_eq!(thread, "main");

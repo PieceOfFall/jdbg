@@ -127,6 +127,10 @@ pub enum CommandResult {
         event: Event,
         location: Location,
         thread: String,
+        /// 命中线程的 jdb id（如 "0x1a3" 或十进制 "18315"）——可直接传给 `thread` 工具切换。
+        /// 命中后由 enrichment 反查 `threads` 回填；查不到则为 None（附 WARNING note）。
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        thread_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         frame: Option<StackFrame>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -137,6 +141,9 @@ pub enum CommandResult {
         caught: bool,
         location: Location,
         thread: String,
+        /// 命中线程的 jdb id（同 `Stopped.thread_id`）。
+        #[serde(skip_serializing_if = "Option::is_none", default)]
+        thread_id: Option<String>,
     },
     VmExited {
         #[serde(skip_serializing_if = "Option::is_none")]

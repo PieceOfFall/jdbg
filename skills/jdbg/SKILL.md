@@ -2,9 +2,9 @@
 name: jdbg
 description: Use when you need a Java program's real runtime state instead of reading source or adding print statements — the actual value of a variable/field/expression at a line, why an exception or NullPointerException is thrown (with stack + locals at the throw site), what a thread is blocked or deadlocked on, or how execution reaches some code. Also for stepping through Java line by line, or attaching to an already-running JVM that has JDWP enabled. Cross-platform, native on Windows, no IDE.
 compatibility: Requires a JDK 8+ (provides the `jdb` command). Debugging is driven through the `jdbg` MCP server (tools named `launch`, `break_at`, `run`, `locals`, …). Native on Windows, Linux, macOS.
-allowed-tools: mcp__jdbg__launch, mcp__jdbg__attach, mcp__jdbg__status, mcp__jdbg__list, mcp__jdbg__kill, mcp__jdbg__break_at, mcp__jdbg__break_in, mcp__jdbg__catch, mcp__jdbg__watch, mcp__jdbg__unwatch, mcp__jdbg__breakpoints, mcp__jdbg__clear, mcp__jdbg__run, mcp__jdbg__cont, mcp__jdbg__step, mcp__jdbg__next, mcp__jdbg__step_out, mcp__jdbg__where, mcp__jdbg__locals, mcp__jdbg__print, mcp__jdbg__dump, mcp__jdbg__eval, mcp__jdbg__threads, mcp__jdbg__classes, mcp__jdbg__methods, mcp__jdbg__thread, mcp__jdbg__frame, mcp__jdbg__list_source, mcp__jdbg__inspect, mcp__jdbg__raw, Bash(javac:*), Bash(java:*), Read
+allowed-tools: mcp__jdbg__launch, mcp__jdbg__attach, mcp__jdbg__status, mcp__jdbg__list, mcp__jdbg__kill, mcp__jdbg__break_at, mcp__jdbg__break_in, mcp__jdbg__catch, mcp__jdbg__watch, mcp__jdbg__unwatch, mcp__jdbg__breakpoints, mcp__jdbg__clear, mcp__jdbg__run, mcp__jdbg__cont, mcp__jdbg__step, mcp__jdbg__next, mcp__jdbg__step_out, mcp__jdbg__where, mcp__jdbg__locals, mcp__jdbg__print, mcp__jdbg__dump, mcp__jdbg__eval, mcp__jdbg__threads, mcp__jdbg__classes, mcp__jdbg__methods, mcp__jdbg__thread, mcp__jdbg__frame, mcp__jdbg__list_source, mcp__jdbg__inspect, mcp__jdbg__raw, mcp__jdbg__suspend, mcp__jdbg__resume, mcp__jdbg__set, mcp__jdbg__ignore, mcp__jdbg__lock, mcp__jdbg__threadlocks, Bash(javac:*), Bash(java:*), Read
 metadata:
-  version: "2.5"
+  version: "2.6"
 ---
 
 # jdbg — interactive Java debugging for agents
@@ -124,8 +124,10 @@ target user, and only freeze that one request thread when it does stop.
 | `step` · `next` · `step_out` | step into · over · out of the current method |
 
 These tools return a `Stopped` result that **automatically includes source context** (surrounding source
-lines with `=>` marking the current line) and the **top stack frame** when available. You do NOT need to
-call `list_source` or `where` separately after stopping — the information is already in the response.
+lines with `=>` marking the current line), the **top stack frame**, and the **hit thread's id**
+(`thread_id`) when available. You do NOT need to call `list_source` or `where` separately after stopping —
+the information is already in the response. To switch to or act on the hit thread, pass `thread_id`
+straight to `thread`/`suspend`/`threadlocks` — no need to scan `threads` for it.
 
 ### Inspection (fast)
 | Tool | Purpose |
@@ -135,19 +137,29 @@ call `list_source` or `where` separately after stopping — the information is a
 | `dump { expr }` | all fields of an object |
 | `inspect { expr, max_elements? }` | show size + first N elements of a collection/array (default 10, max 50) |
 | `where { all? }` | call stack of the current thread (or every thread with `all: true`) |
-| `threads` · `thread { id }` | list threads / switch the current thread |
+| `threads { filter? }` · `thread { id }` | list threads (filter by name substring) / switch the current thread |
 | `frame { direction, n? }` | move within the call stack (`direction`: up \| down) |
 | `list_source { line? }` | show source around a line |
 | `classes { pattern? }` | search loaded classes by substring — find CGLIB proxies, inner classes, or confirm a class is loaded |
 | `methods { class }` | list all methods of a loaded class (with param types) — find exact signature for `break_in` |
 | `raw { command }` | escape hatch: send a literal jdb command (`monitor`, `fields`, `redefine`, `trace`, …) |
 
+### Thread control · state mutation · locks
+| Tool | Purpose |
+|---|---|
+| `suspend { id? }` · `resume { id? }` | suspend/resume one thread (or all if no id) — fine-grained control without freezing the whole VM |
+| `set { lvalue, value }` | assign a variable/field/array element — **mutates live state** to test a fix or force a branch |
+| `ignore { exception, mode? }` | stop catching an exception (removes a `catch`); `mode` must match how it was caught |
+| `lock { expr }` | monitor owner + waiters for an object — contention/deadlock diagnosis |
+| `threadlocks { id? }` | locks a thread holds and is blocked on — the core deadlock command |
+
 ## Reading results & deciding what to do next
 Every tool returns a typed result. The ones that drive the next move:
 - **`Stopped`** — a breakpoint or step landed. The response **already includes** source context (lines around
-  the stop with `=>` marking the current line) and the top stack frame — you can read them immediately without
-  extra calls. Execution stops **before** the indicated line runs (the line has not yet executed). Use `locals`
-  / `print { expr }` / `inspect { expr }` to examine state.
+  the stop with `=>` marking the current line), the top stack frame, and the hit thread's `thread_id` — you can
+  read them immediately without extra calls. Execution stops **before** the indicated line runs (the line has
+  not yet executed). Use `locals` / `print { expr }` / `inspect { expr }` to examine state. To act on the hit
+  thread (switch, suspend, inspect its locks), pass `thread_id` directly — do not scan `threads` for it.
 - **`ExceptionCaught`** — an exception fired. `where` for the throw site, `locals` for state.
 - **`VmExited`** — the program ended; the session is done (`list` / `kill`).
 - **`Timeout`** — the app did not stop within the timeout (long loop or deadlock). The session is **kept
@@ -243,9 +255,14 @@ If `where` / `locals` returns empty or "No thread specified" immediately after a
 
 ### Thread IDs in `threads` output
 
-The `threads` output shows lines like `0x37bd http-nio-8231-exec-8 cond. waiting`. **Pass the id exactly
-as shown** to the `thread` tool — copy it verbatim, do not reformat it.
-Do NOT pass the thread **name** (e.g. `http-nio-8231-exec-8`) — jdb rejects names.
+**After a stop, prefer the `thread_id` field from the `Stopped` result** — it is the hit thread's id, ready
+to pass to `thread`/`suspend`/`threadlocks`. You only need the `threads` output below when targeting a
+*different* thread than the one that stopped.
+
+The `threads` output shows lines like `0x37bd http-nio-8231-exec-8 cond. waiting` (the hit thread, if any, is
+prefixed with `*`). **Pass the id exactly as shown** to the `thread` tool — copy it verbatim, do not reformat
+it. Do NOT pass the thread **name** (e.g. `http-nio-8231-exec-8`) — jdb rejects names. On a large app, use
+`threads { "filter": "http-nio" }` to cut the list down instead of scanning 90+ lines.
 
 The id format depends on the JDK: most print a `0x`-prefixed hex value (`0x37f2`), but some (commonly
 external Tomcat / app-server attach) print a plain **decimal** value (`18315`). Use whichever the

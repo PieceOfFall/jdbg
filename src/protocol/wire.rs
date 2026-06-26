@@ -141,12 +141,41 @@ pub enum Command {
     Print { expr: String },
     Dump { expr: String },
     Eval { expr: String },
-    Threads,
+    Threads {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        filter: Option<String>,
+    },
     Thread { id: String },
     Frame { direction: String, #[serde(default = "default_one")] n: u32 },
     ListSource { #[serde(skip_serializing_if = "Option::is_none")] line: Option<u32> },
     Inspect { expr: String, #[serde(default = "default_max_elements")] max_elements: u32 },
     Raw { command: String },
+
+    // ── Thread control / state mutation / locks ──
+    Suspend {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+    Resume {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
+    Set {
+        lvalue: String,
+        value: String,
+    },
+    Ignore {
+        exception: String,
+        #[serde(default = "default_catch_mode")]
+        mode: String,
+    },
+    Lock {
+        expr: String,
+    },
+    ThreadLocks {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+    },
 
     // ── Daemon control ──
     DaemonStatus,
