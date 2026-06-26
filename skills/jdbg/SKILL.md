@@ -4,7 +4,7 @@ description: Use when you need a Java program's real runtime state instead of re
 compatibility: Requires a JDK 8+ (provides the `jdb` command). Debugging is driven through the `jdbg` MCP server (tools named `launch`, `break_at`, `run`, `locals`, …). Native on Windows, Linux, macOS.
 allowed-tools: mcp__jdbg__launch, mcp__jdbg__attach, mcp__jdbg__status, mcp__jdbg__list, mcp__jdbg__kill, mcp__jdbg__break_at, mcp__jdbg__break_in, mcp__jdbg__catch, mcp__jdbg__watch, mcp__jdbg__unwatch, mcp__jdbg__breakpoints, mcp__jdbg__clear, mcp__jdbg__run, mcp__jdbg__cont, mcp__jdbg__step, mcp__jdbg__next, mcp__jdbg__step_out, mcp__jdbg__where, mcp__jdbg__locals, mcp__jdbg__print, mcp__jdbg__dump, mcp__jdbg__eval, mcp__jdbg__threads, mcp__jdbg__classes, mcp__jdbg__methods, mcp__jdbg__thread, mcp__jdbg__frame, mcp__jdbg__list_source, mcp__jdbg__inspect, mcp__jdbg__raw, Bash(javac:*), Bash(java:*), Read
 metadata:
-  version: "2.4"
+  version: "2.5"
 ---
 
 # jdbg — interactive Java debugging for agents
@@ -243,18 +243,20 @@ If `where` / `locals` returns empty or "No thread specified" immediately after a
 
 ### Thread IDs in `threads` output
 
-The `threads` output shows lines like `(TaskThread)0x37bd http-nio-8231-exec-8 cond. waiting`. The
-**full hex value with `0x` prefix** (e.g. `0x37bd`) is the thread id accepted by the `thread` tool.
+The `threads` output shows lines like `0x37bd http-nio-8231-exec-8 cond. waiting`. **Pass the id exactly
+as shown** to the `thread` tool — copy it verbatim, do not reformat it.
 Do NOT pass the thread **name** (e.g. `http-nio-8231-exec-8`) — jdb rejects names.
-Do NOT strip the `0x` prefix — `37bd` alone is also rejected.
 
-Example: if `threads` shows `(TaskThread)0x37f2 http-nio-8231-exec-20`, use:
-```
-thread { "id": "0x37f2" }
-```
+The id format depends on the JDK: most print a `0x`-prefixed hex value (`0x37f2`), but some (commonly
+external Tomcat / app-server attach) print a plain **decimal** value (`18315`). Use whichever the
+`threads` output gave you, unchanged — do NOT add a `0x` prefix to a decimal id, and do NOT strip the
+`0x` from a hex id. Both forms are wrong if reformatted, and jdb will reject them.
+
+Example: if `threads` shows `0x37f2 http-nio-8231-exec-20`, use `thread { "id": "0x37f2" }`.
+If it shows `18315 http-nio-9702-exec-1`, use `thread { "id": "18315" }`.
 
 Note: if the thread is no longer suspended (e.g. it has finished executing and returned to the pool),
-`thread` will report "not a valid thread id" even with the correct hex value. This indicates the
+`thread` will report "not a valid thread id" even with the correct id. This indicates the
 breakpoint did not hold the thread — see the guidance above about retrying or re-attaching.
 
 ### External Tomcat / application servers

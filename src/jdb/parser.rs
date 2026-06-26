@@ -36,11 +36,13 @@ static RE_PRINT: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*(?P<expr>.+?)\s+=\s+(?P<value>.+)$").unwrap()
 });
 
-/// `threads` 输出中线程行的头部：`  (类名)0xID rest…`
+/// `threads` 输出中线程行的头部：`  (类名)ID rest…`
 /// 实际格式：`  (java.lang.Thread)0x1   main   running`——id 紧跟 `)`，无空格。
 /// 括号内是线程对象的**类名**（非 group）；group 来自独立的 `Group xxx:` 行。
+/// id 多为 `0x` 前缀的 hex，但某些 JDK 的 jdb（如外部 Tomcat attach）打成纯十进制（`18315`）；
+/// 两种都按原样捕获并原样回传给 `thread <id>`（hex 分支在前，避免 `0x…` 被十进制分支截断）。
 static RE_THREAD_LINE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\s*\((?P<class>[^)]+)\)(?P<id>0x[0-9a-fA-F]+)\s+(?P<rest>.+?)\s*$").unwrap()
+    Regex::new(r"^\s*\((?P<class>[^)]+)\)(?P<id>0x[0-9a-fA-F]+|\d+)\s+(?P<rest>.+?)\s*$").unwrap()
 });
 
 /// 从线程行 rest 尾部分离出状态（状态可能含空格，如 `cond. waiting`、`running (at breakpoint)`）。
@@ -458,6 +460,14 @@ Group system:
 Group main:
   (java.lang.Thread)0x1                           main              running (at breakpoint)";
 
+    // 某些 JDK 的 jdb 把线程 id 打成十进制（无 0x 前缀），如 OpenJDK/Azul 在外部 Tomcat attach 场景。
+    const THREADS_DECIMAL: &str = "\
+Group system:
+  (java.lang.Thread)18247                          Signal Dispatcher running
+Group main:
+  (org.apache.tomcat.util.threads.TaskThread)18315 http-nio-9702-exec-1 running (at breakpoint)
+  (org.apache.tomcat.util.threads.TaskThread)18316 http-nio-9702-exec-2 cond. waiting";
+
     const LIST_SOURCE: &str = "\
 5            int sum = 0;
 6            for (int i = 0; i < count; i++) {
@@ -589,6 +599,26 @@ It will be set after the class is loaded.";
         assert_eq!(main.id, "0x1");
         assert_eq!(main.group.as_deref(), Some("main"));
         assert_eq!(main.state, "running (at breakpoint)");
+    }
+
+    #[test]
+    fn threads_with_decimal_ids() {
+        let result = parse_threads(THREADS_DECIMAL);
+        let CommandResult::Threads { threads } = result else {
+            panic!("expected Threads, got {result:?}");
+        };
+        assert_eq!(threads.len(), 3, "threads: {threads:?}");
+
+        let by_name = |n: &str| threads.iter().find(|t| t.name == n).unwrap();
+
+        let exec1 = by_name("http-nio-9702-exec-1");
+        assert_eq!(exec1.id, "18315");
+        assert_eq!(exec1.group.as_deref(), Some("main"));
+        assert_eq!(exec1.state, "running (at breakpoint)");
+
+        let exec2 = by_name("http-nio-9702-exec-2");
+        assert_eq!(exec2.id, "18316");
+        assert_eq!(exec2.state, "cond. waiting");
     }
 
     #[test]
