@@ -88,6 +88,9 @@ impl SessionManager {
     }
 
     /// 创建 attach 会话（连接已运行 JVM 的 JDWP 端口）。
+    ///
+    /// 去重：若已有存活 session 连接到同一 host:port，拒绝创建并提示复用或先 kill。
+    /// 两个 jdb 连同一 JDWP 端口会互相干扰（kill 发 resume 解冻对方的断点）。
     pub fn create_attach(&self, params: AttachParams) -> Result<Arc<Session>> {
         let jdb_path = match params.jdb_path {
             Some(ref p) => {
@@ -96,6 +99,23 @@ impl SessionManager {
             }
             None => jdkpath::find_jdb(None)?,
         };
+
+        // 规范化 host 以确保去重比对一致（localhost → 127.0.0.1）。
+        let norm_host = crate::jdb::process::normalize_attach_host(&params.host);
+        let target = format!("{}:{}", norm_host, params.port);
+
+        // 去重检测：拒绝连接到已有存活 session 的同一目标。
+        {
+            let map = self.sessions.lock().expect("sessions mutex poisoned");
+            for s in map.values() {
+                if s.meta.target == target && !matches!(s.state(), RunState::Dead) {
+                    return Err(Error::DuplicateTarget {
+                        target,
+                        existing_id: s.meta.id.clone(),
+                    });
+                }
+            }
+        }
 
         let config = AttachConfig {
             host: params.host,

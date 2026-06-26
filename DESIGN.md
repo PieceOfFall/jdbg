@@ -219,6 +219,7 @@ Loaded  ──run──►  Suspended  ──cont/step/next──►  Suspended
 | `catch` 异常 thread 推断 | reader 从尾部 thread-prompt 提取线程名回填 `DetectedEvent::Exception.thread`（不再为空串）。 |
 | `--timeout` 传递 | `Request.timeout` → handler → `CommandKind::with_timeout_secs` → `read_until_prompt`，便捷方法全部透传。 |
 | `kill` 默认会话 | `jdbg kill` 不带 `--session` 时默认唯一存活会话（与其它命令一致，§7 全局标志约定）。 |
+| **v0.7.2 修复：Tomcat 调试稳定性** | 5 项修复覆盖真实 Tomcat（suspend=n, JDK 8, GBK, 4000+ 行大类）attach 调试失败：**① Timeout 缓冲泄漏**——`read_until_prompt` 超时后 `take_text()` 清空缓冲（原先 `.clone()` 不清 → 后续命令匹配脏数据错乱）。**② Normal purge 无条件化**——`execute()` 对 Normal 命令始终 `purge_pending()`（去掉 `state==Suspended` 前提，Running 态下 channel 残留同样需清）。**③ "Nothing suspended." 快速返回**——Blocking 模式下 jdb 回复 "Nothing suspended.\n> " 时立即完成（VM 实际未挂起，`cont` 是空操作），不再空等 30s 超时。**④ attach 去重**——`create_attach` 扫描存活 session 相同 target，拒绝重复连接（两 jdb 连同一 JDWP 端口 kill 时互相 resume 干扰）。新增 `Error::DuplicateTarget`。**⑤ 千位分隔符行号**——en_US locale 下 jdb 对 ≥1000 行号输出逗号（`line=3,956`），正则改 `[\d,]+` + `replace(',', "")` 解析；覆盖 `RE_BREAKPOINT_OR_STEP`、`RE_FIELD_WATCH`、`RE_SOURCE_LINE`、`parse_location_parens`。 |
 
 ## 8. 依赖清单
 

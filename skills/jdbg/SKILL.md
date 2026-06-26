@@ -208,6 +208,8 @@ includes the location, thread, and enriched source context just like breakpoint 
 - **Calling `list_source`/`where` after every stop** → unnecessary. `Stopped` results already include source
   context and the top stack frame. Only call them if you need the full stack or a different line range.
 - **Multiple sessions** → pass `session` (an id from `list`), or keep one session at a time.
+- **"a live session already attached to …"** → you (or a previous conversation) already have a session on that
+  port. Use `list` to find the existing session id, then reuse it or `kill` it first before re-attaching.
 - **Treating `Timeout` as a crash** → it is non-destructive; the session is still alive. Inspect or kill it.
 - **Wrong JDK picked up** → pass `jdb_path` to `launch` / `attach`, or set `JAVA_HOME`, to force a specific
   JDK (e.g. JDK 8 vs JDK 21).

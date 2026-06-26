@@ -32,6 +32,13 @@ pub enum Error {
     #[error("session not found: {0}")]
     SessionNotFound(String),
 
+    /// 试图 attach 到已有存活 session 连接的同一目标（host:port）。
+    #[error(
+        "a live session '{existing_id}' is already attached to {target}. \
+         Reuse it (--session {existing_id}) or kill it first."
+    )]
+    DuplicateTarget { target: String, existing_id: String },
+
     /// jdb 报告连接 / 启动错误（§5：`Unable to attach`、`java.io.IOException`、`Input stream closed`）。
     #[error("jdb connection/launch failed: {0}")]
     Connection(String),
@@ -53,6 +60,7 @@ impl Error {
             Error::Spawn { .. } => 4,
             Error::SessionDead(_) => 5,
             Error::SessionNotFound(_) => 5,
+            Error::DuplicateTarget { .. } => 5,
             Error::Connection(_) => 6,
             Error::Timeout { .. } => 7,
             Error::Io(_) => 1,

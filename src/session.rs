@@ -234,10 +234,12 @@ impl Session {
             )));
         }
 
-        // Normal 命令在 Suspended 态发出前，清掉 channel 里可能残留的 stale bare-prompt
-        // （上一条 blocking 命令命中事件后 jdb 迟到补发的 `> `）。此时缓冲本应为空，
-        // 任何残留都是陈旧数据，清掉它避免本次命令读到空响应而错位。
-        if kind.mode == ReadMode::Normal && inner.state == RunState::Suspended {
+        // Normal 命令发出前，清掉 channel 里可能残留的 stale bare-prompt 或迟到字节。
+        // purge_pending 是 try_recv（非阻塞），无论当前 state 如何都应执行：
+        // - Suspended: 上一条 blocking 命令遗留的迟到 bare-prompt `> `
+        // - Running: timeout 后 channel 中迟到的事件 banner / prompt
+        // Blocking 命令不 purge，因为它需要读到后续的事件 banner。
+        if kind.mode == ReadMode::Normal {
             inner.reader.purge_pending();
         }
 

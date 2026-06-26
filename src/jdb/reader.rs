@@ -30,9 +30,10 @@ static RE_THREAD_PROMPT: LazyLock<Regex> =
 
 /// Breakpoint hit / Step completed.
 /// 真实格式: `Breakpoint hit: "thread=main", Main.main(), line=3 bci=0`
+/// 注意：en_US locale 下 jdb 对 ≥1000 的行号输出千位分隔逗号（如 `line=3,956`）。
 static RE_BREAKPOINT_OR_STEP: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?m)^(?P<kind>Breakpoint hit|Step completed): "thread=(?P<thread>[^"]+)", (?P<class>\S+)\.(?P<method>\S+)\(\), line=(?P<line>\d+)"#,
+        r#"(?m)^(?P<kind>Breakpoint hit|Step completed): "thread=(?P<thread>[^"]+)", (?P<class>\S+)\.(?P<method>\S+)\(\), line=(?P<line>[\d,]+)"#,
     )
     .unwrap()
 });
@@ -47,9 +48,10 @@ static RE_EXCEPTION: LazyLock<Regex> = LazyLock::new(|| {
 /// Modification: `Field (Cls.field) is <old>, will be <new>: "thread=T", Cls.method(), line=N bci=M`
 /// Access:       `Field (Cls.field) is <value>: "thread=T", Cls.method(), line=N bci=M`
 /// The detail may contain colons inside quoted values, so match `: "thread=` as the separator.
+/// 注意：en_US locale 下 line 可能带千位逗号（如 `line=3,956`）。
 static RE_FIELD_WATCH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?m)^Field \((?P<field>[^)]+)\) (?P<detail>.+): "thread=(?P<thread>[^"]+)", (?P<class>\S+)\.(?P<method>\S+)\(\), line=(?P<line>\d+)"#,
+        r#"(?m)^Field \((?P<field>[^)]+)\) (?P<detail>.+): "thread=(?P<thread>[^"]+)", (?P<class>\S+)\.(?P<method>\S+)\(\), line=(?P<line>[\d,]+)"#,
     )
     .unwrap()
 });
@@ -231,7 +233,7 @@ impl PromptReader {
             }
             let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
                 return ReadOutcome::Timeout {
-                    partial: self.text.clone(),
+                    partial: self.take_text(),
                 };
             };
             // 处于 patience 窗口时用小粒度轮询，使窗口到期能及时判定 PartialStop。
@@ -249,7 +251,7 @@ impl PromptReader {
                         continue;
                     }
                     return ReadOutcome::Timeout {
-                        partial: self.text.clone(),
+                        partial: self.take_text(),
                     };
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => self.eof = true,
@@ -335,7 +337,18 @@ impl PromptReader {
             return Some(ReadOutcome::Prompt { output, event });
         }
 
-        // Blocking 模式下出现裸 prompt：忽略它，继续等待真正的停下信号。
+        // Blocking 模式下裸 prompt 出现：通常忽略（等真正的 thread-prompt / 事件 banner）。
+        // 但特殊情况："Nothing suspended." + 裸 prompt 表示 VM 实际未挂起（如 attach suspend=n
+        // 后 cont），此时 cont/resume 是空操作，应立即返回而非空等到超时。
+        if is_bare_prompt && mode == ReadMode::Blocking {
+            let before_prompt = &self.text[..self.text.len() - last_line.len()];
+            if before_prompt.contains("Nothing suspended") {
+                let output = before_prompt.trim_end_matches('\n').to_string();
+                let _ = self.take_text();
+                return Some(ReadOutcome::Prompt { output, event: None });
+            }
+        }
+
         None
     }
 
@@ -369,7 +382,7 @@ fn detect_event(output: &str, prompt_thread: Option<&str>) -> Option<DetectedEve
         let thread = c["thread"].to_string();
         let class = c["class"].to_string();
         let method = c["method"].to_string();
-        let line = c["line"].parse().unwrap_or(0);
+        let line = parse_line_number(&c["line"]);
         let is_step = &c["kind"] == "Step completed";
         return Some(if is_step {
             DetectedEvent::Step { thread, class, method, line }
@@ -398,10 +411,15 @@ fn detect_event(output: &str, prompt_thread: Option<&str>) -> Option<DetectedEve
             access_type,
             class: c["class"].to_string(),
             method: c["method"].to_string(),
-            line: c["line"].parse().unwrap_or(0),
+            line: parse_line_number(&c["line"]),
         });
     }
     None
+}
+
+/// 解析行号：去掉 en_US locale 下 jdb 输出的千位分隔逗号（如 "3,956" → 3956）。
+fn parse_line_number(raw: &str) -> u32 {
+    raw.replace(',', "").parse().unwrap_or(0)
 }
 
 /// 从 thread-prompt 行（如 `main[1] `）提取线程名（`[` 之前的部分）。
@@ -460,6 +478,42 @@ mod tests {
         let output = "Breakpoint hit: \"thread=main\", Main.main(), line=9 bci=0";
         let event = detect_event(output, Some("main"));
         assert!(matches!(event, Some(DetectedEvent::Breakpoint { .. })));
+    }
+
+    /// 回归测试：en_US locale 下 jdb 对 ≥1000 行号输出千位逗号（如 `line=3,956`）。
+    #[test]
+    fn breakpoint_line_with_thousands_separator() {
+        let output = r#"Breakpoint hit: "thread=http-nio-8231-exec-3", com.yao.shopping.business.impl.cart.ShoppingCartListManagerImpl.getAllCartAndDemandDataV2(), line=3,956 bci=538"#;
+        let event = detect_event(output, None);
+        let Some(DetectedEvent::Breakpoint { thread, class, method, line }) = event else {
+            panic!("expected Breakpoint, got {event:?}");
+        };
+        assert_eq!(thread, "http-nio-8231-exec-3");
+        assert_eq!(class, "com.yao.shopping.business.impl.cart.ShoppingCartListManagerImpl");
+        assert_eq!(method, "getAllCartAndDemandDataV2");
+        assert_eq!(line, 3956, "thousands separator comma must be stripped");
+    }
+
+    /// 回归测试：无千位逗号的普通行号仍正常解析。
+    #[test]
+    fn breakpoint_line_without_separator_still_works() {
+        let output = r#"Breakpoint hit: "thread=main", Main.main(), line=42 bci=0"#;
+        let event = detect_event(output, None);
+        let Some(DetectedEvent::Breakpoint { line, .. }) = event else {
+            panic!("expected Breakpoint, got {event:?}");
+        };
+        assert_eq!(line, 42);
+    }
+
+    /// Field watchpoint 也可能有千位逗号行号。
+    #[test]
+    fn field_watch_line_with_thousands_separator() {
+        let output = r#"Field (Service.count) is 0, will be 1: "thread=worker-1", com.example.Service.increment(), line=1,024 bci=5"#;
+        let event = detect_event(output, None);
+        let Some(DetectedEvent::FieldWatch { line, .. }) = event else {
+            panic!("expected FieldWatch, got {event:?}");
+        };
+        assert_eq!(line, 1024, "thousands separator comma must be stripped");
     }
 
     /// 一个只产出一次预设字节、之后永久阻塞（不 EOF）的 Reader，
@@ -530,5 +584,55 @@ mod tests {
             }
             other => panic!("expected PartialStop step, got {other:?}"),
         }
+    }
+
+    /// Bug A 回归测试：Timeout 后内部缓冲必须清空，否则后续命令读到脏数据。
+    #[test]
+    fn timeout_clears_buffer() {
+        // 模拟：发一段不含 prompt 的数据，然后 stall → 触发 timeout。
+        let data = b"some partial output without prompt";
+        let reader = StallingReader { data: data.to_vec(), sent: false };
+        let mut pr = PromptReader::new(reader);
+
+        // 用极短超时触发 Timeout。
+        let outcome = pr.read_until_prompt(Duration::from_millis(200), ReadMode::Normal);
+        match &outcome {
+            ReadOutcome::Timeout { partial } => {
+                assert!(partial.contains("some partial output"), "got: {partial:?}");
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+
+        // 关键断言：内部缓冲已被清空（text 和 raw 都空）。
+        assert!(pr.text.is_empty(), "text buffer should be empty after timeout, got: {:?}", pr.text);
+        assert!(pr.raw.is_empty(), "raw buffer should be empty after timeout, got len={}", pr.raw.len());
+    }
+
+    /// Bug D 回归测试：Blocking 模式下 "Nothing suspended." + bare prompt 应立即返回，
+    /// 而不是空等到超时。
+    #[test]
+    fn nothing_suspended_in_blocking_mode_returns_immediately() {
+        // 模拟 jdb 对 cont（VM 已在运行）的回复："Nothing suspended.\n> "
+        let data = b"Nothing suspended.\n> ";
+        let reader = StallingReader { data: data.to_vec(), sent: false };
+        let mut pr = PromptReader::new(reader);
+
+        let start = Instant::now();
+        let outcome = pr.read_until_prompt(Duration::from_secs(30), ReadMode::Blocking);
+        let elapsed = start.elapsed();
+
+        match &outcome {
+            ReadOutcome::Prompt { output, event } => {
+                assert!(output.contains("Nothing suspended"), "output: {output:?}");
+                assert!(event.is_none(), "should have no event, got: {event:?}");
+            }
+            other => panic!("expected Prompt, got {other:?}"),
+        }
+
+        // 应在毫秒内返回，远小于 30s 超时。
+        assert!(
+            elapsed < Duration::from_secs(2),
+            "should return immediately, not block; took {elapsed:?}"
+        );
     }
 }

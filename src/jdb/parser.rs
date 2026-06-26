@@ -57,9 +57,10 @@ static RE_THREAD_GROUP: LazyLock<Regex> = LazyLock::new(|| {
 });
 
 /// `list` 命令输出中的源代码行：`42    int x = 1;` 或 `42 =>  int x = 1;`
+/// en_US locale 下行号可能带千位逗号：`3,956    int x = 1;`
 /// `=>` 标记当前执行行。捕获 marker 以便定位 around_line。
 static RE_SOURCE_LINE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?P<num>\d+)\s+(?P<marker>=>)?\s*(?P<text>.*?)\s*$").unwrap()
+    Regex::new(r"^(?P<num>[\d,]+)\s+(?P<marker>=>)?\s*(?P<text>.*?)\s*$").unwrap()
 });
 
 // ─── 命令上下文提示 ──────────────────────────────────────────────────────────────
@@ -306,7 +307,7 @@ pub fn parse_source(output: &str) -> CommandResult {
     let mut marker_line: Option<u32> = None;
     for text_line in output.lines() {
         if let Some(c) = RE_SOURCE_LINE.captures(text_line) {
-            let num = c["num"].parse().unwrap_or(0);
+            let num = c["num"].replace(',', "").parse().unwrap_or(0);
             if c.name("marker").is_some() {
                 marker_line = Some(num);
             }
@@ -394,6 +395,7 @@ pub fn parse_watch_set(output: &str) -> CommandResult {
 // ─── 工具函数 ────────────────────────────────────────────────────────────────────
 
 /// 解析栈帧括号内容 `(File.java:42)` → (file, line, is_native)。
+/// 注意：en_US locale 下 jdb 对 ≥1000 的行号可能输出千位逗号（如 `File.java:3,956`）。
 fn parse_location_parens(loc: &str) -> (Option<String>, u32, bool) {
     if loc.contains("native method") || loc.contains("Native Method") {
         return (None, 0, true);
@@ -401,10 +403,10 @@ fn parse_location_parens(loc: &str) -> (Option<String>, u32, bool) {
     if loc.contains("Unknown Source") {
         return (None, 0, false);
     }
-    // 格式: "File.java:42" 或 "bci=N"
+    // 格式: "File.java:42" 或 "File.java:3,956" 或 "bci=N"
     if let Some(colon) = loc.rfind(':') {
         let file = &loc[..colon];
-        let line = loc[colon + 1..].parse().unwrap_or(0);
+        let line = loc[colon + 1..].replace(',', "").parse().unwrap_or(0);
         (Some(file.to_string()), line, false)
     } else {
         (Some(loc.to_string()), 0, false)
