@@ -1,14 +1,16 @@
-//! Prompt-aware reader：逐字节从 jdb stdout 读取，识别 prompt / 事件 / VM退出。
+//! Prompt-aware reader: read jdb stdout byte by byte and recognize prompts, events, and VM exit.
 //!
-//! 核心契约（§5）：
-//! - 普通命令：写 `cmd\n` 后读到 prompt 即为就绪，小超时（~15s）。
-//! - 阻塞命令（run/cont/step/next/step up）：prompt 直到断点命中/异常/VM退出才回来，大超时（~30s）。
-//! - 超时不杀进程——返回部分输出 + `ReadOutcome::Timeout`。
+//! Core contract (§5):
+//! - Normal commands: after writing `cmd\n`, the command is ready when a prompt is read; short timeout (~15s).
+//! - Blocking commands (run/cont/step/next/step up): the prompt returns only at breakpoint/exception/VM exit;
+//!   use a longer timeout (~30s).
+//! - Do not kill the process on timeout: return partial output + `ReadOutcome::Timeout`.
 //!
-//! 实现：
-//! - 逐字节读入 `Vec<u8>` 滚动缓冲区（prompt 无 trailing newline，单次 read 不一定含完整行）。
-//! - `\r\n` → `\n` 归一化 + UTF-8 lossy 解码后在缓冲区尾部匹配 prompt regex。
-//! - 检测 event banner（breakpoint hit / step completed / exception / VM exit）发出语义信号。
+//! Implementation:
+//! - Read byte-wise into a rolling `Vec<u8>` buffer; prompts have no trailing newline and one read may not
+//!   contain a complete line.
+//! - Normalize `\r\n` → `\n`, decode UTF-8 lossily, and match prompt regexes at the buffer tail.
+//! - Detect event banners (breakpoint hit / step completed / exception / VM exit) and emit semantic signals.
 
 use std::io::Read;
 use std::sync::LazyLock;
@@ -16,21 +18,21 @@ use std::time::{Duration, Instant};
 
 use regex::Regex;
 
-// ─── 正则（§5，LazyLock 一次编译）─────────────────────────────────────────────
+// ─── Regexes (§5, compiled once through LazyLock) ──────────────────────────────
 
-/// 裸 prompt `> `——出现在 VM 启动前、以及阻塞命令（run/cont）执行后的**中间态**
-/// （VM Started 时短暂出现）。Blocking 模式下必须忽略它，否则会错过随后的断点事件。
-static RE_BARE_PROMPT: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^>\s$").unwrap());
+/// Bare prompt `> `, seen before VM startup and as an **intermediate state** after blocking commands
+/// (`run`/`cont`) when `VM Started` briefly appears. Blocking mode must ignore it or it will miss the
+/// following breakpoint event.
+static RE_BARE_PROMPT: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^>\s$").unwrap());
 
-/// Thread prompt `thread[frame] `（如 `main[1] `、`Thread-3[2] `、`pool-1-thread-2[2] `）。
-/// 出现它代表 VM 真正挂起在某个线程帧——是停下/命令完成的可靠信号。
+/// Thread prompt `thread[frame] `, such as `main[1] `, `Thread-3[2] `, `pool-1-thread-2[2] `.
+/// Its presence means the VM is truly suspended in a thread frame, a reliable stop/command-complete signal.
 static RE_THREAD_PROMPT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^[^\s\[\]]+\[\d+\]\s$").unwrap());
 
 /// Breakpoint hit / Step completed.
-/// 真实格式: `Breakpoint hit: "thread=main", Main.main(), line=3 bci=0`
-/// 注意：en_US locale 下 jdb 对 ≥1000 的行号输出千位分隔逗号（如 `line=3,956`）。
+/// Real format: `Breakpoint hit: "thread=main", Main.main(), line=3 bci=0`
+/// Note: in en_US locale, jdb emits thousands separators for line numbers >=1000, e.g. `line=3,956`.
 static RE_BREAKPOINT_OR_STEP: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?m)^(?P<kind>Breakpoint hit|Step completed): "thread=(?P<thread>[^"]+)", (?P<class>\S+)\.(?P<method>\S+)\(\), line=(?P<line>[\d,]+)"#,
@@ -40,15 +42,14 @@ static RE_BREAKPOINT_OR_STEP: LazyLock<Regex> = LazyLock::new(|| {
 
 /// Exception occurred.
 static RE_EXCEPTION: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^Exception occurred: (?P<exc>\S+) \((?P<caught>caught|uncaught)")
-        .unwrap()
+    Regex::new(r"(?m)^Exception occurred: (?P<exc>\S+) \((?P<caught>caught|uncaught)").unwrap()
 });
 
 /// Field watchpoint hit (real jdb format, JDK 8–21+).
 /// Modification: `Field (Cls.field) is <old>, will be <new>: "thread=T", Cls.method(), line=N bci=M`
 /// Access:       `Field (Cls.field) is <value>: "thread=T", Cls.method(), line=N bci=M`
 /// The detail may contain colons inside quoted values, so match `: "thread=` as the separator.
-/// 注意：en_US locale 下 line 可能带千位逗号（如 `line=3,956`）。
+/// Note: in en_US locale, line may contain thousands separators, e.g. `line=3,956`.
 static RE_FIELD_WATCH: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r#"(?m)^Field \((?P<field>[^)]+)\) (?P<detail>.+): "thread=(?P<thread>[^"]+)", (?P<class>\S+)\.(?P<method>\S+)\(\), line=(?P<line>[\d,]+)"#,
@@ -56,12 +57,11 @@ static RE_FIELD_WATCH: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// VM 退出 / 断开。
-static RE_VM_EXIT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?m)^The application (?:exited|has been disconnected)").unwrap()
-});
+/// VM exit / disconnect.
+static RE_VM_EXIT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?m)^The application (?:exited|has been disconnected)").unwrap());
 
-/// 连接/启动致命错误。
+/// Fatal connection/launch error.
 static RE_FATAL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"(?m)^(?:Unable to attach to target VM|java\.io\.IOException|Input stream closed|Connection refused)",
@@ -69,39 +69,39 @@ static RE_FATAL: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-// ─── 公开类型 ────────────────────────────────────────────────────────────────────
+// ─── Public Types ──────────────────────────────────────────────────────────────
 
-/// 读取模式：决定如何对待裸 prompt `> `。
+/// Read mode: determines how bare prompt `> ` is handled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadMode {
-    /// 普通命令（locals/where/print/stop…）：任何 prompt（裸或 thread）都代表命令完成。
+    /// Normal commands (locals/where/print/stop...): any prompt, bare or thread, completes the command.
     Normal,
-    /// 阻塞命令（run/cont/step/next/step-out）：忽略中间的裸 prompt，
-    /// 只在 thread-prompt / 事件 banner / VM退出 时才算停下。
+    /// Blocking commands (run/cont/step/next/step-out): ignore intermediate bare prompts and stop only at
+    /// thread-prompt / event banner / VM exit.
     Blocking,
 }
 
-/// reader 交给上层的单次读取结果。
+/// Single read result returned by the reader to upper layers.
 #[derive(Debug, Clone)]
 pub enum ReadOutcome {
-    /// 成功读到 prompt，附带 prompt 之前的全部文本。
+    /// Successfully read a prompt, with all text before the prompt.
     Prompt {
-        /// prompt 之前的输出文本（已归一化、去掉尾部 prompt 行本身）。
+        /// Output text before the prompt, normalized and with the trailing prompt line removed.
         output: String,
-        /// 检测到的事件（如果有的话）。
+        /// Detected event, if any.
         event: Option<DetectedEvent>,
     },
-    /// VM 退出。
+    /// VM exited.
     VmExit { output: String },
-    /// jdb 报告致命错误（连接失败等）。
+    /// jdb reported a fatal error, such as connection failure.
     Fatal { message: String },
-    /// 超时——返回目前已读到的部分输出；**不杀进程**。
+    /// Timeout: return partial output read so far; **do not kill the process**.
     Timeout { partial: String },
-    /// stdout EOF（管道关闭 / jdb 退出）。
+    /// stdout EOF, from pipe close or jdb exit.
     Eof { output: String },
 }
 
-/// reader 识别的事件语义。
+/// Event semantics recognized by the reader.
 #[derive(Debug, Clone)]
 pub enum DetectedEvent {
     Breakpoint {
@@ -129,45 +129,44 @@ pub enum DetectedEvent {
         method: String,
         line: u32,
     },
-    /// JDK 8 SUSPEND_THREAD 截断 banner：jdb 写出 `"Breakpoint hit: "` 或 `"Step completed: "`
-    /// 前缀后不再继续（无 thread/location/thread-prompt）。Session 层需自动补全。
-    PartialStop {
-        is_step: bool,
-    },
+    /// JDK 8 SUSPEND_THREAD truncated banner: jdb writes the `"Breakpoint hit: "` or `"Step completed: "`
+    /// prefix and then stops, with no thread/location/thread-prompt. Session must enrich it automatically.
+    PartialStop { is_step: bool },
 }
 
 // ─── PromptReader ────────────────────────────────────────────────────────────────
 
-/// 截断 banner patience window：检测到截断前缀后等此时长仍无后续字节即判定为 PartialStop。
-/// SUSPEND_ALL 的完整 banner 在数 ms 内全部到达，500ms 极为保守。
+/// Truncated-banner patience window: after seeing a truncated prefix, if no further bytes arrive within
+/// this duration, classify it as PartialStop. Full SUSPEND_ALL banners arrive within a few ms, so 500ms is conservative.
 const PARTIAL_BANNER_PATIENCE: Duration = Duration::from_millis(500);
 
-/// Patience 窗口期间 recv_timeout 的轮询粒度。
+/// recv_timeout polling granularity during the patience window.
 const PARTIAL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// 后台读线程发来的数据块；`None` 表示 EOF。
+/// Data block from the background reader thread; `None` means EOF.
 type Chunk = Option<Vec<u8>>;
 
-/// 从 jdb stdout 读取并识别 prompt/事件的读取器。
+/// Reader that reads jdb stdout and recognizes prompts/events.
 ///
-/// 内部起一个后台线程逐块读取 stdout（标准库阻塞 IO 无法超时，故用线程 + channel），
-/// `read_until_prompt` 在主线程用 `recv_timeout` 累积字节并在缓冲区尾部匹配 prompt。
+/// Internally starts a background thread to read stdout chunks. Standard-library blocking IO cannot time
+/// out directly, so it uses a thread + channel. `read_until_prompt` accumulates bytes in the main thread
+/// with `recv_timeout` and matches prompts at the buffer tail.
 pub struct PromptReader {
     rx: std::sync::mpsc::Receiver<Chunk>,
-    /// 原始字节缓冲（跨 chunk 累积，用于正确处理跨界的 `\r\n`）。
+    /// Raw byte buffer accumulated across chunks, so split `\r\n` boundaries are handled correctly.
     raw: Vec<u8>,
-    /// 归一化（`\r\n`→`\n`）+ UTF-8 lossy 解码后的文本，匹配都基于它。
+    /// Normalized (`\r\n`→`\n`) and UTF-8 lossy-decoded text used for all matching.
     text: String,
     eof: bool,
-    /// 截断 banner（`Breakpoint hit: ` / `Step completed: `，JDK 8 SUSPEND_THREAD）首次出现在缓冲尾部的时刻。
-    /// 用于 patience window：等 [`PARTIAL_BANNER_PATIENCE`] 仍无后续字节才判定为 PartialStop；
-    /// 新字节到达即重置（完整 banner 会续写后半部分，不会误判）。
+    /// First time a truncated banner (`Breakpoint hit: ` / `Step completed: `, JDK 8 SUSPEND_THREAD)
+    /// appeared at the buffer tail. Used for the patience window: only classify as PartialStop after
+    /// [`PARTIAL_BANNER_PATIENCE`] passes with no further bytes. New bytes reset it, so full banners are not misclassified.
     partial_banner_since: Option<Instant>,
     _handle: std::thread::JoinHandle<()>,
 }
 
 impl PromptReader {
-    /// 接管 stdout，启动后台读线程。
+    /// Take ownership of stdout and start the background reader thread.
     pub fn new<R: Read + Send + 'static>(mut stdout: R) -> Self {
         let (tx, rx) = std::sync::mpsc::channel::<Chunk>();
         let handle = std::thread::spawn(move || {
@@ -200,10 +199,10 @@ impl PromptReader {
         }
     }
 
-    /// 读取直到 prompt / 事件 / VM退出 / 致命错误 / EOF / 超时。
+    /// Read until prompt / event / VM exit / fatal error / EOF / timeout.
     ///
-    /// `mode` 决定如何对待裸 prompt（见 [`ReadMode`]）。
-    /// 返回后，已消费的文本从内部缓冲清空（下一条命令从干净缓冲开始）。
+    /// `mode` determines how bare prompts are handled (see [`ReadMode`]).
+    /// On return, consumed text is removed from the internal buffer so the next command starts cleanly.
     pub fn read_until_prompt(&mut self, timeout: Duration, mode: ReadMode) -> ReadOutcome {
         let deadline = Instant::now() + timeout;
         loop {
@@ -211,8 +210,8 @@ impl PromptReader {
                 return outcome;
             }
 
-            // Patience window：Blocking 模式下缓冲尾部是截断 banner（JDK 8 SUSPEND_THREAD），
-            // 等 PARTIAL_BANNER_PATIENCE 仍无后续字节即判定 PartialStop（jdb 不会再写 location）。
+            // Patience window: in Blocking mode the buffer tail is a truncated banner (JDK 8 SUSPEND_THREAD).
+            // If no bytes arrive within PARTIAL_BANNER_PATIENCE, classify it as PartialStop; jdb will not write location.
             if mode == ReadMode::Blocking && self.tail_is_partial_banner() {
                 match self.partial_banner_since {
                     None => self.partial_banner_since = Some(Instant::now()),
@@ -222,7 +221,7 @@ impl PromptReader {
                     Some(_) => {}
                 }
             } else {
-                // 尾部不再是截断 banner（续写了完整 banner，或其它输出）→ 重置计时。
+                // Tail is no longer a truncated banner (full banner continued, or other output), so reset the timer.
                 self.partial_banner_since = None;
             }
 
@@ -236,7 +235,7 @@ impl PromptReader {
                     partial: self.take_text(),
                 };
             };
-            // 处于 patience 窗口时用小粒度轮询，使窗口到期能及时判定 PartialStop。
+            // During the patience window, poll at small granularity so expiry promptly classifies PartialStop.
             let wait = if self.partial_banner_since.is_some() {
                 remaining.min(PARTIAL_POLL_INTERVAL)
             } else {
@@ -246,7 +245,7 @@ impl PromptReader {
                 Ok(Some(bytes)) => self.push(&bytes),
                 Ok(None) => self.eof = true,
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                    // patience 窗口内的轮询超时不算命令超时——继续循环重新评估。
+                    // Poll timeouts inside the patience window are not command timeouts; loop and re-evaluate.
                     if self.partial_banner_since.is_some() && Instant::now() < deadline {
                         continue;
                     }
@@ -259,8 +258,8 @@ impl PromptReader {
         }
     }
 
-    /// 追加原始字节，重新归一化解码（缓冲不大，重复解码可接受）。
-    /// 新字节到达 → 重置 partial banner patience（完整 banner 正在续写）。
+    /// Append raw bytes and re-normalize/decode. Buffers are small, so repeated decoding is acceptable.
+    /// New bytes reset partial-banner patience because a full banner may be continuing.
     fn push(&mut self, bytes: &[u8]) {
         self.raw.extend_from_slice(bytes);
         let decoded = String::from_utf8_lossy(&self.raw);
@@ -268,16 +267,16 @@ impl PromptReader {
         self.partial_banner_since = None;
     }
 
-    /// 取出并清空当前文本缓冲。
+    /// Take and clear the current text buffer.
     fn take_text(&mut self) -> String {
         let out = std::mem::take(&mut self.text);
         self.raw.clear();
         out
     }
 
-    /// 排空 channel 中已到达或即将到达的残留字节，清空内部缓冲。
-    /// 用于 blocking 命令返回后消除尾部输出（bare prompt 残留、源码行等）。
-    /// 循环 recv_timeout(100ms)：确保把 jdb 正在 flush 的尾部字节全收完再丢弃。
+    /// Drain residual bytes already in or about to arrive through the channel, then clear the internal buffer.
+    /// Used after blocking commands to remove tail output such as bare prompts or source lines.
+    /// Loops with recv_timeout(100ms) to ensure trailing bytes being flushed by jdb are collected before discarding.
     pub fn drain_stale(&mut self) {
         loop {
             match self.rx.recv_timeout(Duration::from_millis(100)) {
@@ -288,9 +287,10 @@ impl PromptReader {
         let _ = self.take_text();
     }
 
-    /// 非阻塞清空 channel 中已到达的残留字节 + 内部缓冲。
-    /// 在确知缓冲应为空时（Suspended 态下发新命令前）调用：清掉上一条 blocking
-    /// 命令遗留、迟到才到达的 stale bare-prompt `> `，避免它被当成本次命令的空响应。
+    /// Non-blockingly clear residual bytes already in the channel plus the internal buffer.
+    /// Called when the buffer should be empty before issuing a new command in Suspended state: remove stale
+    /// bare-prompt `> ` bytes that arrived late from the previous blocking command so they are not treated
+    /// as an empty response to the current command.
     pub fn purge_pending(&mut self) {
         while let Ok(chunk) = self.rx.try_recv() {
             match chunk {
@@ -304,32 +304,35 @@ impl PromptReader {
         let _ = self.take_text();
     }
 
-    /// 检查当前缓冲是否到达某个终止条件。
+    /// Check whether the current buffer has reached a termination condition.
     fn try_match(&mut self, mode: ReadMode) -> Option<ReadOutcome> {
-        // 1. 致命错误优先。
+        // 1. Fatal errors take priority.
         if let Some(m) = RE_FATAL.find(&self.text) {
             let line = current_line(&self.text, m.start()).to_string();
             let _ = self.take_text();
             return Some(ReadOutcome::Fatal { message: line });
         }
 
-        // 2. VM 退出：banner 出现即判定（其后可能 EOF，不一定有 prompt）。
+        // 2. VM exit: the banner is enough; EOF may follow, and there may be no prompt.
         if RE_VM_EXIT.is_match(&self.text) {
             return Some(ReadOutcome::VmExit {
                 output: self.take_text(),
             });
         }
 
-        // 3. 尾部 prompt：判断命令是否完成。
+        // 3. Tail prompt: decide whether the command is complete.
         let last_line = self.text.rsplit('\n').next().unwrap_or("");
         let is_thread_prompt = RE_THREAD_PROMPT.is_match(last_line);
         let is_bare_prompt = RE_BARE_PROMPT.is_match(last_line);
 
-        // thread-prompt 总是代表停下；裸 prompt 只有 Normal 模式才算完成。
+        // Thread prompts always mean stopped; bare prompts only complete Normal mode.
         let done = is_thread_prompt || (is_bare_prompt && mode == ReadMode::Normal);
         if done {
-            // thread-prompt（如 `main[1] `）携带当前线程名，供无 thread= 的事件 banner（异常）回填。
-            let prompt_thread = is_thread_prompt.then(|| thread_from_prompt(last_line)).flatten();
+            // Thread prompts like `main[1] ` carry the current thread name, used to backfill event banners
+            // without thread=, such as exceptions.
+            let prompt_thread = is_thread_prompt
+                .then(|| thread_from_prompt(last_line))
+                .flatten();
             let cut = self.text.len() - last_line.len();
             let output = self.text[..cut].trim_end_matches('\n').to_string();
             let event = detect_event(&output, prompt_thread.as_deref());
@@ -337,30 +340,33 @@ impl PromptReader {
             return Some(ReadOutcome::Prompt { output, event });
         }
 
-        // Blocking 模式下裸 prompt 出现：通常忽略（等真正的 thread-prompt / 事件 banner）。
-        // 但特殊情况："Nothing suspended." + 裸 prompt 表示 VM 实际未挂起（如 attach suspend=n
-        // 后 cont），此时 cont/resume 是空操作，应立即返回而非空等到超时。
+        // Bare prompt in Blocking mode is usually ignored while waiting for a real thread-prompt/event banner.
+        // Special case: "Nothing suspended." + bare prompt means the VM was not actually suspended, e.g. cont
+        // after attach suspend=n. cont/resume is then a no-op and should return immediately instead of timing out.
         if is_bare_prompt && mode == ReadMode::Blocking {
             let before_prompt = &self.text[..self.text.len() - last_line.len()];
             if before_prompt.contains("Nothing suspended") {
                 let output = before_prompt.trim_end_matches('\n').to_string();
                 let _ = self.take_text();
-                return Some(ReadOutcome::Prompt { output, event: None });
+                return Some(ReadOutcome::Prompt {
+                    output,
+                    event: None,
+                });
             }
         }
 
         None
     }
 
-    /// 缓冲尾部是否为截断事件 banner 前缀（`"Breakpoint hit: "` 或 `"Step completed: "`）。
-    /// JDK 8 在 SUSPEND_THREAD policy 下命中断点/完成单步后，jdb 只写此前缀、不续写
-    /// thread/location、也不发 thread-prompt——光标停在冒号空格后等待输入。
+    /// Whether the buffer tail is a truncated event banner prefix (`"Breakpoint hit: "` or `"Step completed: "`).
+    /// Under JDK 8 SUSPEND_THREAD policy, after hitting a breakpoint or completing a step, jdb writes only
+    /// this prefix and does not continue with thread/location or thread-prompt; the cursor stops after colon-space.
     fn tail_is_partial_banner(&self) -> bool {
         let last_line = self.text.rsplit('\n').next().unwrap_or("");
         last_line == "Breakpoint hit: " || last_line == "Step completed: "
     }
 
-    /// Patience 窗口到期，确认截断 banner——发射 PartialStop 事件。
+    /// Patience window expired, confirming a truncated banner; emit a PartialStop event.
     fn emit_partial_stop(&mut self) -> ReadOutcome {
         let last_line = self.text.rsplit('\n').next().unwrap_or("");
         let is_step = last_line.starts_with("Step completed:");
@@ -375,8 +381,8 @@ impl PromptReader {
     }
 }
 
-/// 在 `output` 文本里检测事件 banner。
-/// `prompt_thread`：尾部 thread-prompt 推断出的线程名（异常 banner 不含 thread= 时回填）。
+/// Detect event banners in `output` text.
+/// `prompt_thread`: thread name inferred from the tail thread-prompt, used to backfill exception banners without thread=.
 fn detect_event(output: &str, prompt_thread: Option<&str>) -> Option<DetectedEvent> {
     if let Some(c) = RE_BREAKPOINT_OR_STEP.captures(output) {
         let thread = c["thread"].to_string();
@@ -385,13 +391,23 @@ fn detect_event(output: &str, prompt_thread: Option<&str>) -> Option<DetectedEve
         let line = parse_line_number(&c["line"]);
         let is_step = &c["kind"] == "Step completed";
         return Some(if is_step {
-            DetectedEvent::Step { thread, class, method, line }
+            DetectedEvent::Step {
+                thread,
+                class,
+                method,
+                line,
+            }
         } else {
-            DetectedEvent::Breakpoint { thread, class, method, line }
+            DetectedEvent::Breakpoint {
+                thread,
+                class,
+                method,
+                line,
+            }
         });
     }
     if let Some(c) = RE_EXCEPTION.captures(output) {
-        // Exception banner 不含 thread=；从尾部 thread-prompt 推断当前线程（否则留空）。
+        // Exception banners do not contain thread=; infer the current thread from the tail thread-prompt or leave empty.
         return Some(DetectedEvent::Exception {
             thread: prompt_thread.unwrap_or("").to_string(),
             exception: c["exc"].to_string(),
@@ -417,23 +433,29 @@ fn detect_event(output: &str, prompt_thread: Option<&str>) -> Option<DetectedEve
     None
 }
 
-/// 解析行号：去掉 en_US locale 下 jdb 输出的千位分隔逗号（如 "3,956" → 3956）。
+/// Parse a line number, stripping en_US thousands separators emitted by jdb, e.g. "3,956" → 3956.
 fn parse_line_number(raw: &str) -> u32 {
     raw.replace(',', "").parse().unwrap_or(0)
 }
 
-/// 从 thread-prompt 行（如 `main[1] `）提取线程名（`[` 之前的部分）。
+/// Extract the thread name from a thread-prompt line such as `main[1] `, taking the part before `[`.
 fn thread_from_prompt(line: &str) -> Option<String> {
     if !RE_THREAD_PROMPT.is_match(line) {
         return None;
     }
-    line.split('[').next().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
+    line.split('[')
+        .next()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }
 
-/// 取出 `text` 中包含字节偏移 `pos` 的那一整行。
+/// Return the whole line in `text` that contains byte offset `pos`.
 fn current_line(text: &str, pos: usize) -> &str {
     let start = text[..pos].rfind('\n').map(|i| i + 1).unwrap_or(0);
-    let end = text[pos..].find('\n').map(|i| pos + i).unwrap_or(text.len());
+    let end = text[pos..]
+        .find('\n')
+        .map(|i| pos + i)
+        .unwrap_or(text.len());
     &text[start..end]
 }
 
@@ -446,7 +468,15 @@ mod tests {
         // Real jdb format: Field (Class.field) is <old>, will be <new>: "thread=T", Class.method(), line=N bci=M
         let output = r#"Field (WatchTest.name) is null, will be "initial": "thread=main", WatchTest.<clinit>(), line=6 bci=2"#;
         let event = detect_event(output, Some("main"));
-        let Some(DetectedEvent::FieldWatch { thread, field, access_type, class, method, line }) = event else {
+        let Some(DetectedEvent::FieldWatch {
+            thread,
+            field,
+            access_type,
+            class,
+            method,
+            line,
+        }) = event
+        else {
             panic!("expected FieldWatch, got {event:?}");
         };
         assert_eq!(thread, "main");
@@ -462,7 +492,15 @@ mod tests {
         // Access format: no "will be" in the detail
         let output = r#"Field (com.example.Service.name) is "hello": "thread=worker-1", com.example.Service.getName(), line=15 bci=0"#;
         let event = detect_event(output, Some("worker-1"));
-        let Some(DetectedEvent::FieldWatch { thread, field, access_type, class, method, line }) = event else {
+        let Some(DetectedEvent::FieldWatch {
+            thread,
+            field,
+            access_type,
+            class,
+            method,
+            line,
+        }) = event
+        else {
             panic!("expected FieldWatch, got {event:?}");
         };
         assert_eq!(thread, "worker-1");
@@ -480,21 +518,30 @@ mod tests {
         assert!(matches!(event, Some(DetectedEvent::Breakpoint { .. })));
     }
 
-    /// 回归测试：en_US locale 下 jdb 对 ≥1000 行号输出千位逗号（如 `line=3,956`）。
+    /// Regression: in en_US locale, jdb prints thousands separators for line numbers >=1000, e.g. `line=3,956`.
     #[test]
     fn breakpoint_line_with_thousands_separator() {
         let output = r#"Breakpoint hit: "thread=http-nio-8231-exec-3", com.yao.shopping.business.impl.cart.ShoppingCartListManagerImpl.getAllCartAndDemandDataV2(), line=3,956 bci=538"#;
         let event = detect_event(output, None);
-        let Some(DetectedEvent::Breakpoint { thread, class, method, line }) = event else {
+        let Some(DetectedEvent::Breakpoint {
+            thread,
+            class,
+            method,
+            line,
+        }) = event
+        else {
             panic!("expected Breakpoint, got {event:?}");
         };
         assert_eq!(thread, "http-nio-8231-exec-3");
-        assert_eq!(class, "com.yao.shopping.business.impl.cart.ShoppingCartListManagerImpl");
+        assert_eq!(
+            class,
+            "com.yao.shopping.business.impl.cart.ShoppingCartListManagerImpl"
+        );
         assert_eq!(method, "getAllCartAndDemandDataV2");
         assert_eq!(line, 3956, "thousands separator comma must be stripped");
     }
 
-    /// 回归测试：无千位逗号的普通行号仍正常解析。
+    /// Regression: ordinary line numbers without thousands separators still parse normally.
     #[test]
     fn breakpoint_line_without_separator_still_works() {
         let output = r#"Breakpoint hit: "thread=main", Main.main(), line=42 bci=0"#;
@@ -505,7 +552,7 @@ mod tests {
         assert_eq!(line, 42);
     }
 
-    /// Field watchpoint 也可能有千位逗号行号。
+    /// Field watchpoints may also have line numbers with thousands separators.
     #[test]
     fn field_watch_line_with_thousands_separator() {
         let output = r#"Field (Service.count) is 0, will be 1: "thread=worker-1", com.example.Service.increment(), line=1,024 bci=5"#;
@@ -516,8 +563,8 @@ mod tests {
         assert_eq!(line, 1024, "thousands separator comma must be stripped");
     }
 
-    /// 一个只产出一次预设字节、之后永久阻塞（不 EOF）的 Reader，
-    /// 模拟 JDK 8 SUSPEND_THREAD 命中后 jdb 写出截断前缀就不再写、也不关闭管道。
+    /// Reader that emits one preset byte chunk and then blocks forever without EOF.
+    /// Simulates JDK 8 SUSPEND_THREAD where jdb writes a truncated prefix and then neither writes nor closes the pipe.
     struct StallingReader {
         data: Vec<u8>,
         sent: bool,
@@ -531,7 +578,7 @@ mod tests {
                 buf[..n].copy_from_slice(&self.data[..n]);
                 return Ok(n);
             }
-            // 之后永久阻塞：模拟 jdb 命中后停在截断 banner、不再有任何输出、也不 EOF。
+            // Block forever afterwards: jdb stopped at a truncated banner, with no further output and no EOF.
             std::thread::sleep(Duration::from_secs(3600));
             Ok(0)
         }
@@ -539,19 +586,26 @@ mod tests {
 
     #[test]
     fn partial_breakpoint_banner_emits_partial_stop_in_blocking_mode() {
-        // JDK 8 SUSPEND_THREAD 截断 banner：前面有正常的启动输出，最后一行是 `Breakpoint hit: `
-        // （冒号空格结尾、无换行、无后续）。
-        let truncated = b"VM Started: Set deferred breakpoint ThreadTest.doWork\n\nBreakpoint hit: ";
-        let reader = StallingReader { data: truncated.to_vec(), sent: false };
+        // JDK 8 SUSPEND_THREAD truncated banner: normal startup output first, and the final line is
+        // `Breakpoint hit: ` ending with colon-space, no newline, no continuation.
+        let truncated =
+            b"VM Started: Set deferred breakpoint ThreadTest.doWork\n\nBreakpoint hit: ";
+        let reader = StallingReader {
+            data: truncated.to_vec(),
+            sent: false,
+        };
         let mut pr = PromptReader::new(reader);
 
-        // Blocking 模式：patience window（500ms）后应判定为 PartialStop，而不是等到超时。
+        // Blocking mode: after the 500ms patience window, classify as PartialStop instead of waiting for timeout.
         let start = Instant::now();
         let outcome = pr.read_until_prompt(Duration::from_secs(30), ReadMode::Blocking);
         let elapsed = start.elapsed();
 
         match outcome {
-            ReadOutcome::Prompt { event: Some(DetectedEvent::PartialStop { is_step }), output } => {
+            ReadOutcome::Prompt {
+                event: Some(DetectedEvent::PartialStop { is_step }),
+                output,
+            } => {
                 assert!(!is_step, "should be a breakpoint, not a step");
                 assert!(
                     output.contains("VM Started"),
@@ -564,7 +618,7 @@ mod tests {
             }
             other => panic!("expected PartialStop, got {other:?}"),
         }
-        // 应在 patience window 略多一点（远小于 30s 超时）就返回。
+        // Should return shortly after the patience window, far below the 30s timeout.
         assert!(
             elapsed < Duration::from_secs(5),
             "should resolve via patience window (~500ms), not block until timeout; took {elapsed:?}"
@@ -574,27 +628,36 @@ mod tests {
     #[test]
     fn partial_step_banner_emits_partial_stop() {
         let truncated = b"Step completed: ";
-        let reader = StallingReader { data: truncated.to_vec(), sent: false };
+        let reader = StallingReader {
+            data: truncated.to_vec(),
+            sent: false,
+        };
         let mut pr = PromptReader::new(reader);
 
         let outcome = pr.read_until_prompt(Duration::from_secs(30), ReadMode::Blocking);
         match outcome {
-            ReadOutcome::Prompt { event: Some(DetectedEvent::PartialStop { is_step }), .. } => {
+            ReadOutcome::Prompt {
+                event: Some(DetectedEvent::PartialStop { is_step }),
+                ..
+            } => {
                 assert!(is_step, "should be flagged as a step");
             }
             other => panic!("expected PartialStop step, got {other:?}"),
         }
     }
 
-    /// Bug A 回归测试：Timeout 后内部缓冲必须清空，否则后续命令读到脏数据。
+    /// Bug A regression: internal buffers must be cleared after Timeout or later commands read stale data.
     #[test]
     fn timeout_clears_buffer() {
-        // 模拟：发一段不含 prompt 的数据，然后 stall → 触发 timeout。
+        // Simulate data without a prompt, then stall to trigger timeout.
         let data = b"some partial output without prompt";
-        let reader = StallingReader { data: data.to_vec(), sent: false };
+        let reader = StallingReader {
+            data: data.to_vec(),
+            sent: false,
+        };
         let mut pr = PromptReader::new(reader);
 
-        // 用极短超时触发 Timeout。
+        // Use a very short timeout to trigger Timeout.
         let outcome = pr.read_until_prompt(Duration::from_millis(200), ReadMode::Normal);
         match &outcome {
             ReadOutcome::Timeout { partial } => {
@@ -603,18 +666,29 @@ mod tests {
             other => panic!("expected Timeout, got {other:?}"),
         }
 
-        // 关键断言：内部缓冲已被清空（text 和 raw 都空）。
-        assert!(pr.text.is_empty(), "text buffer should be empty after timeout, got: {:?}", pr.text);
-        assert!(pr.raw.is_empty(), "raw buffer should be empty after timeout, got len={}", pr.raw.len());
+        // Key assertion: internal buffers were cleared, both text and raw.
+        assert!(
+            pr.text.is_empty(),
+            "text buffer should be empty after timeout, got: {:?}",
+            pr.text
+        );
+        assert!(
+            pr.raw.is_empty(),
+            "raw buffer should be empty after timeout, got len={}",
+            pr.raw.len()
+        );
     }
 
-    /// Bug D 回归测试：Blocking 模式下 "Nothing suspended." + bare prompt 应立即返回，
-    /// 而不是空等到超时。
+    /// Bug D regression: in Blocking mode, "Nothing suspended." + bare prompt should return immediately
+    /// instead of waiting until timeout.
     #[test]
     fn nothing_suspended_in_blocking_mode_returns_immediately() {
-        // 模拟 jdb 对 cont（VM 已在运行）的回复："Nothing suspended.\n> "
+        // Simulate jdb's reply to cont when the VM is already running: "Nothing suspended.\n> "
         let data = b"Nothing suspended.\n> ";
-        let reader = StallingReader { data: data.to_vec(), sent: false };
+        let reader = StallingReader {
+            data: data.to_vec(),
+            sent: false,
+        };
         let mut pr = PromptReader::new(reader);
 
         let start = Instant::now();
@@ -629,7 +703,7 @@ mod tests {
             other => panic!("expected Prompt, got {other:?}"),
         }
 
-        // 应在毫秒内返回，远小于 30s 超时。
+        // Should return within milliseconds, far below the 30s timeout.
         assert!(
             elapsed < Duration::from_secs(2),
             "should return immediately, not block; took {elapsed:?}"

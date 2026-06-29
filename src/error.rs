@@ -1,22 +1,22 @@
-//! 领域错误类型。`thiserror` 定义结构化错误，上层用 `anyhow` 加 context。
+//! Domain error types. `thiserror` defines structured errors, while upper layers add context with `anyhow`.
 //!
-//! 注意：命令「超时」在引擎内部不是错误，而是 `reader` 返回的一种非破坏性结果
-//! （见 §5：超时不杀进程，返回部分输出并标记 `Running`）。这里的 `Error::Timeout`
-//! 仅用于无法继续读取的退化场景，正常超时走 `CommandResult::Timeout`。
+//! Note: command timeouts are not engine errors. They are non-destructive results returned by `reader`
+//! (see §5: do not kill on timeout; return partial output and mark `Running`). `Error::Timeout`
+//! is only for degraded cases where reading cannot continue; normal timeouts use `CommandResult::Timeout`.
 
-/// crate 统一的 `Result` 别名。
+/// Crate-wide `Result` alias.
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
-    /// 在所有发现路径上都找不到 jdb 可执行文件。
+    /// The jdb executable could not be found through any discovery path.
     #[error(
         "jdb executable not found (searched: {searched:?}). \
          Install a JDK, set JAVA_HOME, or pass --jdb-path"
     )]
     JdbNotFound { searched: Vec<String> },
 
-    /// 启动 jdb 子进程失败。
+    /// Failed to spawn the jdb child process.
     #[error("failed to spawn jdb at {path}: {source}")]
     Spawn {
         path: String,
@@ -24,36 +24,36 @@ pub enum Error {
         source: std::io::Error,
     },
 
-    /// jdb 子进程已退出 / stdin 或 stdout 管道关闭。
+    /// The jdb child process has exited, or its stdin/stdout pipe is closed.
     #[error("jdb session is not alive: {0}")]
     SessionDead(String),
 
-    /// 找不到指定（或默认）会话。
+    /// The specified or default session was not found.
     #[error("session not found: {0}")]
     SessionNotFound(String),
 
-    /// 试图 attach 到已有存活 session 连接的同一目标（host:port）。
+    /// Attempted to attach to the same target (host:port) as an existing live session.
     #[error(
         "a live session '{existing_id}' is already attached to {target}. \
          Reuse it (--session {existing_id}) or kill it first."
     )]
     DuplicateTarget { target: String, existing_id: String },
 
-    /// jdb 报告连接 / 启动错误（§5：`Unable to attach`、`java.io.IOException`、`Input stream closed`）。
+    /// jdb reported a connection or launch error (§5: `Unable to attach`, `java.io.IOException`, `Input stream closed`).
     #[error("jdb connection/launch failed: {0}")]
     Connection(String),
 
-    /// 读取 jdb 输出时彻底超时且无法恢复（退化场景）。
+    /// Reading jdb output timed out completely and could not recover.
     #[error("timed out after {secs}s waiting for jdb")]
     Timeout { secs: u64 },
 
-    /// 其它 IO 错误。
+    /// Any other IO error.
     #[error(transparent)]
     Io(#[from] std::io::Error),
 }
 
 impl Error {
-    /// 映射到进程退出码（后续 CLI 阶段使用）。
+    /// Map the error to a process exit code for the CLI.
     pub fn exit_code(&self) -> i32 {
         match self {
             Error::JdbNotFound { .. } => 3,

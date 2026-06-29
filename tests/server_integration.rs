@@ -1,7 +1,7 @@
-//! 集成测试：模拟完整的 daemon handler 流程，验证所有改动在真实 jdb 会话中工作。
+//! Integration tests: simulate the full daemon handler flow and verify changes against real jdb sessions.
 //!
-//! 这些测试需要 JDK（JAVA_HOME 或 PATH 中有 jdb），且需要编译好的 Java fixture。
-//! 运行前确保执行了：javac -g tests/fixtures/java/CollectionTest.java
+//! These tests require a JDK (jdb available through JAVA_HOME or PATH) and compiled Java fixtures.
+//! Before running, ensure: javac -g tests/fixtures/java/CollectionTest.java
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -9,12 +9,12 @@ use std::sync::Arc;
 use java_agent_debugger::protocol::*;
 use java_agent_debugger::session::Session;
 
-/// 辅助：获取 jdb 路径。
+/// Helper: get the jdb path.
 fn jdb_path() -> PathBuf {
     java_agent_debugger::jdkpath::find_jdb(None).expect("jdb not found — is JAVA_HOME set?")
 }
 
-/// 辅助：fixture 目录。
+/// Helper: fixture directory.
 fn fixture_dir() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests")
@@ -22,7 +22,7 @@ fn fixture_dir() -> PathBuf {
         .join("java")
 }
 
-/// 辅助：launch 一个 fixture 会话。
+/// Helper: launch one fixture session.
 fn launch_fixture(main_class: &str) -> Arc<Session> {
     use java_agent_debugger::jdb::process::LaunchConfig;
 
@@ -47,18 +47,18 @@ fn launch_fixture(main_class: &str) -> Arc<Session> {
 fn break_target_record_and_take() {
     let session = launch_fixture("CollectionTest");
 
-    // 初始状态：无 target
+    // Initial state: no target.
     assert!(session.take_break_target().is_none());
 
-    // 记录
+    // Record.
     session.record_break_target("CollectionTest", 9);
     let target = session.take_break_target();
     assert_eq!(target, Some(("CollectionTest".to_string(), 9)));
 
-    // take 是 one-shot
+    // take is one-shot.
     assert!(session.take_break_target().is_none());
 
-    // 清理
+    // Cleanup.
     let _ = session.kill();
 }
 
@@ -68,7 +68,7 @@ fn break_target_record_and_take() {
 fn breakpoint_hit_includes_source_context_and_frame() {
     let session = launch_fixture("CollectionTest");
 
-    // 设置断点：第 10 行（int size = fruits.size();）
+    // Set breakpoint: line 10 (`int size = fruits.size();`).
     let bp_resp = session
         .stop_at("CollectionTest", 10, None, None)
         .expect("stop_at failed");
@@ -78,34 +78,39 @@ fn breakpoint_hit_includes_source_context_and_frame() {
         bp_resp.result
     );
 
-    // 运行
+    // Run.
     let run_resp = session.run(Some(30)).expect("run failed");
 
-    // run 返回的是原始 Stopped（session 层不做 enrichment，enrichment 在 handler 层）
-    // 所以我们手动模拟 handler 的 enrich 逻辑
+    // run returns raw Stopped because the session layer does not enrich; enrichment lives in the handler layer.
+    // Manually simulate the handler enrichment logic here.
     let mut resp = run_resp;
     enrich_stopped_test_helper(&session, &mut resp);
 
     match &resp.result {
-        CommandResult::Stopped { location, frame, source_context, .. } => {
+        CommandResult::Stopped {
+            location,
+            frame,
+            source_context,
+            ..
+        } => {
             assert_eq!(location.class, "CollectionTest");
             assert_eq!(location.method, "main");
             assert!(location.line > 0, "line should be nonzero");
 
-            // frame 应该被填充
+            // frame should be filled.
             assert!(frame.is_some(), "frame should be enriched, got None");
             let f = frame.as_ref().unwrap();
-            assert_eq!(f.index, 1); // jdb 用 1-based frame indices
+            assert_eq!(f.index, 1); // jdb uses 1-based frame indices.
             assert_eq!(f.location.class, "CollectionTest");
 
-            // source_context 应该被填充（如果 sourcepath 正确）
+            // source_context should be filled when sourcepath is correct.
             assert!(
                 source_context.is_some(),
                 "source_context should be enriched, got None"
             );
             let lines = source_context.as_ref().unwrap();
             assert!(!lines.is_empty(), "source lines should not be empty");
-            // 应该包含断点行
+            // Should include the breakpoint line.
             assert!(
                 lines.iter().any(|l| l.number == location.line),
                 "source_context should contain the breakpoint line {}",
@@ -124,7 +129,7 @@ fn breakpoint_hit_includes_source_context_and_frame() {
 fn line_mismatch_note_when_hit_differs() {
     let session = launch_fixture("CollectionTest");
 
-    // 设置断点并记录 target
+    // Set breakpoint and record target.
     session
         .stop_at("CollectionTest", 10, None, None)
         .expect("stop_at failed");
@@ -133,19 +138,19 @@ fn line_mismatch_note_when_hit_differs() {
     let run_resp = session.run(Some(30)).expect("run failed");
     let mut resp = run_resp;
 
-    // 模拟 check_line_mismatch
+    // Simulate check_line_mismatch.
     check_line_mismatch_test_helper(&session, &mut resp);
 
-    // 如果实际命中行 == 请求行，note 应为 None
+    // If the actual hit line equals the requested line, note should be None.
     if let CommandResult::Stopped { location, .. } = &resp.result {
         if location.line == 10 {
-            // 行号匹配，不应有 note
+            // Line numbers match; no note expected.
             assert!(
                 resp.note.is_none(),
                 "no mismatch note expected when lines match"
             );
         } else {
-            // 行号不匹配，应有 note
+            // Line numbers differ; note expected.
             assert!(
                 resp.note.is_some(),
                 "mismatch note expected when lines differ"
@@ -165,7 +170,7 @@ fn line_mismatch_note_when_hit_differs() {
 fn inspect_collection_returns_elements() {
     let session = launch_fixture("CollectionTest");
 
-    // 断点到集合已填充之后（line 10: int size = fruits.size();）
+    // Break after the collection has been populated (line 10: int size = fruits.size();).
     session
         .stop_at("CollectionTest", 10, None, None)
         .expect("stop_at failed");
@@ -176,14 +181,19 @@ fn inspect_collection_returns_elements() {
         run_resp.result
     );
 
-    // 调用 inspect
+    // Call inspect.
     let inspect_resp = handle_inspect_test_helper(&session, "fruits", 10, None);
     match &inspect_resp.result {
-        CommandResult::Inspection { expr, size, elements, truncated } => {
+        CommandResult::Inspection {
+            expr,
+            size,
+            elements,
+            truncated,
+        } => {
             assert_eq!(expr, "fruits");
             assert_eq!(*size, Some(3), "fruits.size() should be 3");
             assert_eq!(elements.len(), 3, "should have 3 elements");
-            // 验证元素内容
+            // Verify element contents.
             assert!(
                 elements[0].value.contains("apple"),
                 "first element should be apple, got: {}",
@@ -217,10 +227,15 @@ fn inspect_with_max_elements_truncates() {
     let run_resp = session.run(Some(30)).expect("run failed");
     assert!(matches!(run_resp.result, CommandResult::Stopped { .. }));
 
-    // 只取 2 个元素
+    // Fetch only 2 elements.
     let inspect_resp = handle_inspect_test_helper(&session, "fruits", 2, None);
     match &inspect_resp.result {
-        CommandResult::Inspection { size, elements, truncated, .. } => {
+        CommandResult::Inspection {
+            size,
+            elements,
+            truncated,
+            ..
+        } => {
             assert_eq!(*size, Some(3));
             assert_eq!(elements.len(), 2, "should only have 2 elements with max=2");
             assert_eq!(*truncated, Some(true), "should be marked truncated");
@@ -235,7 +250,7 @@ fn inspect_with_max_elements_truncates() {
 fn inspect_empty_returns_size_zero() {
     let session = launch_fixture("CollectionTest");
 
-    // 断点到 line 7 — fruits 刚创建还是空的
+    // Break at line 7, where fruits has just been created and is still empty.
     // line 6: List<String> fruits = new ArrayList<>();
     // line 7: fruits.add("apple");
     session
@@ -262,7 +277,7 @@ fn inspect_empty_returns_size_zero() {
 fn conditional_breakpoint_set_accepted() {
     let session = launch_fixture("CollectionTest");
 
-    // 验证断点能被 jdb 接受（stop_at 层不处理条件——条件断点逻辑在 handler 层）
+    // Verify the breakpoint is accepted by jdb. stop_at does not handle conditions; conditional logic is in handler.
     let bp_resp = session
         .stop_at("CollectionTest", 10, None, None)
         .expect("stop_at failed");
@@ -272,7 +287,7 @@ fn conditional_breakpoint_set_accepted() {
         bp_resp.result
     );
 
-    // 条件为 true → 应该停住
+    // Condition is true, so execution should stop.
     let run_resp = session.run(Some(30)).expect("run failed");
     assert!(
         matches!(run_resp.result, CommandResult::Stopped { .. }),
@@ -289,7 +304,7 @@ fn attach_to_unreachable_port_gives_clear_error() {
 
     let config = AttachConfig {
         host: "127.0.0.1".to_string(),
-        port: 19999, // 没有 JDWP 在这个端口监听
+        port: 19999, // No JDWP listener on this port.
         sourcepath: vec![],
     };
     let result = Session::attach(&jdb_path(), &config, "test-unreachable".into(), None);
@@ -309,17 +324,17 @@ fn attach_to_unreachable_port_gives_clear_error() {
     );
 }
 
-/// 回归：attach 入口把 `localhost` 规范化为 `127.0.0.1`，且规范化贯穿到 `probe_tcp`。
-/// 双栈机器上 `localhost` 可能解析到 IPv6 `[::1]`，而 JDWP 多在 IPv4 监听 → 连接被拒。
-/// 用不可达端口触发 probe_tcp 失败，错误信息里应出现规范化后的 `127.0.0.1`（而非原始 `localhost`），
-/// 证明 probe 与后续 spawn 用的都是 IPv4 字面量。
+/// Regression: attach entry normalizes `localhost` to `127.0.0.1`, and that normalization reaches `probe_tcp`.
+/// On dual-stack machines, `localhost` may resolve to IPv6 `[::1]`, while JDWP often listens on IPv4, causing refusal.
+/// Use an unreachable port to trigger probe_tcp failure; the error should mention normalized `127.0.0.1`
+/// instead of raw `localhost`, proving both probe and later spawn use the IPv4 literal.
 #[test]
 fn attach_normalizes_localhost_to_ipv4_loopback() {
     use java_agent_debugger::jdb::process::AttachConfig;
 
     let config = AttachConfig {
         host: "localhost".to_string(),
-        port: 19999, // 没有 JDWP 在这个端口监听
+        port: 19999, // No JDWP listener on this port.
         sourcepath: vec![],
     };
     let result = Session::attach(&jdb_path(), &config, "test-localhost-norm".into(), None);
@@ -338,15 +353,15 @@ fn attach_normalizes_localhost_to_ipv4_loopback() {
     );
 }
 
-// ─── Phase: thread suspend policy (jdb 原生 `stop thread`) ───
+// ─── Phase: thread suspend policy (native jdb `stop thread`) ───
 
-/// thread policy 断点：`stop thread at` 语法被 jdb 接受，命中后正常解析为 Stopped，
-/// 触发线程是 "worker"（事件 banner 与普通断点一致，parser 兼容）。
+/// Thread-policy breakpoint: `stop thread at` syntax is accepted by jdb, and a hit parses normally as Stopped.
+/// The triggering thread is "worker"; the event banner matches normal breakpoints, so parser remains compatible.
 #[test]
 fn thread_breakpoint_hit_resolves_worker() {
     let session = launch_fixture("ThreadTest");
 
-    // suspend="thread" → jdb 发 `stop thread at`（SUSPEND_THREAD policy）
+    // suspend="thread" makes jdb issue `stop thread at` (SUSPEND_THREAD policy).
     let bp = session
         .stop_in("ThreadTest", "doWork", None, Some("thread"), None)
         .expect("stop_in failed");
@@ -357,23 +372,33 @@ fn thread_breakpoint_hit_resolves_worker() {
     );
 
     let run_resp = session.run(Some(30)).expect("run failed");
-    // PartialStop 补全：截断 banner（JDK 8 SUSPEND_THREAD）经 session 层
-    // threads→thread<id>→where 自动补全 thread/location/frame。
+    // PartialStop enrichment: truncated banner (JDK 8 SUSPEND_THREAD) is automatically enriched by the
+    // session layer through threads→thread<id>→where to fill thread/location/frame.
     match &run_resp.result {
-        CommandResult::Stopped { location, thread, thread_id, frame, .. } => {
+        CommandResult::Stopped {
+            location,
+            thread,
+            thread_id,
+            frame,
+            ..
+        } => {
             assert_eq!(location.class, "ThreadTest");
             assert_eq!(location.method, "doWork");
             assert_eq!(thread, "worker", "the hit thread should be 'worker'");
-            // PartialStop 路径应在 session 层零额外开销地回填命中线程 id（复用那次 `threads`）。
-            let tid = thread_id.as_ref().expect("thread_id should be filled on a thread-policy hit");
+            // PartialStop path should fill hit thread id in the session layer without extra cost, reusing that `threads`.
+            let tid = thread_id
+                .as_ref()
+                .expect("thread_id should be filled on a thread-policy hit");
             assert!(!tid.is_empty(), "thread_id should be non-empty");
-            // frame 应已被 session 层从 `where` 回填（供 handler 跳过重复 where 查询）。
-            let f = frame.as_ref().expect("frame should be enriched by session layer");
+            // frame should be backfilled by the session layer from `where`, letting handler skip a duplicate where query.
+            let f = frame
+                .as_ref()
+                .expect("frame should be enriched by session layer");
             assert_eq!(f.location.class, "ThreadTest");
             assert_eq!(f.location.method, "doWork");
             assert!(f.location.line > 0, "enriched frame line should be nonzero");
 
-            // 回填的 id 必须能真正切换到该线程（即 transcript 里失败的那一步）。
+            // The backfilled id must actually switch to that thread; this is the step that failed in the transcript.
             let sw = session
                 .execute(
                     &format!("thread {tid}"),
@@ -383,7 +408,7 @@ fn thread_breakpoint_hit_resolves_worker() {
                     .with_timeout_secs(Some(5)),
                 )
                 .expect("thread switch failed");
-            // jdb 接受 → 不应是 "not a valid thread id" 之类错误文本。
+            // jdb accepted it, so this should not be an error like "not a valid thread id".
             if let CommandResult::Raw { text } = &sw.result {
                 assert!(
                     !text.contains("not a valid thread id"),
@@ -394,11 +419,15 @@ fn thread_breakpoint_hit_resolves_worker() {
         other => panic!("expected Stopped in worker/doWork, got {other:?}"),
     }
 
-    // 走 handler 层 enrich：基于 session 已填的 frame，补 source_context（list）。
+    // Run handler-layer enrichment: use the frame already filled by session to add source_context via list.
     let mut resp = run_resp;
     enrich_stopped_test_helper(&session, &mut resp);
     match &resp.result {
-        CommandResult::Stopped { source_context, location, .. } => {
+        CommandResult::Stopped {
+            source_context,
+            location,
+            ..
+        } => {
             let lines = source_context
                 .as_ref()
                 .expect("source_context should be enriched via handler layer");
@@ -414,9 +443,9 @@ fn thread_breakpoint_hit_resolves_worker() {
     let _ = session.kill();
 }
 
-/// 核心回归：thread policy 下 VM 不会 SUSPEND_ALL —— worker 挂在断点时，daemon
-/// 线程 heartbeat 仍持续递增 heartbeatCount，证明其它线程没有被冻结。
-/// （旧的 suspend-count 模拟方案在此会因 spec 不匹配静默退回 all，冻结全部线程。）
+/// Core regression: under thread policy the VM does not SUSPEND_ALL. While worker is stopped at a breakpoint,
+/// the daemon heartbeat thread keeps incrementing heartbeatCount, proving other threads are not frozen.
+/// The old suspend-count simulation would silently fall back to all here due to spec mismatch and freeze all threads.
 #[test]
 fn thread_breakpoint_keeps_other_threads_running() {
     let session = launch_fixture("ThreadTest");
@@ -431,8 +460,8 @@ fn thread_breakpoint_keeps_other_threads_running() {
         run_resp.result
     );
 
-    // worker 已挂在断点；读 heartbeatCount 两次，中间用 jdb 往返制造时间窗口
-    // （heartbeat 每 ~50ms 递增）。thread policy 下计数必须继续增长。
+    // worker is stopped at a breakpoint. Read heartbeatCount twice, with jdb round-trips between them to create
+    // a time window. heartbeat increments about every 50ms, so under thread policy the count must keep growing.
     let c1 = try_eval_int_helper(&session, "ThreadTest.heartbeatCount", Some(5))
         .expect("should read heartbeatCount (c1)");
     for _ in 0..15 {
@@ -452,8 +481,8 @@ fn thread_breakpoint_keeps_other_threads_running() {
 
 // ─── Phase: new commands (suspend/resume/set/ignore/lock/threadlocks) ───
 
-/// 验证 6 个新命令的语法被真实 jdb 接受（尤其 `set <lvalue> = <expr>`）。
-/// 在 doWork 命中后，逐条执行并断言输出不含明显的 jdb 报错。
+/// Verify the 6 new command syntaxes are accepted by real jdb, especially `set <lvalue> = <expr>`.
+/// After doWork is hit, execute them one by one and assert output has no obvious jdb error.
 #[test]
 fn new_commands_accepted_by_jdb() {
     use java_agent_debugger::jdb::parser::CommandHint;
@@ -473,10 +502,13 @@ fn new_commands_accepted_by_jdb() {
 
     let exec = |cmd: &str| {
         session
-            .execute(cmd, CommandKind::normal(CommandHint::Other).with_timeout_secs(Some(5)))
+            .execute(
+                cmd,
+                CommandKind::normal(CommandHint::Other).with_timeout_secs(Some(5)),
+            )
             .unwrap_or_else(|e| panic!("`{cmd}` errored: {e}"))
     };
-    // jdb 对无法识别的命令会回 "Unrecognized command ..."；语法错回 "Usage: ..."。
+    // jdb returns "Unrecognized command ..." for unknown commands and "Usage: ..." for syntax errors.
     let assert_ok = |cmd: &str, resp: &CommandResponse| {
         if let CommandResult::Raw { text } = &resp.result {
             assert!(
@@ -489,7 +521,7 @@ fn new_commands_accepted_by_jdb() {
     for cmd in [
         format!("suspend {tid}"),
         format!("resume {tid}"),
-        "set x = 99".to_string(),       // doWork 的局部 int x
+        "set x = 99".to_string(), // local int x in doWork.
         "ignore java.lang.NullPointerException".to_string(),
         "threadlocks".to_string(),
     ] {
@@ -506,19 +538,22 @@ fn new_commands_accepted_by_jdb() {
 fn classes_returns_loaded_classes() {
     let session = launch_fixture("CollectionTest");
 
-    // 需要先 run 到断点让类加载完成
+    // First run to the breakpoint so the class is loaded.
     session
         .stop_at("CollectionTest", 10, None, None)
         .expect("stop_at failed");
     let run_resp = session.run(Some(30)).expect("run failed");
     assert!(matches!(&run_resp.result, CommandResult::Stopped { .. }));
 
-    // 执行 classes 命令（带 pattern 过滤）
+    // Execute classes command with pattern filtering.
     use java_agent_debugger::jdb::parser::CommandHint;
     use java_agent_debugger::session::CommandKind;
 
     let resp = session
-        .execute("classes CollectionTest", CommandKind::normal(CommandHint::Classes).with_timeout_secs(Some(10)))
+        .execute(
+            "classes CollectionTest",
+            CommandKind::normal(CommandHint::Classes).with_timeout_secs(Some(10)),
+        )
         .expect("classes failed");
 
     match &resp.result {
@@ -553,7 +588,10 @@ fn methods_returns_class_methods() {
     use java_agent_debugger::session::CommandKind;
 
     let resp = session
-        .execute("methods CollectionTest", CommandKind::normal(CommandHint::Methods).with_timeout_secs(Some(10)))
+        .execute(
+            "methods CollectionTest",
+            CommandKind::normal(CommandHint::Methods).with_timeout_secs(Some(10)),
+        )
         .expect("methods failed");
 
     match &resp.result {
@@ -562,7 +600,7 @@ fn methods_returns_class_methods() {
                 !methods.is_empty(),
                 "should find methods for CollectionTest"
             );
-            // CollectionTest 有 main 方法
+            // CollectionTest has a main method.
             assert!(
                 methods.iter().any(|m| m.contains("main")),
                 "should contain main method, got: {:?}",
@@ -584,9 +622,12 @@ fn watch_set_accepted() {
     use java_agent_debugger::jdb::parser::CommandHint;
     use java_agent_debugger::session::CommandKind;
 
-    // 设置字段监视点
+    // Set field watchpoint.
     let resp = session
-        .execute("watch WatchTest.name", CommandKind::normal(CommandHint::WatchSet).with_timeout_secs(Some(10)))
+        .execute(
+            "watch WatchTest.name",
+            CommandKind::normal(CommandHint::WatchSet).with_timeout_secs(Some(10)),
+        )
         .expect("watch failed");
 
     match &resp.result {
@@ -606,18 +647,23 @@ fn watch_field_modification_hit() {
     use java_agent_debugger::jdb::parser::CommandHint;
     use java_agent_debugger::session::CommandKind;
 
-    // 设置字段监视点
+    // Set field watchpoint.
     session
-        .execute("watch WatchTest.name", CommandKind::normal(CommandHint::WatchSet).with_timeout_secs(Some(10)))
+        .execute(
+            "watch WatchTest.name",
+            CommandKind::normal(CommandHint::WatchSet).with_timeout_secs(Some(10)),
+        )
         .expect("watch failed");
 
-    // 运行 — 应该在字段被修改时停下
+    // Run; should stop when the field is modified.
     let run_resp = session.run(Some(30)).expect("run failed");
 
     match &run_resp.result {
         CommandResult::Stopped { event, thread, .. } => {
             match event {
-                Event::FieldWatch { field, access_type, .. } => {
+                Event::FieldWatch {
+                    field, access_type, ..
+                } => {
                     assert!(
                         field.contains("name"),
                         "field should contain 'name', got: {field}"
@@ -625,13 +671,15 @@ fn watch_field_modification_hit() {
                     assert_eq!(access_type, "modified");
                 }
                 _ => {
-                    // 也可能先命中静态初始化访问，thread 应有值
+                    // It may also hit static initialization access first; thread should still be present.
                     assert!(!thread.is_empty(), "thread should not be empty");
                 }
             }
         }
         CommandResult::VmExited { .. } => {
-            panic!("VM exited without hitting watchpoint — jdb may not support watch on static fields in this JDK version");
+            panic!(
+                "VM exited without hitting watchpoint — jdb may not support watch on static fields in this JDK version"
+            );
         }
         other => panic!("expected Stopped with FieldWatch event, got {other:?}"),
     }
@@ -643,9 +691,12 @@ fn watch_field_modification_hit() {
 
 fn enrich_stopped_test_helper(session: &Session, resp: &mut CommandResponse) {
     let (location_line, frame_ref, source_ref) = match &mut resp.result {
-        CommandResult::Stopped { location, frame, source_context, .. } => {
-            (location.line, frame, source_context)
-        }
+        CommandResult::Stopped {
+            location,
+            frame,
+            source_context,
+            ..
+        } => (location.line, frame, source_context),
         _ => return,
     };
 
@@ -670,7 +721,11 @@ fn enrich_stopped_test_helper(session: &Session, resp: &mut CommandResponse) {
 
 fn check_line_mismatch_test_helper(session: &Session, resp: &mut CommandResponse) {
     let location = match &resp.result {
-        CommandResult::Stopped { event: Event::Breakpoint { .. }, location, .. } => location.clone(),
+        CommandResult::Stopped {
+            event: Event::Breakpoint { .. },
+            location,
+            ..
+        } => location.clone(),
         _ => return,
     };
 

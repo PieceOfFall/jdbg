@@ -1,28 +1,28 @@
-//! 定位 jdb 可执行文件。
+//! Locate the jdb executable.
 //!
-//! 发现顺序（§10）：
-//! 1. 用户显式指定 `--jdb-path`（调用方传入 `explicit`）
+//! Discovery order (§10):
+//! 1. User-provided `--jdb-path` (passed in as `explicit`)
 //! 2. `JAVA_HOME/bin/jdb(.exe)`
-//! 3. 系统 PATH（`which` / `where`）
-//! 4. 常见安装目录（`Program Files\Java\*`、`.jdks\*`、`/usr/lib/jvm/*` …）
+//! 3. System PATH (`which` / `where`)
+//! 4. Common install directories (`Program Files\Java\*`, `.jdks\*`, `/usr/lib/jvm/*`, ...)
 //!
-//! **JAVA_HOME 优先于 PATH**——本机 PATH 解析到 JDK 21，用户要 JDK 8。
+//! **JAVA_HOME takes priority over PATH**: on this machine PATH resolves to JDK 21, while the user wants JDK 8.
 
 use std::path::{Path, PathBuf};
 
 use crate::error::Error;
 
-/// jdb 可执行文件名（含 Windows .exe 后缀）。
+/// jdb executable name, including the Windows `.exe` suffix.
 #[cfg(windows)]
 const JDB_EXE: &str = "jdb.exe";
 #[cfg(not(windows))]
 const JDB_EXE: &str = "jdb";
 
-/// 按优先级定位 jdb。`explicit` 为用户通过 `--jdb-path` 提供的显式路径。
+/// Locate jdb by priority. `explicit` is the path supplied by the user through `--jdb-path`.
 pub fn find_jdb(explicit: Option<&Path>) -> crate::error::Result<PathBuf> {
     let mut searched: Vec<String> = Vec::new();
 
-    // 1. 显式路径
+    // 1. Explicit path.
     if let Some(p) = explicit {
         if p.is_file() {
             return Ok(p.to_path_buf());
@@ -40,13 +40,13 @@ pub fn find_jdb(explicit: Option<&Path>) -> crate::error::Result<PathBuf> {
         searched.push("JAVA_HOME: (not set)".into());
     }
 
-    // 3. PATH（使用 `which` crate 的逻辑手写，避免额外依赖）
+    // 3. PATH. This hand-rolls `which`-style logic to avoid another dependency.
     if let Some(found) = find_in_path() {
         return Ok(found);
     }
     searched.push("PATH: not found".into());
 
-    // 4. 常见安装目录
+    // 4. Common install directories.
     if let Some(found) = scan_common_dirs() {
         return Ok(found);
     }
@@ -55,13 +55,13 @@ pub fn find_jdb(explicit: Option<&Path>) -> crate::error::Result<PathBuf> {
     Err(Error::JdbNotFound { searched })
 }
 
-/// 检查 `home/bin/jdb(.exe)` 是否存在，存在则返回其路径。
+/// Return `home/bin/jdb(.exe)` if it exists.
 fn jdb_in_home(home: &Path) -> Option<PathBuf> {
     let candidate = home.join("bin").join(JDB_EXE);
     candidate.is_file().then_some(candidate)
 }
 
-/// 扫描各平台常见 JDK 安装目录下的每个 JDK home，查找 jdb。
+/// Scan common per-platform JDK parent directories for jdb.
 fn scan_common_dirs() -> Option<PathBuf> {
     for parent in common_jdk_parents() {
         let Ok(entries) = std::fs::read_dir(&parent) else {
@@ -69,8 +69,10 @@ fn scan_common_dirs() -> Option<PathBuf> {
         };
         for entry in entries.flatten() {
             let dir = entry.path();
-            // 直接布局 `<home>/bin` 与 macOS bundle 布局 `<home>/Contents/Home/bin`。
-            if let Some(found) = jdb_in_home(&dir).or_else(|| jdb_in_home(&dir.join("Contents").join("Home"))) {
+            // Direct `<home>/bin` layout and macOS bundle `<home>/Contents/Home/bin` layout.
+            if let Some(found) =
+                jdb_in_home(&dir).or_else(|| jdb_in_home(&dir.join("Contents").join("Home")))
+            {
                 return Some(found);
             }
         }
@@ -78,7 +80,7 @@ fn scan_common_dirs() -> Option<PathBuf> {
     None
 }
 
-/// 各平台存放多个 JDK home 的父目录列表。
+/// Parent directories that commonly contain multiple JDK homes on each platform.
 fn common_jdk_parents() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
@@ -98,7 +100,7 @@ fn common_jdk_parents() -> Vec<PathBuf> {
     dirs
 }
 
-/// 在 PATH 环境变量中查找 jdb。
+/// Find jdb in the PATH environment variable.
 fn find_in_path() -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     let sep = if cfg!(windows) { ';' } else { ':' };

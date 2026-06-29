@@ -1,10 +1,10 @@
-//! 输出 schema 类型——解析器的产出物、CLI/MCP 的渲染输入。
+//! Output schema types: parser outputs and CLI/MCP rendering inputs.
 
 use serde::{Deserialize, Serialize};
 
-// ─── 基础结构 ───────────────────────────────────────────────────────────────────
+// ─── Basic Structures ──────────────────────────────────────────────────────────
 
-/// 代码位置。
+/// A source/code location.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Location {
     pub class: String,
@@ -14,7 +14,7 @@ pub struct Location {
     pub line: u32,
 }
 
-/// 栈帧。
+/// A stack frame.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct StackFrame {
     pub index: u32,
@@ -23,14 +23,14 @@ pub struct StackFrame {
     pub is_native: bool,
 }
 
-/// 单个线程的调用栈（`where all` 按线程分组）。
+/// The call stack for one thread, grouped from `where all`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadStack {
     pub thread: String,
     pub frames: Vec<StackFrame>,
 }
 
-/// 局部变量 / 对象字段绑定。
+/// A local variable or object field binding.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VarBinding {
     pub name: String,
@@ -39,10 +39,10 @@ pub struct VarBinding {
     pub value: String,
 }
 
-/// 线程信息。
+/// Thread information.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ThreadInfo {
-    /// jdb 给出的十六进制 id（如 "0x1a3"）。
+    /// Hex thread id reported by jdb, such as "0x1a3".
     pub id: String,
     pub name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -50,39 +50,54 @@ pub struct ThreadInfo {
     pub state: String,
 }
 
-/// 源代码行。
+/// A source line.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceLine {
     pub number: u32,
     pub text: String,
 }
 
-// ─── 运行状态 & 事件 ────────────────────────────────────────────────────────────
+// ─── Run State & Events ────────────────────────────────────────────────────────
 
-/// Session 的运行状态机（§5）。
+/// Session run-state machine (§5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RunState {
-    /// launch 后、`run` 前。
+    /// After launch and before `run`.
     Loaded,
-    /// 停在断点 / step / exception。
+    /// Suspended at a breakpoint, step, or exception.
     Suspended,
-    /// 应用正在执行中（`cont`/`run` 后尚未停下）。
+    /// The application is running and has not stopped after `cont`/`run`.
     Running,
-    /// 应用正常退出。
+    /// The application exited normally.
     Exited,
-    /// jdb 子进程意外退出 / 管道断裂。
+    /// The jdb child process exited unexpectedly or the pipe broke.
     Dead,
 }
 
-/// reader 识别到的事件类型。
+/// Event types recognized by the reader.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Event {
-    Breakpoint { location: Location, thread: String },
-    Step { location: Location, thread: String },
-    Exception { exception: String, caught: bool, location: Option<Location>, thread: String },
-    FieldWatch { field: String, access_type: String, thread: String },
+    Breakpoint {
+        location: Location,
+        thread: String,
+    },
+    Step {
+        location: Location,
+        thread: String,
+    },
+    Exception {
+        exception: String,
+        caught: bool,
+        location: Option<Location>,
+        thread: String,
+    },
+    FieldWatch {
+        field: String,
+        access_type: String,
+        thread: String,
+    },
     VmExit,
 }
 
@@ -90,7 +105,7 @@ pub enum Event {
 
 // %%PLACEHOLDER_RESULT_CMDRESULT%%
 
-/// 命令执行结果（§8）。internally-tagged JSON。
+/// Command execution result (§8), serialized as internally tagged JSON.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum CommandResult {
@@ -127,8 +142,8 @@ pub enum CommandResult {
         event: Event,
         location: Location,
         thread: String,
-        /// 命中线程的 jdb id（如 "0x1a3" 或十进制 "18315"）——可直接传给 `thread` 工具切换。
-        /// 命中后由 enrichment 反查 `threads` 回填；查不到则为 None（附 WARNING note）。
+        /// jdb id of the hit thread, such as "0x1a3" or decimal "18315"; can be passed directly to `thread`.
+        /// Filled by enrichment through a reverse lookup in `threads`; None means lookup failed and a WARNING note was added.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         thread_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -141,7 +156,7 @@ pub enum CommandResult {
         caught: bool,
         location: Location,
         thread: String,
-        /// 命中线程的 jdb id（同 `Stopped.thread_id`）。
+        /// jdb id of the hit thread, same semantics as `Stopped.thread_id`.
         #[serde(skip_serializing_if = "Option::is_none", default)]
         thread_id: Option<String>,
     },
@@ -160,7 +175,7 @@ pub enum CommandResult {
     StackTrace {
         frames: Vec<StackFrame>,
     },
-    /// `where all` 的多线程栈，按线程分组。
+    /// Multi-thread stack trace from `where all`, grouped by thread.
     ThreadStackTrace {
         threads: Vec<ThreadStack>,
     },
@@ -184,7 +199,7 @@ pub enum CommandResult {
         around_line: u32,
         lines: Vec<SourceLine>,
     },
-    /// `inspect` 结果：集合/数组的 size + 前 N 个元素。
+    /// `inspect` result: collection/array size plus the first N elements.
     Inspection {
         expr: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -216,7 +231,7 @@ pub enum CommandResult {
     },
 }
 
-// ─── 辅助 enum ──────────────────────────────────────────────────────────────────
+// ─── Helper Enums ──────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -233,7 +248,7 @@ pub enum BreakpointKind {
     Catch,
 }
 
-/// session list 里每条信息。
+/// One entry in the session list.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SessionInfo {
     pub id: String,
@@ -248,9 +263,9 @@ pub struct SessionInfo {
     pub created_at: Option<String>,
 }
 
-// ─── 带 side bands 的完整响应 ────────────────────────────────────────────────────
+// ─── Full Response with Side Bands ─────────────────────────────────────────────
 
-/// 完整的命令响应，包含 side bands（stderr 输出、note 提示）。
+/// Full command response, including side bands such as stderr output and notes.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CommandResponse {
     #[serde(flatten)]

@@ -1,12 +1,12 @@
-//! 将 reader 返回的原始文本 block 分类解析为 `CommandResult`。
+//! Classify and parse raw text blocks returned by the reader into `CommandResult`.
 //!
-//! 这里是**正确性核心**——单元测试用真实 jdb transcript fixture 覆盖。
-//! 正则契约来源：CLAUDE.md §5。
+//! This is the **correctness core**. Unit tests cover it with real jdb transcript fixtures.
+//! Regex contracts come from CLAUDE.md §5.
 //!
-//! 解析策略：
-//! - `classify_output` 接收从 reader 拿到的文本 + 上下文命令类型，选择解析路径。
-//! - 各子解析器（parse_locals, parse_where, parse_threads 等）逐行匹配生成结构化数据。
-//! - 无法识别的文本兜底为 `CommandResult::Raw`。
+//! Parsing strategy:
+//! - `classify_output` receives reader text plus the contextual command type and selects a parse path.
+//! - Sub-parsers (`parse_locals`, `parse_where`, `parse_threads`, etc.) match line by line into structured data.
+//! - Unrecognized text falls back to `CommandResult::Raw`.
 
 use std::sync::LazyLock;
 
@@ -14,38 +14,35 @@ use regex::Regex;
 
 use crate::protocol::*;
 
-// ─── 正则（细粒度解析用，prompt/event 级已在 reader 中）─────────────────────────
+// ─── Regexes (fine-grained parsing; prompt/event parsing lives in reader) ──────
 
-/// `where` 输出中的栈帧行：`  [1] com.example.Main.method (Main.java:42)`
+/// Stack-frame line in `where` output: `  [1] com.example.Main.method (Main.java:42)`
 static RE_FRAME: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(
-        r"^\s*\[(?P<idx>\d+)\]\s+(?P<class>\S+)\.(?P<method>\S+)\s+\((?P<loc>[^)]+)\)",
-    )
-    .unwrap()
+    Regex::new(r"^\s*\[(?P<idx>\d+)\]\s+(?P<class>\S+)\.(?P<method>\S+)\s+\((?P<loc>[^)]+)\)")
+        .unwrap()
 });
 
-/// `locals` 输出中的变量行：`name = value`
-/// 实际格式示例：`args = instance of java.lang.String[0] (id=430)`
-/// 注意：jdb 不输出类型括号——它只有 `name = value`。
-static RE_LOCAL: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?P<name>\S+)\s+=\s+(?P<value>.+)$").unwrap()
-});
+/// Variable line in `locals` output: `name = value`
+/// Real example: `args = instance of java.lang.String[0] (id=430)`
+/// Note: jdb does not emit type parentheses; it only emits `name = value`.
+static RE_LOCAL: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^(?P<name>\S+)\s+=\s+(?P<value>.+)$").unwrap());
 
-/// `print/eval` 输出：` <expr> = value` 或 `<expr> = <type> value`
-static RE_PRINT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\s*(?P<expr>.+?)\s+=\s+(?P<value>.+)$").unwrap()
-});
+/// `print/eval` output: ` <expr> = value` or `<expr> = <type> value`
+static RE_PRINT: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*(?P<expr>.+?)\s+=\s+(?P<value>.+)$").unwrap());
 
-/// `threads` 输出中线程行的头部：`  (类名)ID rest…`
-/// 实际格式：`  (java.lang.Thread)0x1   main   running`——id 紧跟 `)`，无空格。
-/// 括号内是线程对象的**类名**（非 group）；group 来自独立的 `Group xxx:` 行。
-/// id 多为 `0x` 前缀的 hex，但某些 JDK 的 jdb（如外部 Tomcat attach）打成纯十进制（`18315`）；
-/// 两种都按原样捕获并原样回传给 `thread <id>`（hex 分支在前，避免 `0x…` 被十进制分支截断）。
+/// Prefix of a thread line in `threads` output: `  (className)ID rest...`
+/// Real format: `  (java.lang.Thread)0x1   main   running`; id immediately follows `)` with no space.
+/// The parentheses contain the thread object's **class name**, not the group; groups come from separate
+/// `Group xxx:` lines. IDs are usually `0x`-prefixed hex, but some JDK jdb builds (for example external
+/// Tomcat attach) print plain decimal (`18315`). Capture both verbatim and pass them back to `thread <id>`;
+/// the hex branch comes first so `0x...` is not truncated by the decimal branch.
 static RE_THREAD_LINE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^\s*\((?P<class>[^)]+)\)(?P<id>0x[0-9a-fA-F]+|\d+)\s+(?P<rest>.+?)\s*$").unwrap()
 });
 
-/// 从线程行 rest 尾部分离出状态（状态可能含空格，如 `cond. waiting`、`running (at breakpoint)`）。
+/// Split state from the tail of a thread-line rest; state may contain spaces such as `cond. waiting`.
 static RE_THREAD_STATE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
         r"\s+(?P<state>(?:cond\. waiting|running|sleeping|waiting|zombie|unknown|not started|monitor).*)$",
@@ -53,21 +50,20 @@ static RE_THREAD_STATE: LazyLock<Regex> = LazyLock::new(|| {
     .unwrap()
 });
 
-/// `Group <name>:` 分组头行。
-static RE_THREAD_GROUP: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^\s*Group\s+(?P<group>\S+):").unwrap()
-});
+/// `Group <name>:` group header line.
+static RE_THREAD_GROUP: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^\s*Group\s+(?P<group>\S+):").unwrap());
 
-/// `list` 命令输出中的源代码行：`42    int x = 1;` 或 `42 =>  int x = 1;`
-/// en_US locale 下行号可能带千位逗号：`3,956    int x = 1;`
-/// `=>` 标记当前执行行。捕获 marker 以便定位 around_line。
+/// Source line in `list` output: `42    int x = 1;` or `42 =>  int x = 1;`
+/// In en_US locale, line numbers may contain thousands separators: `3,956    int x = 1;`
+/// `=>` marks the current execution line. Capture the marker to identify around_line.
 static RE_SOURCE_LINE: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(r"^(?P<num>[\d,]+)\s+(?P<marker>=>)?\s*(?P<text>.*?)\s*$").unwrap()
 });
 
-// ─── 命令上下文提示 ──────────────────────────────────────────────────────────────
+// ─── Command Context Hints ─────────────────────────────────────────────────────
 
-/// 告诉 parser 当前 block 是对哪条命令的响应，以选择解析路径。
+/// Tells the parser which command produced the current block so it can choose a parse path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandHint {
     Where,
@@ -91,11 +87,11 @@ pub enum CommandHint {
     Other,
 }
 
-// ─── 公开 API ────────────────────────────────────────────────────────────────────
+// ─── Public API ────────────────────────────────────────────────────────────────
 
-/// 将原始输出文本 + 命令 hint 解析为 `CommandResult`。
+/// Parse raw output text plus a command hint into `CommandResult`.
 ///
-/// 返回 `(result, note)`——`note` 是可能的附加提示（如"请用 -g 编译"）。
+/// Returns `(result, note)`, where `note` is an optional extra hint such as "compile with -g".
 pub fn classify_output(output: &str, hint: CommandHint) -> (CommandResult, Option<String>) {
     let note = if output.contains("Local variable information not available") {
         Some("Compile with `javac -g` to include local variable debug info.".into())
@@ -116,19 +112,21 @@ pub fn classify_output(output: &str, hint: CommandHint) -> (CommandResult, Optio
         CommandHint::Classes => parse_classes(output),
         CommandHint::Methods => parse_methods(output),
         CommandHint::WatchSet => parse_watch_set(output),
-        _ => CommandResult::Raw { text: output.to_string() },
+        _ => CommandResult::Raw {
+            text: output.to_string(),
+        },
     };
     (result, note)
 }
 
-// ─── 子解析器 ────────────────────────────────────────────────────────────────────
+// ─── Sub-parsers ───────────────────────────────────────────────────────────────
 
-/// 解析单条 `where` 栈帧行；非帧行返回 None。
+/// Parse a single `where` stack-frame line; non-frame lines return None.
 fn parse_frame_line(line: &str) -> Option<StackFrame> {
     let c = RE_FRAME.captures(line)?;
     let index = c["idx"].parse().unwrap_or(0);
     let method = c["method"].to_string();
-    // loc 格式: "File.java:42" 或 "native method" 或 "Unknown Source"
+    // loc format: "File.java:42", "native method", or "Unknown Source".
     let (file, line_num, is_native) = parse_location_parens(&c["loc"]);
     Some(StackFrame {
         index,
@@ -142,43 +140,54 @@ fn parse_frame_line(line: &str) -> Option<StackFrame> {
     })
 }
 
-/// 解析单线程 `where` 输出为 `StackTrace`。
+/// Parse single-thread `where` output into `StackTrace`.
 pub fn parse_where(output: &str) -> CommandResult {
     let frames: Vec<StackFrame> = output.lines().filter_map(parse_frame_line).collect();
     if frames.is_empty() {
-        CommandResult::Raw { text: output.to_string() }
+        CommandResult::Raw {
+            text: output.to_string(),
+        }
     } else {
         CommandResult::StackTrace { frames }
     }
 }
 
-/// 解析 `where all` 多线程输出为 `ThreadStackTrace`。
+/// Parse multi-thread `where all` output into `ThreadStackTrace`.
 ///
-/// 输出形如：每个线程一个 header 行（`main:`、`Reference Handler:`），其后为缩进的帧行；
-/// 无帧的线程只有 header。线程名可能含空格，故用"以冒号结尾的非帧行"作为分组边界。
+/// Output has one header line per thread (`main:`, `Reference Handler:`), followed by indented frame lines.
+/// Threads without frames have only the header. Thread names may contain spaces, so a non-frame line ending
+/// in a colon is used as the group boundary.
 pub fn parse_where_all(output: &str) -> CommandResult {
     let mut threads: Vec<ThreadStack> = Vec::new();
     for line in output.lines() {
         if let Some(frame) = parse_frame_line(line) {
             match threads.last_mut() {
                 Some(t) => t.frames.push(frame),
-                // 帧出现在任何 header 之前——归入一个匿名线程兜底。
-                None => threads.push(ThreadStack { thread: String::new(), frames: vec![frame] }),
+                // A frame appeared before any header; put it in an anonymous fallback thread.
+                None => threads.push(ThreadStack {
+                    thread: String::new(),
+                    frames: vec![frame],
+                }),
             }
         } else if let Some(name) = line.trim().strip_suffix(':')
             && !name.is_empty()
         {
-            threads.push(ThreadStack { thread: name.to_string(), frames: Vec::new() });
+            threads.push(ThreadStack {
+                thread: name.to_string(),
+                frames: Vec::new(),
+            });
         }
     }
     if threads.is_empty() {
-        CommandResult::Raw { text: output.to_string() }
+        CommandResult::Raw {
+            text: output.to_string(),
+        }
     } else {
         CommandResult::ThreadStackTrace { threads }
     }
 }
 
-/// 解析 `locals` 输出为 `Locals`。
+/// Parse `locals` output into `Locals`.
 pub fn parse_locals(output: &str) -> CommandResult {
     let mut vars = Vec::new();
     for line in output.lines() {
@@ -191,15 +200,17 @@ pub fn parse_locals(output: &str) -> CommandResult {
         }
     }
     if vars.is_empty() {
-        CommandResult::Raw { text: output.to_string() }
+        CommandResult::Raw {
+            text: output.to_string(),
+        }
     } else {
         CommandResult::Locals { vars }
     }
 }
 
-/// 解析 `print` / `eval` 输出为 `Value`。
+/// Parse `print` / `eval` output into `Value`.
 pub fn parse_print(output: &str) -> CommandResult {
-    // 第一行有意义内容通常是 ` expr = value`。
+    // The first meaningful line is usually ` expr = value`.
     for line in output.lines() {
         let line = line.trim();
         if line.is_empty() {
@@ -213,24 +224,30 @@ pub fn parse_print(output: &str) -> CommandResult {
             };
         }
     }
-    CommandResult::Raw { text: output.to_string() }
+    CommandResult::Raw {
+        text: output.to_string(),
+    }
 }
 
-/// 解析 `dump` 输出为 `ObjectDump`（字段列表）。
+/// Parse `dump` output into `ObjectDump` field list.
 pub fn parse_dump(output: &str) -> CommandResult {
-    // dump 输出第一行通常是 `expr = { ... }` 或多行字段。
-    // 尝试提取表达式名和字段。
+    // The first dump line is usually `expr = { ... }` or a multi-line field listing.
+    // Try to extract the expression name and fields.
     let lines: Vec<&str> = output.lines().collect();
     if lines.is_empty() {
-        return CommandResult::Raw { text: output.to_string() };
+        return CommandResult::Raw {
+            text: output.to_string(),
+        };
     }
 
-    // 第一行: `expr = {` 或 `expr = value`
+    // First line: `expr = {` or `expr = value`.
     let first = lines[0].trim();
     let expr = if let Some(pos) = first.find('=') {
         first[..pos].trim().to_string()
     } else {
-        return CommandResult::Raw { text: output.to_string() };
+        return CommandResult::Raw {
+            text: output.to_string(),
+        };
     };
 
     let mut fields = Vec::new();
@@ -239,11 +256,11 @@ pub fn parse_dump(output: &str) -> CommandResult {
         if line == "}" || line.is_empty() {
             continue;
         }
-        // 字段格式: `fieldName: value` 或 `fieldName (type): value`
+        // Field format: `fieldName: value` or `fieldName (type): value`.
         if let Some(pos) = line.find(':') {
             let name_part = line[..pos].trim();
             let value = line[pos + 1..].trim().to_string();
-            // name_part 可能带 (type)
+            // name_part may include (type).
             let (name, ty) = if let Some(paren) = name_part.find('(') {
                 let n = name_part[..paren].trim().to_string();
                 let t = name_part[paren + 1..].trim_end_matches(')').to_string();
@@ -256,17 +273,18 @@ pub fn parse_dump(output: &str) -> CommandResult {
     }
 
     if fields.is_empty() {
-        // 可能是单行 dump，回退 Value 解析
+        // May be a single-line dump; fall back to Value parsing.
         parse_print(output)
     } else {
         CommandResult::ObjectDump { expr, fields }
     }
 }
 
-/// 解析 `threads` 输出为 `Threads`。
+/// Parse `threads` output into `Threads`.
 ///
-/// 跟踪 `Group xxx:` 行确定当前分组；线程行的 class+id 用 `RE_THREAD_LINE` 提取，
-/// state 用 `RE_THREAD_STATE` 从 rest 尾部分离（state 可能含空格），剩余为 name。
+/// Track `Group xxx:` lines to determine the current group. Extract class+id from thread lines with
+/// `RE_THREAD_LINE`, split state from the tail of rest with `RE_THREAD_STATE` (state may contain spaces),
+/// and treat the remainder as the name.
 pub fn parse_threads(output: &str) -> CommandResult {
     let mut threads = Vec::new();
     let mut current_group: Option<String> = None;
@@ -279,7 +297,7 @@ pub fn parse_threads(output: &str) -> CommandResult {
         if let Some(c) = RE_THREAD_LINE.captures(line) {
             let id = c["id"].to_string();
             let rest = &c["rest"];
-            // 从 rest 尾部分离 state；分不出则整个 rest 当 name、state 留空。
+            // Split state from the tail of rest; if it cannot be split, use all rest as name and leave state empty.
             let (name, state) = match RE_THREAD_STATE.find(rest) {
                 Some(m) => (
                     rest[..m.start()].trim().to_string(),
@@ -297,13 +315,15 @@ pub fn parse_threads(output: &str) -> CommandResult {
     }
 
     if threads.is_empty() {
-        CommandResult::Raw { text: output.to_string() }
+        CommandResult::Raw {
+            text: output.to_string(),
+        }
     } else {
         CommandResult::Threads { threads }
     }
 }
 
-/// 解析 `list` 命令输出为 `Source`。
+/// Parse `list` command output into `Source`.
 pub fn parse_source(output: &str) -> CommandResult {
     let mut lines = Vec::new();
     let mut marker_line: Option<u32> = None;
@@ -320,14 +340,16 @@ pub fn parse_source(output: &str) -> CommandResult {
         }
     }
     if lines.is_empty() {
-        return CommandResult::Raw { text: output.to_string() };
+        return CommandResult::Raw {
+            text: output.to_string(),
+        };
     }
-    // around_line: 优先用 `=>` 标记行，否则取中间行。
+    // around_line: prefer the `=>` marked line, otherwise use the middle line.
     let around_line = marker_line.unwrap_or_else(|| lines[lines.len() / 2].number);
     CommandResult::Source { around_line, lines }
 }
 
-/// 解析 `clear`(无参) / `stop`(无参) 输出为断点列表。
+/// Parse `clear` with no args / `stop` with no args into a breakpoint list.
 pub fn parse_breakpoint_list(output: &str) -> CommandResult {
     let breakpoints: Vec<String> = output
         .lines()
@@ -337,10 +359,10 @@ pub fn parse_breakpoint_list(output: &str) -> CommandResult {
     CommandResult::BreakpointList { breakpoints }
 }
 
-/// 解析 `stop at`/`stop in`/`catch` 的设置确认。
+/// Parse setup confirmation from `stop at`/`stop in`/`catch`.
 pub fn parse_breakpoint_set(output: &str) -> CommandResult {
     let text = output.trim();
-    // 成功时 jdb 会输出如 "Set breakpoint com.example.Main:42" 或 "Deferring breakpoint ..."
+    // On success, jdb emits lines like "Set breakpoint com.example.Main:42" or "Deferring breakpoint ...".
     let deferred = text.contains("Deferring") || text.contains("deferred");
     let bp_kind = if text.contains("catch") || text.contains("Exception") {
         BreakpointKind::Catch
@@ -356,9 +378,9 @@ pub fn parse_breakpoint_set(output: &str) -> CommandResult {
     }
 }
 
-// ─── classes / methods / watch 解析器 ──────────────────────────────────────────
+// ─── classes / methods / watch parsers ────────────────────────────────────────
 
-/// 解析 `classes [pattern]` 输出——每行一个全限定类名。
+/// Parse `classes [pattern]` output, one fully qualified class name per line.
 pub fn parse_classes(output: &str) -> CommandResult {
     let classes: Vec<String> = output
         .lines()
@@ -369,7 +391,7 @@ pub fn parse_classes(output: &str) -> CommandResult {
     CommandResult::Classes { classes }
 }
 
-/// 解析 `methods <class>` 输出——每行一个方法签名。
+/// Parse `methods <class>` output, one method signature per line.
 pub fn parse_methods(output: &str) -> CommandResult {
     let methods: Vec<String> = output
         .lines()
@@ -377,10 +399,13 @@ pub fn parse_methods(output: &str) -> CommandResult {
         .filter(|l| !l.is_empty() && !l.starts_with("**"))
         .map(|l| l.to_string())
         .collect();
-    CommandResult::Methods { class: String::new(), methods }
+    CommandResult::Methods {
+        class: String::new(),
+        methods,
+    }
 }
 
-/// 解析 `watch` 设置确认。
+/// Parse `watch` setup confirmation.
 pub fn parse_watch_set(output: &str) -> CommandResult {
     let text = output.trim();
     let deferred = text.contains("Deferring") || text.contains("deferred");
@@ -391,13 +416,17 @@ pub fn parse_watch_set(output: &str) -> CommandResult {
     } else {
         "modification".to_string()
     };
-    CommandResult::WatchSet { spec: text.to_string(), mode, deferred }
+    CommandResult::WatchSet {
+        spec: text.to_string(),
+        mode,
+        deferred,
+    }
 }
 
-// ─── 工具函数 ────────────────────────────────────────────────────────────────────
+// ─── Utility Functions ────────────────────────────────────────────────────────
 
-/// 解析栈帧括号内容 `(File.java:42)` → (file, line, is_native)。
-/// 注意：en_US locale 下 jdb 对 ≥1000 的行号可能输出千位逗号（如 `File.java:3,956`）。
+/// Parse stack-frame parentheses `(File.java:42)` into (file, line, is_native).
+/// Note: in en_US locale, jdb may print thousands separators for line numbers >=1000, e.g. `File.java:3,956`.
 fn parse_location_parens(loc: &str) -> (Option<String>, u32, bool) {
     if loc.contains("native method") || loc.contains("Native Method") {
         return (None, 0, true);
@@ -405,7 +434,7 @@ fn parse_location_parens(loc: &str) -> (Option<String>, u32, bool) {
     if loc.contains("Unknown Source") {
         return (None, 0, false);
     }
-    // 格式: "File.java:42" 或 "File.java:3,956" 或 "bci=N"
+    // Format: "File.java:42", "File.java:3,956", or "bci=N".
     if let Some(colon) = loc.rfind(':') {
         let file = &loc[..colon];
         let line = loc[colon + 1..].replace(',', "").parse().unwrap_or(0);
@@ -417,11 +446,11 @@ fn parse_location_parens(loc: &str) -> (Option<String>, u32, bool) {
 
 #[cfg(test)]
 mod tests {
-    //! Parser TDD 测试——用真实 jdb transcript fixture 验证解析器正确性。
+    //! Parser TDD tests: verify parser correctness with real jdb transcript fixtures.
     use super::*;
     use crate::protocol::{BreakpointKind, CommandResult};
 
-    // ─── fixture 文本（从 tests/fixtures/jdb/ 真实捕获，locale-forced）────────────
+    // ─── Fixture Text (real captures from tests/fixtures/jdb/, locale-forced) ─
 
     const LOCALS_SPARSE: &str = "\
 Method arguments:
@@ -460,7 +489,7 @@ Group system:
 Group main:
   (java.lang.Thread)0x1                           main              running (at breakpoint)";
 
-    // 某些 JDK 的 jdb 把线程 id 打成十进制（无 0x 前缀），如 OpenJDK/Azul 在外部 Tomcat attach 场景。
+    // Some JDK jdb builds print thread ids as decimal without a 0x prefix, e.g. OpenJDK/Azul in external Tomcat attach.
     const THREADS_DECIMAL: &str = "\
 Group system:
   (java.lang.Thread)18247                          Signal Dispatcher running
@@ -493,7 +522,7 @@ It will be set after the class is loaded.";
         let CommandResult::Locals { vars } = result else {
             panic!("expected Locals, got {result:?}");
         };
-        // args(方法参数) + count + label + sum
+        // args (method parameter) + count + label + sum.
         assert_eq!(vars.len(), 4, "vars: {vars:?}");
         assert_eq!(vars[0].name, "args");
         assert_eq!(vars[1].name, "count");
@@ -538,17 +567,17 @@ It will be set after the class is loaded.";
         };
         assert_eq!(threads.len(), 3, "threads: {threads:?}");
 
-        // 含 native 帧的线程
+        // Thread with a native frame.
         assert_eq!(threads[0].thread, "Reference Handler");
         assert_eq!(threads[0].frames.len(), 2);
         assert!(threads[0].frames[0].is_native);
         assert_eq!(threads[0].frames[1].location.line, 191);
 
-        // 无帧线程仍保留
+        // Threads without frames are still kept.
         assert_eq!(threads[1].thread, "Signal Dispatcher");
         assert!(threads[1].frames.is_empty());
 
-        // 主线程（线程名为 "main"，注意不要与帧行混淆）
+        // Main thread; the thread name is "main", and must not be confused with frame lines.
         assert_eq!(threads[2].thread, "main");
         assert_eq!(threads[2].frames.len(), 2);
         assert_eq!(threads[2].frames[0].location.method, "foo");
@@ -627,7 +656,7 @@ It will be set after the class is loaded.";
         let CommandResult::Source { around_line, lines } = result else {
             panic!("expected Source, got {result:?}");
         };
-        // `=>` 标记的当前执行行是 9
+        // The `=>` marker indicates that the current execution line is 9.
         assert_eq!(around_line, 9);
         assert_eq!(lines.len(), 7);
         assert_eq!(lines[0].number, 5);
@@ -639,7 +668,10 @@ It will be set after the class is loaded.";
     #[test]
     fn breakpoint_set_method_deferred() {
         let result = parse_breakpoint_set(BP_SET_METHOD);
-        let CommandResult::BreakpointSet { bp_kind, deferred, .. } = result else {
+        let CommandResult::BreakpointSet {
+            bp_kind, deferred, ..
+        } = result
+        else {
             panic!("expected BreakpointSet, got {result:?}");
         };
         assert_eq!(bp_kind, BreakpointKind::Method);
@@ -649,14 +681,17 @@ It will be set after the class is loaded.";
     #[test]
     fn breakpoint_set_line_deferred() {
         let result = parse_breakpoint_set(BP_SET_LINE);
-        let CommandResult::BreakpointSet { bp_kind, deferred, .. } = result else {
+        let CommandResult::BreakpointSet {
+            bp_kind, deferred, ..
+        } = result
+        else {
             panic!("expected BreakpointSet, got {result:?}");
         };
         assert_eq!(bp_kind, BreakpointKind::Line);
         assert!(deferred);
     }
 
-    // ─── classes / methods / watch 测试 ──────────────────────────────────────
+    // ─── classes / methods / watch tests ─────────────────────────────────────
 
     const CLASSES_OUTPUT: &str = "\
 ** classes list **
@@ -692,7 +727,10 @@ It will be set after the class is loaded.";
         };
         assert_eq!(classes.len(), 5);
         assert_eq!(classes[0], "java.lang.Object");
-        assert_eq!(classes[3], "com.example.Service$$EnhancerBySpringCGLIB$$abc123");
+        assert_eq!(
+            classes[3],
+            "com.example.Service$$EnhancerBySpringCGLIB$$abc123"
+        );
     }
 
     #[test]

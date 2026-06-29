@@ -1,8 +1,8 @@
-//! Wire / output 类型——解析器的产出物、CLI 的渲染输入、IPC 协议。
+//! Wire and output types: parser outputs, CLI rendering inputs, and the IPC protocol.
 //!
-//! 拆分为两个子模块：
-//! - [`result`]：输出 schema（CommandResult 及其组成类型）——解析器产出、渲染输入。
-//! - [`wire`]：IPC wire 类型（Request/Response/Command）——CLI↔Daemon 协议。
+//! Split into two submodules:
+//! - [`result`]: output schema (`CommandResult` and related types), used as parser output and rendering input.
+//! - [`wire`]: IPC wire types (`Request`/`Response`/`Command`) for the CLI↔Daemon protocol.
 
 pub mod result;
 pub mod wire;

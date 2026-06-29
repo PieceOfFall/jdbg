@@ -1,8 +1,8 @@
-//! 输出渲染：把 `CommandResponse` 渲染为人类可读文本（默认）或 JSON（`--json`）。
+//! Output rendering: render `CommandResponse` as human-readable text by default, or JSON for `--json`.
 
 use crate::protocol::*;
 
-/// 渲染完整响应。
+/// Render a full response.
 pub fn render(resp: &CommandResponse, json: bool) -> String {
     if json {
         return serde_json::to_string_pretty(resp).unwrap_or_else(|_| format!("{resp:?}"));
@@ -14,17 +14,25 @@ pub fn render(resp: &CommandResponse, json: bool) -> String {
     out
 }
 
-/// 渲染 CommandResult 为人类可读文本。
+/// Render CommandResult as human-readable text.
 fn render_result(result: &CommandResult) -> String {
     match result {
-        CommandResult::SessionCreated { session, mode, target, state } => {
+        CommandResult::SessionCreated {
+            session,
+            mode,
+            target,
+            state,
+        } => {
             format!("Session {session} created ({mode:?} {target}), state: {state:?}")
         }
         CommandResult::SessionList { sessions } => {
             if sessions.is_empty() {
                 return "No active sessions.".into();
             }
-            let mut lines = vec![format!("{:<10} {:<8} {:<20} {:<10} {}", "ID", "MODE", "TARGET", "STATE", "PID")];
+            let mut lines = vec![format!(
+                "{:<10} {:<8} {:<20} {:<10} {}",
+                "ID", "MODE", "TARGET", "STATE", "PID"
+            )];
             for s in sessions {
                 lines.push(format!(
                     "{:<10} {:<8} {:<20} {:<10} {}",
@@ -37,13 +45,23 @@ fn render_result(result: &CommandResult) -> String {
             }
             lines.join("\n")
         }
-        CommandResult::Status { session, state, last_event, jdb_alive } => {
-            let evt = last_event.as_ref()
+        CommandResult::Status {
+            session,
+            state,
+            last_event,
+            jdb_alive,
+        } => {
+            let evt = last_event
+                .as_ref()
                 .map(|e| format!("{e:?}"))
                 .unwrap_or_else(|| "none".into());
             format!("Session {session}: state={state:?} jdb_alive={jdb_alive} last_event={evt}")
         }
-        CommandResult::BreakpointSet { spec, bp_kind, deferred } => {
+        CommandResult::BreakpointSet {
+            spec,
+            bp_kind,
+            deferred,
+        } => {
             let d = if *deferred { " (deferred)" } else { "" };
             format!("Breakpoint set ({bp_kind:?}){d}: {spec}")
         }
@@ -54,13 +72,32 @@ fn render_result(result: &CommandResult) -> String {
                 breakpoints.join("\n")
             }
         }
-        CommandResult::Stopped { event, location, thread, thread_id, source_context, .. } => {
-            let id_suffix = thread_id.as_deref().map(|i| format!(" (id={i})")).unwrap_or_default();
+        CommandResult::Stopped {
+            event,
+            location,
+            thread,
+            thread_id,
+            source_context,
+            ..
+        } => {
+            let id_suffix = thread_id
+                .as_deref()
+                .map(|i| format!(" (id={i})"))
+                .unwrap_or_default();
             let kind = match event {
                 Event::Breakpoint { .. } => "Breakpoint hit",
                 Event::Step { .. } => "Step completed",
-                Event::FieldWatch { field, access_type, .. } => {
-                    return format_field_watch_stopped(field, access_type, thread, &id_suffix, location, source_context);
+                Event::FieldWatch {
+                    field, access_type, ..
+                } => {
+                    return format_field_watch_stopped(
+                        field,
+                        access_type,
+                        thread,
+                        &id_suffix,
+                        location,
+                        source_context,
+                    );
                 }
                 _ => "Stopped",
             };
@@ -70,40 +107,59 @@ fn render_result(result: &CommandResult) -> String {
             );
             if let Some(lines) = source_context {
                 for l in lines {
-                    let marker = if l.number == location.line { "=>" } else { "  " };
+                    let marker = if l.number == location.line {
+                        "=>"
+                    } else {
+                        "  "
+                    };
                     out.push_str(&format!("\n{marker} {:>4}  {}", l.number, l.text));
                 }
             }
             out
         }
-        CommandResult::ExceptionCaught { exception, caught, location, thread, thread_id } => {
+        CommandResult::ExceptionCaught {
+            exception,
+            caught,
+            location,
+            thread,
+            thread_id,
+        } => {
             let mode = if *caught { "caught" } else { "uncaught" };
-            let id_suffix = thread_id.as_deref().map(|i| format!(" (id={i})")).unwrap_or_default();
+            let id_suffix = thread_id
+                .as_deref()
+                .map(|i| format!(" (id={i})"))
+                .unwrap_or_default();
             format!(
                 "Exception ({mode}): {exception} at {}.{}() line={} thread={thread}{id_suffix}",
                 location.class, location.method, location.line
             )
         }
-        CommandResult::VmExited { exit_code, .. } => {
-            match exit_code {
-                Some(code) => format!("The application exited with code {code}"),
-                None => "The application exited".into(),
-            }
-        }
-        CommandResult::Timeout { partial_output, state } => {
+        CommandResult::VmExited { exit_code, .. } => match exit_code {
+            Some(code) => format!("The application exited with code {code}"),
+            None => "The application exited".into(),
+        },
+        CommandResult::Timeout {
+            partial_output,
+            state,
+        } => {
             format!("TIMEOUT (state={state:?}). Partial output:\n{partial_output}")
         }
-        CommandResult::StackTrace { frames } => {
-            frames.iter().map(|f| {
+        CommandResult::StackTrace { frames } => frames
+            .iter()
+            .map(|f| {
                 let loc = &f.location;
                 let file = loc.file.as_deref().unwrap_or("?");
                 if f.is_native {
                     format!("  [{}] {}.{} (native)", f.index, loc.class, loc.method)
                 } else {
-                    format!("  [{}] {}.{} ({file}:{})", f.index, loc.class, loc.method, loc.line)
+                    format!(
+                        "  [{}] {}.{} ({file}:{})",
+                        f.index, loc.class, loc.method, loc.line
+                    )
                 }
-            }).collect::<Vec<_>>().join("\n")
-        }
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
         CommandResult::ThreadStackTrace { threads } => {
             let mut lines = Vec::new();
             for ts in threads {
@@ -115,9 +171,15 @@ fn render_result(result: &CommandResult) -> String {
                     let loc = &f.location;
                     let file = loc.file.as_deref().unwrap_or("?");
                     if f.is_native {
-                        lines.push(format!("  [{}] {}.{} (native)", f.index, loc.class, loc.method));
+                        lines.push(format!(
+                            "  [{}] {}.{} (native)",
+                            f.index, loc.class, loc.method
+                        ));
                     } else {
-                        lines.push(format!("  [{}] {}.{} ({file}:{})", f.index, loc.class, loc.method, loc.line));
+                        lines.push(format!(
+                            "  [{}] {}.{} ({file}:{})",
+                            f.index, loc.class, loc.method, loc.line
+                        ));
                     }
                 }
             }
@@ -127,19 +189,18 @@ fn render_result(result: &CommandResult) -> String {
             if vars.is_empty() {
                 return "No local variables.".into();
             }
-            vars.iter().map(|v| {
-                match &v.ty {
+            vars.iter()
+                .map(|v| match &v.ty {
                     Some(t) => format!("  {} ({t}) = {}", v.name, v.value),
                     None => format!("  {} = {}", v.name, v.value),
-                }
-            }).collect::<Vec<_>>().join("\n")
+                })
+                .collect::<Vec<_>>()
+                .join("\n")
         }
-        CommandResult::Value { expr, value, ty } => {
-            match ty {
-                Some(t) => format!("{expr} ({t}) = {value}"),
-                None => format!("{expr} = {value}"),
-            }
-        }
+        CommandResult::Value { expr, value, ty } => match ty {
+            Some(t) => format!("{expr} ({t}) = {value}"),
+            None => format!("{expr} = {value}"),
+        },
         CommandResult::ObjectDump { expr, fields } => {
             let mut out = format!("{expr} = {{\n");
             for f in fields {
@@ -157,18 +218,27 @@ fn render_result(result: &CommandResult) -> String {
                     lines.push(format!("Group {group}:"));
                     last_group = Some(group);
                 }
-                // 命中线程（state 含 "at breakpoint"）用 `*` 前缀标出，方便一眼定位。
-                let marker = if t.state.contains("at breakpoint") { "*" } else { " " };
+                // Mark hit threads (state contains "at breakpoint") with `*` so they are easy to spot.
+                let marker = if t.state.contains("at breakpoint") {
+                    "*"
+                } else {
+                    " "
+                };
                 lines.push(format!("{marker} {} {:<24} {}", t.id, t.name, t.state));
             }
             lines.join("\n")
         }
-        CommandResult::Source { lines, .. } => {
-            lines.iter().map(|l| {
-                format!("{:>4}  {}", l.number, l.text)
-            }).collect::<Vec<_>>().join("\n")
-        }
-        CommandResult::Inspection { expr, size, elements, truncated } => {
+        CommandResult::Source { lines, .. } => lines
+            .iter()
+            .map(|l| format!("{:>4}  {}", l.number, l.text))
+            .collect::<Vec<_>>()
+            .join("\n"),
+        CommandResult::Inspection {
+            expr,
+            size,
+            elements,
+            truncated,
+        } => {
             let sz = size.map(|s| format!(" (size={s})")).unwrap_or_default();
             let mut out = format!("{expr}{sz}:");
             if elements.is_empty() {
@@ -194,10 +264,19 @@ fn render_result(result: &CommandResult) -> String {
             if methods.is_empty() {
                 format!("No methods found for {class}.")
             } else {
-                format!("{} ({} methods):\n{}", class, methods.len(), methods.join("\n"))
+                format!(
+                    "{} ({} methods):\n{}",
+                    class,
+                    methods.len(),
+                    methods.join("\n")
+                )
             }
         }
-        CommandResult::WatchSet { spec, mode, deferred } => {
+        CommandResult::WatchSet {
+            spec,
+            mode,
+            deferred,
+        } => {
             let d = if *deferred { " (deferred)" } else { "" };
             format!("Watch set ({mode}){d}: {spec}")
         }
@@ -213,9 +292,8 @@ fn format_field_watch_stopped(
     location: &Location,
     source_context: &Option<Vec<SourceLine>>,
 ) -> String {
-    let mut out = format!(
-        "Field watchpoint hit ({access_type}): {field} thread={thread}{id_suffix}"
-    );
+    let mut out =
+        format!("Field watchpoint hit ({access_type}): {field} thread={thread}{id_suffix}");
     if location.line > 0 {
         out.push_str(&format!(
             "\n  at {}.{}() line={}",
@@ -224,7 +302,11 @@ fn format_field_watch_stopped(
     }
     if let Some(lines) = source_context {
         for l in lines {
-            let marker = if l.number == location.line { "=>" } else { "  " };
+            let marker = if l.number == location.line {
+                "=>"
+            } else {
+                "  "
+            };
             out.push_str(&format!("\n{marker} {:>4}  {}", l.number, l.text));
         }
     }
@@ -240,17 +322,36 @@ mod tests {
         let resp = CommandResponse {
             result: CommandResult::Stopped {
                 event: Event::Breakpoint {
-                    location: Location { class: "Main".into(), method: "main".into(), file: None, line: 10 },
+                    location: Location {
+                        class: "Main".into(),
+                        method: "main".into(),
+                        file: None,
+                        line: 10,
+                    },
                     thread: "main".into(),
                 },
-                location: Location { class: "Main".into(), method: "main".into(), file: None, line: 10 },
+                location: Location {
+                    class: "Main".into(),
+                    method: "main".into(),
+                    file: None,
+                    line: 10,
+                },
                 thread: "main".into(),
                 thread_id: Some("0x1".into()),
                 frame: None,
                 source_context: Some(vec![
-                    SourceLine { number: 9, text: "int x = 1;".into() },
-                    SourceLine { number: 10, text: "int y = 2;".into() },
-                    SourceLine { number: 11, text: "return x + y;".into() },
+                    SourceLine {
+                        number: 9,
+                        text: "int x = 1;".into(),
+                    },
+                    SourceLine {
+                        number: 10,
+                        text: "int y = 2;".into(),
+                    },
+                    SourceLine {
+                        number: 11,
+                        text: "return x + y;".into(),
+                    },
                 ]),
             },
             stderr: None,
@@ -268,10 +369,20 @@ mod tests {
         let resp = CommandResponse {
             result: CommandResult::Stopped {
                 event: Event::Step {
-                    location: Location { class: "Foo".into(), method: "bar".into(), file: None, line: 5 },
+                    location: Location {
+                        class: "Foo".into(),
+                        method: "bar".into(),
+                        file: None,
+                        line: 5,
+                    },
                     thread: "t1".into(),
                 },
-                location: Location { class: "Foo".into(), method: "bar".into(), file: None, line: 5 },
+                location: Location {
+                    class: "Foo".into(),
+                    method: "bar".into(),
+                    file: None,
+                    line: 5,
+                },
                 thread: "t1".into(),
                 thread_id: None,
                 frame: None,
@@ -291,8 +402,16 @@ mod tests {
                 expr: "myList".into(),
                 size: Some(3),
                 elements: vec![
-                    VarBinding { name: "[0]".into(), ty: None, value: "\"hello\"".into() },
-                    VarBinding { name: "[1]".into(), ty: None, value: "\"world\"".into() },
+                    VarBinding {
+                        name: "[0]".into(),
+                        ty: None,
+                        value: "\"hello\"".into(),
+                    },
+                    VarBinding {
+                        name: "[1]".into(),
+                        ty: None,
+                        value: "\"world\"".into(),
+                    },
                 ],
                 truncated: Some(true),
             },

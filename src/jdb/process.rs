@@ -1,38 +1,39 @@
-//! Spawn 并控制 jdb 子进程。
+//! Spawn and control the jdb child process.
 //!
-//! 用 `std::process::Command` + piped stdio（**不用 ConPTY**，§5）。
-//! 始终带上 MANDATORY 的 `-J` flags 强制英文 locale，否则本机 jdb 输出乱码中文、解析失败。
+//! Uses `std::process::Command` with piped stdio (**not ConPTY**, §5).
+//! Always include the mandatory `-J` flags to force the English locale; otherwise this machine's jdb emits
+//! localized Chinese output and parsing fails.
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 
 use crate::error::{Error, Result};
 
-/// 强制英文 locale + UTF-8 的 jdb flags（§5，不可省略）。
+/// jdb flags that force English locale + UTF-8 (§5, mandatory).
 const LOCALE_FLAGS: &[&str] = &[
     "-J-Duser.language=en",
     "-J-Duser.country=US",
     "-J-Dfile.encoding=UTF-8",
 ];
 
-/// 平台相关的 classpath/sourcepath 分隔符。
+/// Platform-specific classpath/sourcepath separator.
 #[cfg(windows)]
 const PATH_SEP: &str = ";";
 #[cfg(not(windows))]
 const PATH_SEP: &str = ":";
 
-/// launch 模式配置（`jdbg launch`）。
+/// Launch-mode config (`jdbg launch`).
 #[derive(Debug, Clone, Default)]
 pub struct LaunchConfig {
     pub main_class: String,
     pub classpath: Vec<PathBuf>,
     pub sourcepath: Vec<PathBuf>,
     pub app_args: Vec<String>,
-    /// 透传给 jdb 的额外参数（`--jdb-arg`）。
+    /// Extra arguments passed through to jdb (`--jdb-arg`).
     pub jdb_args: Vec<String>,
 }
 
-/// attach 模式配置（`jdbg attach`）——连接已运行 JVM 的 JDWP 端口。
+/// Attach-mode config (`jdbg attach`): connect to a running JVM's JDWP port.
 #[derive(Debug, Clone)]
 pub struct AttachConfig {
     pub host: String,
@@ -40,29 +41,30 @@ pub struct AttachConfig {
     pub sourcepath: Vec<PathBuf>,
 }
 
-/// spawn 后交出的句柄集合：进程 + stdin 封装在 `JdbProcess`，stdout/stderr 交给 reader 线程。
+/// Handles returned after spawn: process + stdin in `JdbProcess`, stdout/stderr handed to reader threads.
 pub struct Spawned {
     pub process: JdbProcess,
     pub stdout: ChildStdout,
     pub stderr: ChildStderr,
 }
 
-/// 持有 jdb 子进程与其 stdin。一次只写一条命令（§5：每会话单命令在飞）。
+/// Owns the jdb child process and its stdin. Write only one command at a time (§5: one in-flight command per session).
 pub struct JdbProcess {
     child: Child,
     stdin: ChildStdin,
 }
 
-/// 按 launch 模式 spawn jdb。
+/// Spawn jdb in launch mode.
 ///
-/// 参数顺序载荷敏感：`jdb <-J flags> [-sourcepath SP] [-classpath CP] [jdb_args] MainClass [app_args]`
-/// ——所有 `-` flag 必须在 MainClass 之前，app args 在最后。
+/// Argument order is payload-sensitive:
+/// `jdb <-J flags> [-sourcepath SP] [-classpath CP] [jdb_args] MainClass [app_args]`.
+/// All `-` flags must come before MainClass, and app args come last.
 pub fn spawn_launch(jdb_path: &Path, config: &LaunchConfig) -> Result<Spawned> {
     let args = build_launch_args(config);
     spawn(jdb_path, &args)
 }
 
-/// 构造 launch 模式的完整参数列表（不含 jdb 可执行文件本身）。
+/// Build the full launch-mode argument list, excluding the jdb executable itself.
 pub fn build_launch_args(config: &LaunchConfig) -> Vec<String> {
     let mut args: Vec<String> = LOCALE_FLAGS.iter().map(|s| s.to_string()).collect();
 
@@ -80,25 +82,25 @@ pub fn build_launch_args(config: &LaunchConfig) -> Vec<String> {
     args
 }
 
-/// 按 attach 模式 spawn jdb。
+/// Spawn jdb in attach mode.
 ///
-/// 命令行：`jdb <-J flags> -connect com.sun.jdi.SocketAttach:hostname=H,port=P [-sourcepath SP]`。
-/// **必须用显式 SocketAttach 连接器**：Windows 上 `jdb -attach host:port` 默认走共享内存
-/// （dt_shmem）传输，与 JDWP `dt_socket` 不匹配会 `Unable to attach`、jdb 立即退出（§10）。
-/// `-connect` 强制 socket 传输，跨平台一致。
+/// Command line: `jdb <-J flags> -connect com.sun.jdi.SocketAttach:hostname=H,port=P [-sourcepath SP]`.
+/// **Must use the explicit SocketAttach connector**: on Windows, `jdb -attach host:port` defaults to
+/// shared-memory (dt_shmem), which does not match JDWP `dt_socket` and causes `Unable to attach` followed
+/// by immediate jdb exit (§10). `-connect` forces socket transport consistently across platforms.
 pub fn spawn_attach(jdb_path: &Path, config: &AttachConfig) -> Result<Spawned> {
     let args = build_attach_args(config);
     spawn(jdb_path, &args)
 }
 
-/// 规范化 attach 目标主机名：把 `localhost`（大小写不敏感）替换为 IPv4 环回字面量
-/// `127.0.0.1`，其它主机名（含已是字面 IP、`::1`、远程主机）原样返回。
+/// Normalize an attach target host: replace case-insensitive `localhost` with the IPv4 loopback literal
+/// `127.0.0.1`, and leave other hostnames (literal IPs, `::1`, remote hosts) unchanged.
 ///
-/// **为什么必要**：双栈机器上 `localhost` 常优先解析到 IPv6 `::1`，而 JDWP 默认（`address=5005`
-/// 或 `*:5005`）通常只在 IPv4 `0.0.0.0` 监听。结果 `probe_tcp` 与 jdb 的
-/// `SocketAttach:hostname=localhost` 都会连到 `::1` 被拒（connection refused），attach 失败。
-/// 强制 IPv4 环回字面量绕过 DNS 的 IPv6 优先，匹配 JDWP 实际监听的地址族。
-/// 用户若显式要 IPv6 环回，传 `::1` 即按原样保留。
+/// **Why this is needed**: on dual-stack machines, `localhost` often resolves to IPv6 `::1` first, while
+/// JDWP defaults (`address=5005` or `*:5005`) usually listen only on IPv4 `0.0.0.0`. Then both `probe_tcp`
+/// and jdb's `SocketAttach:hostname=localhost` connect to `::1`, get connection refused, and attach fails.
+/// Forcing the IPv4 loopback literal bypasses DNS's IPv6 preference and matches the address family JDWP is
+/// actually listening on. Users who explicitly want IPv6 loopback can pass `::1`, which is preserved.
 pub fn normalize_attach_host(host: &str) -> String {
     if host.eq_ignore_ascii_case("localhost") {
         "127.0.0.1".to_string()
@@ -107,7 +109,7 @@ pub fn normalize_attach_host(host: &str) -> String {
     }
 }
 
-/// 构造 attach 模式的完整参数列表（不含 jdb 可执行文件本身）。
+/// Build the full attach-mode argument list, excluding the jdb executable itself.
 pub fn build_attach_args(config: &AttachConfig) -> Vec<String> {
     let mut args: Vec<String> = LOCALE_FLAGS.iter().map(|s| s.to_string()).collect();
     args.push("-connect".into());
@@ -122,7 +124,7 @@ pub fn build_attach_args(config: &AttachConfig) -> Vec<String> {
     args
 }
 
-/// 用平台分隔符拼接多个路径。
+/// Join multiple paths with the platform separator.
 fn join_paths(paths: &[PathBuf]) -> String {
     paths
         .iter()
@@ -131,7 +133,7 @@ fn join_paths(paths: &[PathBuf]) -> String {
         .join(PATH_SEP)
 }
 
-/// 实际 spawn：piped stdin/stdout/stderr。
+/// Actual spawn with piped stdin/stdout/stderr.
 fn spawn(jdb_path: &Path, args: &[String]) -> Result<Spawned> {
     let mut cmd = Command::new(jdb_path);
     cmd.args(args)
@@ -139,9 +141,10 @@ fn spawn(jdb_path: &Path, args: &[String]) -> Result<Spawned> {
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // Windows: 不为 jdb 弹出空的控制台窗口。daemon 以 DETACHED_PROCESS 运行（无控制台），
-    // 系统会给控制台子程序 jdb.exe 新建一个控制台窗口；但 stdio 全走管道，窗口无内容、纯噪音。
-    // CREATE_NO_WINDOW 让 jdb 在不可见的控制台中运行（子 JVM 继承），管道 I/O 不受影响。
+    // Windows: avoid popping an empty console window for jdb. The daemon runs as DETACHED_PROCESS
+    // without a console, so the system would create a new console window for console-subsystem jdb.exe.
+    // stdio is fully piped, so that window is empty noise. CREATE_NO_WINDOW runs jdb in an invisible
+    // console inherited by the child JVM, without affecting pipe I/O.
     #[cfg(windows)]
     {
         use std::os::windows::process::CommandExt;
@@ -149,12 +152,10 @@ fn spawn(jdb_path: &Path, args: &[String]) -> Result<Spawned> {
         cmd.creation_flags(CREATE_NO_WINDOW);
     }
 
-    let mut child = cmd
-        .spawn()
-        .map_err(|source| Error::Spawn {
-            path: jdb_path.display().to_string(),
-            source,
-        })?;
+    let mut child = cmd.spawn().map_err(|source| Error::Spawn {
+        path: jdb_path.display().to_string(),
+        source,
+    })?;
 
     let stdin = child
         .stdin
@@ -177,7 +178,7 @@ fn spawn(jdb_path: &Path, args: &[String]) -> Result<Spawned> {
 }
 
 impl JdbProcess {
-    /// 向 jdb stdin 写一条命令（自动补 `\n` 并 flush）。
+    /// Write one command to jdb stdin, automatically appending `\n` and flushing.
     pub fn write_command(&mut self, cmd: &str) -> Result<()> {
         use std::io::Write;
         self.stdin.write_all(cmd.as_bytes())?;
@@ -186,17 +187,17 @@ impl JdbProcess {
         Ok(())
     }
 
-    /// 子进程 PID。
+    /// Child process PID.
     pub fn pid(&self) -> u32 {
         self.child.id()
     }
 
-    /// 是否仍在运行（非阻塞探测）。
+    /// Whether the process is still running, checked non-blockingly.
     pub fn is_alive(&mut self) -> bool {
         matches!(self.child.try_wait(), Ok(None))
     }
 
-    /// 强制结束 jdb 子进程。
+    /// Force-kill the jdb child process.
     pub fn kill(&mut self) -> Result<()> {
         self.child.kill()?;
         let _ = self.child.wait();
@@ -209,7 +210,11 @@ mod tests {
     use super::*;
 
     fn starts_with_locale(args: &[String]) -> bool {
-        let head: Vec<&str> = args.iter().take(LOCALE_FLAGS.len()).map(|s| s.as_str()).collect();
+        let head: Vec<&str> = args
+            .iter()
+            .take(LOCALE_FLAGS.len())
+            .map(|s| s.as_str())
+            .collect();
         head.as_slice() == LOCALE_FLAGS
     }
 
@@ -222,7 +227,7 @@ mod tests {
         };
         let args = build_launch_args(&cfg);
         assert!(starts_with_locale(&args));
-        // MainClass 必须在所有 `-` flag 之后。
+        // MainClass must come after all `-` flags.
         let cp = args.iter().position(|a| a == "-classpath").unwrap();
         let main = args.iter().position(|a| a == "Main").unwrap();
         assert!(cp < main, "args: {args:?}");
@@ -230,7 +235,7 @@ mod tests {
 
     #[test]
     fn attach_args_use_socket_connector_not_dash_attach() {
-        // 关键回归：Windows 上 `-attach host:port` 默认走共享内存，必须用 SocketAttach 连接器。
+        // Key regression: on Windows `-attach host:port` defaults to shared memory, so use SocketAttach.
         let cfg = AttachConfig {
             host: "localhost".into(),
             port: 5005,
@@ -240,28 +245,35 @@ mod tests {
         assert!(starts_with_locale(&args));
         assert!(args.iter().any(|a| a == "-connect"), "args: {args:?}");
         assert!(
-            args.iter().any(|a| a == "com.sun.jdi.SocketAttach:hostname=localhost,port=5005"),
+            args.iter()
+                .any(|a| a == "com.sun.jdi.SocketAttach:hostname=localhost,port=5005"),
             "args: {args:?}"
         );
-        assert!(!args.iter().any(|a| a == "-attach"), "must not use -attach: {args:?}");
+        assert!(
+            !args.iter().any(|a| a == "-attach"),
+            "must not use -attach: {args:?}"
+        );
         assert!(args.iter().any(|a| a == "-sourcepath"), "args: {args:?}");
     }
 
     #[test]
     fn normalize_attach_host_maps_localhost_to_ipv4_loopback() {
-        // 双栈机器上 localhost→::1，但 JDWP 多数只在 IPv4 监听 → 必须连 127.0.0.1。
+        // On dual-stack machines localhost→::1, but JDWP usually listens only on IPv4, so use 127.0.0.1.
         assert_eq!(normalize_attach_host("localhost"), "127.0.0.1");
-        // 大小写不敏感（DNS 名不区分大小写）。
+        // Case-insensitive because DNS names are case-insensitive.
         assert_eq!(normalize_attach_host("LocalHost"), "127.0.0.1");
         assert_eq!(normalize_attach_host("LOCALHOST"), "127.0.0.1");
     }
 
     #[test]
     fn normalize_attach_host_leaves_other_hosts_untouched() {
-        // 已是字面 IP、远程主机、显式 IPv6 环回都原样保留。
+        // Preserve literal IPs, remote hosts, and explicit IPv6 loopback.
         assert_eq!(normalize_attach_host("127.0.0.1"), "127.0.0.1");
         assert_eq!(normalize_attach_host("::1"), "::1");
         assert_eq!(normalize_attach_host("10.0.0.5"), "10.0.0.5");
-        assert_eq!(normalize_attach_host("debug.example.com"), "debug.example.com");
+        assert_eq!(
+            normalize_attach_host("debug.example.com"),
+            "debug.example.com"
+        );
     }
 }

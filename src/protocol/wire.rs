@@ -1,4 +1,4 @@
-//! IPC Wire 类型——CLI↔Daemon 的 JSONL 协议（§4）。
+//! IPC wire types for the CLI↔Daemon JSONL protocol (§4).
 
 use serde::{Deserialize, Serialize};
 
@@ -6,38 +6,38 @@ use super::result::CommandResponse;
 
 // ─── Request ────────────────────────────────────────────────────────────────────
 
-/// CLI→Daemon 的请求（一个连接一条）。
+/// CLI→Daemon request, one request per connection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Request {
-    /// 协议版本。
+    /// Protocol version.
     pub v: u32,
-    /// 唯一请求 id（用于日志关联）。
+    /// Unique request id for log correlation.
     pub id: String,
-    /// 目标会话 id（None = 默认唯一会话）。
+    /// Target session id. None means the default unique session.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session: Option<String>,
-    /// 本命令超时（秒），覆盖默认值；None 用默认。对应 CLI 的 `--timeout`。
+    /// Command timeout in seconds, overriding the default. None uses the default. Mirrors CLI `--timeout`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
-    /// 具体命令。
+    /// The concrete command.
     pub cmd: Command,
 }
 
-/// Daemon→CLI 的响应。
+/// Daemon→CLI response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Response {
     pub v: u32,
     pub id: String,
     pub ok: bool,
-    /// 成功时有 result。
+    /// Present on success.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<CommandResponse>,
-    /// 失败时有 error。
+    /// Present on failure.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<WireError>,
 }
 
-/// Wire 层错误描述。
+/// Wire-layer error description.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WireError {
     pub code: i32,
@@ -48,7 +48,7 @@ pub struct WireError {
 
 // ─── Command ────────────────────────────────────────────────────────────────────
 
-/// 命令枚举——镜像 §7 CLI 子命令，internally-tagged。
+/// Command enum mirroring §7 CLI subcommands, serialized as internally tagged JSON.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Command {
@@ -117,7 +117,9 @@ pub enum Command {
         field: String,
     },
     Breakpoints,
-    Clear { spec: String },
+    Clear {
+        spec: String,
+    },
 
     // ── Execution control ──
     Run,
@@ -136,20 +138,44 @@ pub enum Command {
     },
 
     // ── Inspection ──
-    Where { #[serde(default)] all: bool },
+    Where {
+        #[serde(default)]
+        all: bool,
+    },
     Locals,
-    Print { expr: String },
-    Dump { expr: String },
-    Eval { expr: String },
+    Print {
+        expr: String,
+    },
+    Dump {
+        expr: String,
+    },
+    Eval {
+        expr: String,
+    },
     Threads {
         #[serde(skip_serializing_if = "Option::is_none")]
         filter: Option<String>,
     },
-    Thread { id: String },
-    Frame { direction: String, #[serde(default = "default_one")] n: u32 },
-    ListSource { #[serde(skip_serializing_if = "Option::is_none")] line: Option<u32> },
-    Inspect { expr: String, #[serde(default = "default_max_elements")] max_elements: u32 },
-    Raw { command: String },
+    Thread {
+        id: String,
+    },
+    Frame {
+        direction: String,
+        #[serde(default = "default_one")]
+        n: u32,
+    },
+    ListSource {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        line: Option<u32>,
+    },
+    Inspect {
+        expr: String,
+        #[serde(default = "default_max_elements")]
+        max_elements: u32,
+    },
+    Raw {
+        command: String,
+    },
 
     // ── Thread control / state mutation / locks ──
     Suspend {
@@ -182,17 +208,29 @@ pub enum Command {
     DaemonStop,
 }
 
-fn default_host() -> String { "localhost".into() }
-fn default_port() -> u16 { 5005 }
-fn default_catch_mode() -> String { "all".into() }
-fn default_watch_mode() -> String { "modification".into() }
-fn default_one() -> u32 { 1 }
-fn default_max_elements() -> u32 { 10 }
+fn default_host() -> String {
+    "localhost".into()
+}
+fn default_port() -> u16 {
+    5005
+}
+fn default_catch_mode() -> String {
+    "all".into()
+}
+fn default_watch_mode() -> String {
+    "modification".into()
+}
+fn default_one() -> u32 {
+    1
+}
+fn default_max_elements() -> u32 {
+    10
+}
 
 // ─── impl ───────────────────────────────────────────────────────────────────────
 
 impl Request {
-    /// 构造一条请求。
+    /// Build a request.
     pub fn new(cmd: Command, session: Option<String>) -> Self {
         use rand::Rng;
         let id: String = rand::rng()
@@ -200,10 +238,16 @@ impl Request {
             .take(8)
             .map(char::from)
             .collect();
-        Self { v: 1, id, session, timeout: None, cmd }
+        Self {
+            v: 1,
+            id,
+            session,
+            timeout: None,
+            cmd,
+        }
     }
 
-    /// 设置超时（秒）。
+    /// Set the timeout in seconds.
     pub fn with_timeout(mut self, timeout: Option<u64>) -> Self {
         self.timeout = timeout;
         self
@@ -211,19 +255,28 @@ impl Request {
 }
 
 impl Response {
-    /// 构造成功响应。
+    /// Build a success response.
     pub fn ok(id: &str, result: CommandResponse) -> Self {
-        Self { v: 1, id: id.to_string(), ok: true, result: Some(result), error: None }
+        Self {
+            v: 1,
+            id: id.to_string(),
+            ok: true,
+            result: Some(result),
+            error: None,
+        }
     }
 
-    /// 构造失败响应。
+    /// Build a failure response.
     pub fn err(id: &str, code: i32, message: impl Into<String>) -> Self {
         Self {
             v: 1,
             id: id.to_string(),
             ok: false,
             result: None,
-            error: Some(WireError { code, message: message.into() }),
+            error: Some(WireError {
+                code,
+                message: message.into(),
+            }),
         }
     }
 }

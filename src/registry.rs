@@ -1,11 +1,11 @@
-//! 磁盘注册表：daemon.json + sessions.json。
+//! On-disk registry: daemon.json + sessions.json.
 //!
-//! 路径通过 `directories::ProjectDirs` 定位（§4）：
+//! Paths are located through `directories::ProjectDirs` (§4):
 //! - Windows: `%LOCALAPPDATA%\claude\jdbg\data\`
 //! - Linux: `$XDG_DATA_HOME/jdbg`
 //! - macOS: `~/Library/Application Support/dev.claude.jdbg`
 //!
-//! **daemon 是单写者**——原子写（temp+rename）。CLI 只读（离线回退）。
+//! **The daemon is the single writer**, using atomic writes (temp+rename). The CLI only reads as an offline fallback.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::Result;
 
-/// Daemon 存活信息。
+/// Daemon liveness information.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DaemonInfo {
     pub pid: u32,
@@ -23,7 +23,7 @@ pub struct DaemonInfo {
     pub started_at: String,
 }
 
-/// Sessions 列表中的一条。
+/// One entry in the session list.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionRecord {
     pub id: String,
@@ -38,13 +38,13 @@ pub struct SessionRecord {
     pub created_at: Option<String>,
 }
 
-/// 注册表路径集合。
+/// Registry path bundle.
 pub struct Registry {
     pub data_dir: PathBuf,
 }
 
 impl Registry {
-    /// 按平台定位数据目录，如不存在则创建。
+    /// Locate the platform data directory and create it if needed.
     pub fn open() -> Result<Self> {
         let dir = data_dir();
         fs::create_dir_all(&dir)?;
@@ -59,34 +59,35 @@ impl Registry {
         self.data_dir.join("sessions.json")
     }
 
-    /// 读取 daemon.json（可能不存在 → None）。
+    /// Read daemon.json. Missing file returns None.
     pub fn read_daemon(&self) -> Option<DaemonInfo> {
         let path = self.daemon_path();
         let content = fs::read_to_string(&path).ok()?;
         serde_json::from_str(&content).ok()
     }
 
-    /// 原子写 daemon.json（temp+rename）。
+    /// Atomically write daemon.json using temp+rename.
     pub fn write_daemon(&self, info: &DaemonInfo) -> Result<()> {
         atomic_write(&self.daemon_path(), info)
     }
 
-    /// 删除 daemon.json（daemon 停止时）。
+    /// Delete daemon.json when the daemon stops.
     pub fn remove_daemon(&self) {
         let _ = fs::remove_file(self.daemon_path());
     }
 
-    /// 读取 sessions.json。
+    /// Read sessions.json.
     pub fn read_sessions(&self) -> Vec<SessionRecord> {
         let path = self.sessions_path();
-        let Ok(content) = fs::read_to_string(&path) else { return vec![] };
+        let Ok(content) = fs::read_to_string(&path) else {
+            return vec![];
+        };
         serde_json::from_str(&content).unwrap_or_default()
     }
 
-    /// 原子写 sessions.json。
+    /// Atomically write sessions.json.
     pub fn write_sessions(&self, sessions: &[SessionRecord]) -> Result<()> {
-        let content = serde_json::to_string_pretty(sessions)
-            .map_err(std::io::Error::other)?;
+        let content = serde_json::to_string_pretty(sessions).map_err(std::io::Error::other)?;
         let path = self.sessions_path();
         let tmp = path.with_extension("tmp");
         fs::write(&tmp, content.as_bytes())?;
@@ -95,34 +96,33 @@ impl Registry {
     }
 }
 
-/// 定位数据目录。
+/// Locate the data directory.
 fn data_dir() -> PathBuf {
     if let Some(proj) = directories::ProjectDirs::from("dev", "claude", "jdbg") {
         proj.data_local_dir().to_path_buf()
     } else {
-        // fallback: 当前目录下 .jdbg/
+        // Fallback: .jdbg/ under the current directory.
         PathBuf::from(".jdbg")
     }
 }
 
-/// 原子写文件：先写 temp（同目录）再 rename，保证断电不损坏。
+/// Atomically write a file: write a temp file in the same directory, then rename to avoid corruption on power loss.
 fn atomic_write<T: Serialize>(path: &Path, data: &T) -> Result<()> {
-    let content = serde_json::to_string_pretty(data)
-        .map_err(std::io::Error::other)?;
+    let content = serde_json::to_string_pretty(data).map_err(std::io::Error::other)?;
     let tmp = path.with_extension("tmp");
     fs::write(&tmp, content.as_bytes())?;
     fs::rename(&tmp, path)?;
     Ok(())
 }
 
-/// 获取当前用户名（用于 socket name）。
+/// Get the current username for the socket name.
 pub fn current_username() -> String {
     std::env::var("USERNAME")
         .or_else(|_| std::env::var("USER"))
         .unwrap_or_else(|_| "unknown".into())
 }
 
-/// 生成固定 socket name（§4：每用户唯一，派生自 sanitized username）。
+/// Generate a stable socket name (§4: unique per user, derived from a sanitized username).
 pub fn socket_name() -> String {
     let user = current_username()
         .chars()

@@ -1,4 +1,4 @@
-# CLAUDE.md — java-agent-debugger (`jdbg`)
+# AGENTS.md — java-agent-debugger (`jdbg`)
 
 > Coding charter for AI agents working in this repo. **Rules and constraints only.**
 > For architecture, module layout, command/tool surface, output schema, dependencies, and status,

@@ -1,17 +1,17 @@
-//! 单连接处理器：解码 JSONL Request，路由命令，编码 Response。
+//! Single-connection handler: decode JSONL Request, route command, encode Response.
 
 use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
 
 use interprocess::local_socket::Stream;
 
+use super::manager::SessionManager;
 use crate::error::Result;
 use crate::jdb::parser::CommandHint;
 use crate::protocol::*;
 use crate::session::{CommandKind, Session};
-use super::manager::SessionManager;
 
-/// 处理一条连接（一个 request → 一个 response）。
+/// Handle one connection: one request → one response.
 pub fn handle_connection(stream: Stream, mgr: &Arc<SessionManager>) -> anyhow::Result<()> {
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();
@@ -35,13 +35,19 @@ pub fn handle_connection(stream: Stream, mgr: &Arc<SessionManager>) -> anyhow::R
     Ok(())
 }
 
-/// 路由命令到具体处理逻辑。
+/// Route a command to concrete handling logic.
 fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
     let id = &req.id;
     match &req.cmd {
         // ── Session lifecycle ──
         Command::Launch {
-            main_class, classpath, sourcepath, app_args, jdb_args, name, jdb_path,
+            main_class,
+            classpath,
+            sourcepath,
+            app_args,
+            jdb_args,
+            name,
+            jdb_path,
         } => {
             match mgr.create_launch(super::manager::LaunchParams {
                 main_class: main_class.clone(),
@@ -59,12 +65,25 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
                         target: session.meta.target.clone(),
                         state: session.state(),
                     };
-                    Response::ok(id, CommandResponse { result, stderr: None, note: None })
+                    Response::ok(
+                        id,
+                        CommandResponse {
+                            result,
+                            stderr: None,
+                            note: None,
+                        },
+                    )
                 }
                 Err(e) => Response::err(id, e.exit_code(), e.to_string()),
             }
         }
-        Command::Attach { host, port, sourcepath, name, jdb_path } => {
+        Command::Attach {
+            host,
+            port,
+            sourcepath,
+            name,
+            jdb_path,
+        } => {
             match mgr.create_attach(super::manager::AttachParams {
                 host: host.clone(),
                 port: *port,
@@ -79,8 +98,8 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
                         target: session.meta.target.clone(),
                         state: session.state(),
                     };
-                    // 若入口处把 localhost 规范化成了 127.0.0.1，明确告知（不静默）：
-                    // 双栈机器 localhost→::1 而 JDWP 多在 IPv4 监听，规范化避免 connection refused。
+                    // If the entry point normalized localhost to 127.0.0.1, say so explicitly.
+                    // On dual-stack machines localhost→::1 while JDWP often listens on IPv4; normalization avoids connection refused.
                     let note = crate::jdb::process::normalize_attach_host(host)
                         .ne(host)
                         .then(|| format!(
@@ -88,53 +107,94 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
                              hosts 'localhost' may resolve to IPv6 [::1] but JDWP usually listens \
                              only on IPv4. target shows the address actually connected."
                         ));
-                    Response::ok(id, CommandResponse { result, stderr: None, note })
+                    Response::ok(
+                        id,
+                        CommandResponse {
+                            result,
+                            stderr: None,
+                            note,
+                        },
+                    )
                 }
                 Err(e) => Response::err(id, e.exit_code(), e.to_string()),
             }
         }
         Command::List => {
             let result = mgr.list();
-            Response::ok(id, CommandResponse { result, stderr: None, note: None })
+            Response::ok(
+                id,
+                CommandResponse {
+                    result,
+                    stderr: None,
+                    note: None,
+                },
+            )
         }
         Command::Kill => {
-            // 解析目标会话（None = 唯一存活会话），与其它命令的 --session 默认行为一致。
+            // Resolve target session (None = unique live session), consistent with other commands' --session default.
             match mgr.get(req.session.as_deref()) {
                 Ok(session) => {
                     let sid = session.meta.id.clone();
                     match mgr.kill(&sid) {
-                        Ok(()) => Response::ok(id, CommandResponse {
-                            result: CommandResult::Raw { text: format!("session {sid} killed") },
-                            stderr: None, note: None,
-                        }),
+                        Ok(()) => Response::ok(
+                            id,
+                            CommandResponse {
+                                result: CommandResult::Raw {
+                                    text: format!("session {sid} killed"),
+                                },
+                                stderr: None,
+                                note: None,
+                            },
+                        ),
                         Err(e) => Response::err(id, e.exit_code(), e.to_string()),
                     }
                 }
                 Err(e) => Response::err(id, e.exit_code(), e.to_string()),
             }
         }
-        Command::Status => {
-            match mgr.get(req.session.as_deref()) {
-                Ok(session) => {
-                    let result = session.status();
-                    Response::ok(id, CommandResponse { result, stderr: None, note: None })
-                }
-                Err(e) => Response::err(id, e.exit_code(), e.to_string()),
+        Command::Status => match mgr.get(req.session.as_deref()) {
+            Ok(session) => {
+                let result = session.status();
+                Response::ok(
+                    id,
+                    CommandResponse {
+                        result,
+                        stderr: None,
+                        note: None,
+                    },
+                )
             }
-        }
+            Err(e) => Response::err(id, e.exit_code(), e.to_string()),
+        },
 
         // ── Daemon control ──
         Command::DaemonStatus => {
             let result = CommandResult::Raw {
                 text: format!("daemon pid={} running", std::process::id()),
             };
-            Response::ok(id, CommandResponse { result, stderr: None, note: None })
+            Response::ok(
+                id,
+                CommandResponse {
+                    result,
+                    stderr: None,
+                    note: None,
+                },
+            )
         }
         Command::DaemonStop => {
-            // 先响应 ok，然后 daemon 会在这个连接关闭后终止进程。
-            let result = CommandResult::Raw { text: "daemon stopping".into() };
-            let resp = Response::ok(id, CommandResponse { result, stderr: None, note: None });
-            // 排出响应后退出进程（粗暴但有效；后续可改优雅 shutdown flag）。
+            // Respond ok first, then the daemon exits after this connection closes.
+            let result = CommandResult::Raw {
+                text: "daemon stopping".into(),
+            };
+            let resp = Response::ok(
+                id,
+                CommandResponse {
+                    result,
+                    stderr: None,
+                    note: None,
+                },
+            );
+            // Exit after flushing the response. Crude but effective; can later become a graceful shutdown flag.
             std::thread::spawn(|| {
                 std::thread::sleep(std::time::Duration::from_millis(100));
                 std::process::exit(0);
@@ -147,7 +207,7 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
     }
 }
 
-/// 对需要具体会话的命令做路由。
+/// Route commands that require a concrete session.
 fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
     let id = &req.id;
     let session = match mgr.get(req.session.as_deref()) {
@@ -155,13 +215,18 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
         Err(e) => return Response::err(id, e.exit_code(), e.to_string()),
     };
 
-    // 本请求的超时覆盖（CLI `--timeout`），None = 用各命令默认值。
+    // Timeout override for this request (CLI `--timeout`); None means each command's default.
     let t = req.timeout;
 
     let result = match &req.cmd {
         // Breakpoints
-        Command::BreakAt { class, line, condition, suspend } => {
-            // suspend policy 在设断点时就编码进 jdb 命令（`stop thread at`），命中后无需补救。
+        Command::BreakAt {
+            class,
+            line,
+            condition,
+            suspend,
+        } => {
+            // The suspend policy is encoded into the jdb breakpoint command (`stop thread at`), so no hit-time repair is needed.
             let r = session.stop_at(class, *line, suspend.as_deref(), t);
             if r.is_ok() {
                 session.record_break_target(class, *line);
@@ -172,7 +237,13 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
             }
             r
         }
-        Command::BreakIn { class, method, args, condition, suspend } => {
+        Command::BreakIn {
+            class,
+            method,
+            args,
+            condition,
+            suspend,
+        } => {
             let r = session.stop_in(class, method, args.as_deref(), suspend.as_deref(), t);
             if r.is_ok() {
                 let spec = match args {
@@ -191,7 +262,10 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
                 "uncaught" => format!("catch uncaught {exception}"),
                 _ => format!("catch {exception}"),
             };
-            session.execute(&cmd, CommandKind::normal(CommandHint::BreakpointSet).with_timeout_secs(t))
+            session.execute(
+                &cmd,
+                CommandKind::normal(CommandHint::BreakpointSet).with_timeout_secs(t),
+            )
         }
         Command::Watch { field, mode } => {
             let cmd = match mode.as_str() {
@@ -199,17 +273,23 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
                 "all" => format!("watch all {field}"),
                 _ => format!("watch {field}"),
             };
-            session.execute(&cmd, CommandKind::normal(CommandHint::WatchSet).with_timeout_secs(t))
+            session.execute(
+                &cmd,
+                CommandKind::normal(CommandHint::WatchSet).with_timeout_secs(t),
+            )
         }
-        Command::Unwatch { field } => {
-            session.execute(&format!("unwatch {field}"), CommandKind::normal(CommandHint::Other).with_timeout_secs(t))
-        }
-        Command::Breakpoints => {
-            session.execute("clear", CommandKind::normal(CommandHint::Breakpoints).with_timeout_secs(t))
-        }
-        Command::Clear { spec } => {
-            session.execute(&format!("clear {spec}"), CommandKind::normal(CommandHint::Other).with_timeout_secs(t))
-        }
+        Command::Unwatch { field } => session.execute(
+            &format!("unwatch {field}"),
+            CommandKind::normal(CommandHint::Other).with_timeout_secs(t),
+        ),
+        Command::Breakpoints => session.execute(
+            "clear",
+            CommandKind::normal(CommandHint::Breakpoints).with_timeout_secs(t),
+        ),
+        Command::Clear { spec } => session.execute(
+            &format!("clear {spec}"),
+            CommandKind::normal(CommandHint::Other).with_timeout_secs(t),
+        ),
 
         // Execution control (blocking — enrich after)
         Command::Run | Command::Cont | Command::Step | Command::Next | Command::StepOut => {
@@ -247,19 +327,30 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
                 Some(p) => format!("classes {p}"),
                 None => "classes".to_string(),
             };
-            let mut r = session.execute(&cmd, CommandKind::normal(CommandHint::Classes).with_timeout_secs(t));
-            // handler 注入 class 名到 Methods 结果（parser 无上下文）。
+            let mut r = session.execute(
+                &cmd,
+                CommandKind::normal(CommandHint::Classes).with_timeout_secs(t),
+            );
+            // The handler injects the class name into Methods results because the parser has no context.
             if let Ok(ref mut resp) = r {
                 if let CommandResult::Methods { ref mut class, .. } = resp.result {
-                    if let Some(p) = pattern { *class = p.clone(); }
+                    if let Some(p) = pattern {
+                        *class = p.clone();
+                    }
                 }
             }
             r
         }
         Command::Methods { class } => {
-            let mut r = session.execute(&format!("methods {class}"), CommandKind::normal(CommandHint::Methods).with_timeout_secs(t));
+            let mut r = session.execute(
+                &format!("methods {class}"),
+                CommandKind::normal(CommandHint::Methods).with_timeout_secs(t),
+            );
             if let Ok(ref mut resp) = r {
-                if let CommandResult::Methods { class: ref mut c, .. } = resp.result {
+                if let CommandResult::Methods {
+                    class: ref mut c, ..
+                } = resp.result
+                {
                     *c = class.clone();
                 }
             }
@@ -277,15 +368,17 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
         }
         Command::Locals => session.locals(t),
         Command::Print { expr } => session.print(expr, t),
-        Command::Dump { expr } => {
-            session.execute(&format!("dump {expr}"), CommandKind::normal(CommandHint::Dump).with_timeout_secs(t))
-        }
-        Command::Eval { expr } => {
-            session.execute(&format!("eval {expr}"), CommandKind::normal(CommandHint::Eval).with_timeout_secs(t))
-        }
+        Command::Dump { expr } => session.execute(
+            &format!("dump {expr}"),
+            CommandKind::normal(CommandHint::Dump).with_timeout_secs(t),
+        ),
+        Command::Eval { expr } => session.execute(
+            &format!("eval {expr}"),
+            CommandKind::normal(CommandHint::Eval).with_timeout_secs(t),
+        ),
         Command::Threads { filter } => {
             let mut r = session.threads(t);
-            // parser 返回全量；过滤在 handler 层做（保持 parser 纯粹，作为测试 oracle）。
+            // Parser returns everything; filtering happens in handler to keep parser pure as a test oracle.
             if let Ok(ref mut resp) = r {
                 if let CommandResult::Threads { threads } = &mut resp.result {
                     *threads = filter_threads(std::mem::take(threads), filter.as_deref());
@@ -293,12 +386,16 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
             }
             r
         }
-        Command::Thread { id: tid } => {
-            session.execute(&format!("thread {tid}"), CommandKind::normal(CommandHint::Other).with_timeout_secs(t))
-        }
+        Command::Thread { id: tid } => session.execute(
+            &format!("thread {tid}"),
+            CommandKind::normal(CommandHint::Other).with_timeout_secs(t),
+        ),
         Command::Frame { direction, n } => {
             let cmd = format!("{direction} {n}");
-            session.execute(&cmd, CommandKind::normal(CommandHint::Other).with_timeout_secs(t))
+            session.execute(
+                &cmd,
+                CommandKind::normal(CommandHint::Other).with_timeout_secs(t),
+            )
         }
         Command::ListSource { line } => session.list_source(*line, t),
         Command::Raw { command } => session.raw(command, t),
@@ -309,39 +406,53 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
                 Some(i) => format!("suspend {i}"),
                 None => "suspend".to_string(),
             };
-            session.execute(&cmd, CommandKind::normal(CommandHint::Other).with_timeout_secs(t))
+            session.execute(
+                &cmd,
+                CommandKind::normal(CommandHint::Other).with_timeout_secs(t),
+            )
         }
         Command::Resume { id } => {
             let cmd = match id {
                 Some(i) => format!("resume {i}"),
                 None => "resume".to_string(),
             };
-            session.execute(&cmd, CommandKind::normal(CommandHint::Other).with_timeout_secs(t))
+            session.execute(
+                &cmd,
+                CommandKind::normal(CommandHint::Other).with_timeout_secs(t),
+            )
         }
-        Command::Set { lvalue, value } => {
-            session.execute(&format!("set {lvalue} = {value}"), CommandKind::normal(CommandHint::Other).with_timeout_secs(t))
-        }
+        Command::Set { lvalue, value } => session.execute(
+            &format!("set {lvalue} = {value}"),
+            CommandKind::normal(CommandHint::Other).with_timeout_secs(t),
+        ),
         Command::Ignore { exception, mode } => {
-            // 镜像 Catch 的 mode dispatch（对称的异常断点移除）。
+            // Mirror Catch's mode dispatch for symmetric exception breakpoint removal.
             let cmd = match mode.as_str() {
                 "caught" => format!("ignore caught {exception}"),
                 "uncaught" => format!("ignore uncaught {exception}"),
                 _ => format!("ignore {exception}"),
             };
-            session.execute(&cmd, CommandKind::normal(CommandHint::Other).with_timeout_secs(t))
+            session.execute(
+                &cmd,
+                CommandKind::normal(CommandHint::Other).with_timeout_secs(t),
+            )
         }
-        Command::Lock { expr } => {
-            session.execute(&format!("lock {expr}"), CommandKind::normal(CommandHint::Other).with_timeout_secs(t))
-        }
+        Command::Lock { expr } => session.execute(
+            &format!("lock {expr}"),
+            CommandKind::normal(CommandHint::Other).with_timeout_secs(t),
+        ),
         Command::ThreadLocks { id } => {
             let cmd = match id {
                 Some(i) => format!("threadlocks {i}"),
                 None => "threadlocks".to_string(),
             };
-            session.execute(&cmd, CommandKind::normal(CommandHint::Other).with_timeout_secs(t))
+            session.execute(
+                &cmd,
+                CommandKind::normal(CommandHint::Other).with_timeout_secs(t),
+            )
         }
 
-        // 不应走到这里（lifecycle/daemon/attach commands 已在上层处理）
+        // Should not get here; lifecycle/daemon/attach commands are handled above.
         _ => return Response::err(id, 400, "unexpected command in session dispatch"),
     };
 
@@ -353,20 +464,30 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
 
 // ─── Enrichment helpers ─────────────────────────────────────────────────────────
 
-/// 追加一条消息到 resp.note（多条用换行分隔）。
+/// Append one message to resp.note, separating multiple messages with newlines.
 fn append_note(resp: &mut CommandResponse, msg: &str) {
     match &mut resp.note {
-        Some(existing) => { existing.push('\n'); existing.push_str(msg); }
+        Some(existing) => {
+            existing.push('\n');
+            existing.push_str(msg);
+        }
         None => resp.note = Some(msg.to_string()),
     }
 }
 
-/// 条件断点循环：如果命中的断点有条件且条件为 false，自动 cont 继续。
-/// 最多循环 100 次防止无限 loop。
-fn eval_condition_loop(session: &Session, mut resp: CommandResponse, timeout: Option<u64>) -> CommandResponse {
+/// Conditional-breakpoint loop: if a hit breakpoint has a condition and the condition is false, auto-cont.
+/// Cap at 100 iterations to avoid infinite loops.
+fn eval_condition_loop(
+    session: &Session,
+    mut resp: CommandResponse,
+    timeout: Option<u64>,
+) -> CommandResponse {
     for _ in 0..100 {
         let spec = match &resp.result {
-            CommandResult::Stopped { event: Event::Breakpoint { location, .. }, .. } => {
+            CommandResult::Stopped {
+                event: Event::Breakpoint { location, .. },
+                ..
+            } => {
                 format!("{}:{}", location.class, location.line)
             }
             _ => return resp,
@@ -377,26 +498,32 @@ fn eval_condition_loop(session: &Session, mut resp: CommandResponse, timeout: Op
             None => return resp,
         };
 
-        // eval 条件表达式
+        // Evaluate condition expression.
         let cond_result = session.print(&condition, Some(5));
         let should_stop = match &cond_result {
             Ok(r) => match &r.result {
                 CommandResult::Value { value, .. } => value.trim() == "true",
                 _ => {
-                    append_note(&mut resp, &format!(
-                        "WARNING: conditional breakpoint eval of \"{}\" returned unexpected result — \
+                    append_note(
+                        &mut resp,
+                        &format!(
+                            "WARNING: conditional breakpoint eval of \"{}\" returned unexpected result — \
                          stopping to let you inspect.",
-                        condition
-                    ));
+                            condition
+                        ),
+                    );
                     true
                 }
             },
             Err(e) => {
-                append_note(&mut resp, &format!(
-                    "WARNING: conditional breakpoint eval of \"{}\" failed ({}) — \
+                append_note(
+                    &mut resp,
+                    &format!(
+                        "WARNING: conditional breakpoint eval of \"{}\" failed ({}) — \
                      stopping to let you inspect.",
-                    condition, e
-                ));
+                        condition, e
+                    ),
+                );
                 true
             }
         };
@@ -405,35 +532,44 @@ fn eval_condition_loop(session: &Session, mut resp: CommandResponse, timeout: Op
             return resp;
         }
 
-        // 条件不满足，自动 cont
+        // Condition is false; auto-cont.
         match session.cont(timeout) {
             Ok(next_resp) => resp = next_resp,
             Err(e) => {
-                append_note(&mut resp, &format!(
-                    "WARNING: conditional breakpoint auto-cont failed ({}) — \
+                append_note(
+                    &mut resp,
+                    &format!(
+                        "WARNING: conditional breakpoint auto-cont failed ({}) — \
                      returning current stop location.",
-                    e
-                ));
+                        e
+                    ),
+                );
                 return resp;
             }
         }
     }
-    append_note(&mut resp, "WARNING: conditional breakpoint hit 100 iterations without condition becoming true — stopping to prevent infinite loop.");
+    append_note(
+        &mut resp,
+        "WARNING: conditional breakpoint hit 100 iterations without condition becoming true — stopping to prevent infinite loop.",
+    );
     resp
 }
 
-/// 阻塞命令返回 Stopped 后，自动获取栈帧 + 源码上下文。
-/// 失败时在 note 中报告 warning（不静默忽略）。
+/// After a blocking command returns Stopped, automatically fetch stack frame + source context.
+/// On failure, report a warning in note instead of silently ignoring it.
 fn enrich_stopped(session: &Session, resp: &mut CommandResponse) {
-    // 先提取需要的信息（避免长生命周期可变借用）。
+    // Extract needed information first to avoid long-lived mutable borrows.
     let (location_line, needs_frame, needs_source) = match &resp.result {
-        CommandResult::Stopped { location, frame, source_context, .. } => {
-            (location.line, frame.is_none(), source_context.is_none())
-        }
+        CommandResult::Stopped {
+            location,
+            frame,
+            source_context,
+            ..
+        } => (location.line, frame.is_none(), source_context.is_none()),
         _ => return,
     };
 
-    // 收集 enrichment 数据（独立于 resp 的借用）。
+    // Collect enrichment data independent of resp's borrow.
     let mut frame_data = None;
     let mut source_data = None;
     let mut warnings: Vec<String> = Vec::new();
@@ -448,14 +584,12 @@ fn enrich_stopped(session: &Session, resp: &mut CommandResponse) {
                 }
             }
             Err(e) => {
-                warnings.push(format!(
-                    "WARNING: failed to enrich stack frame: {e}"
-                ));
+                warnings.push(format!("WARNING: failed to enrich stack frame: {e}"));
             }
         }
     }
 
-    // 确定用于 source_context 的行号——如果 location.line==0（如 FieldWatch），从 frame 回填。
+    // Determine the line number for source_context. If location.line==0 (e.g. FieldWatch), backfill from frame.
     let effective_line = if location_line > 0 {
         location_line
     } else {
@@ -470,19 +604,23 @@ fn enrich_stopped(session: &Session, resp: &mut CommandResponse) {
                 }
             }
             Err(e) => {
-                warnings.push(format!(
-                    "WARNING: failed to enrich source context: {e}"
-                ));
+                warnings.push(format!("WARNING: failed to enrich source context: {e}"));
             }
         }
     }
 
-    // 写回结果。
-    if let CommandResult::Stopped { location, frame, source_context, .. } = &mut resp.result {
+    // Write back the result.
+    if let CommandResult::Stopped {
+        location,
+        frame,
+        source_context,
+        ..
+    } = &mut resp.result
+    {
         if frame.is_none() {
             *frame = frame_data.clone();
         }
-        // 如果 location 是空的（FieldWatch），从 frame 回填。
+        // If location is empty (FieldWatch), backfill from frame.
         if location.line == 0 {
             if let Some(ref f) = frame_data {
                 location.class = f.location.class.clone();
@@ -512,22 +650,24 @@ fn enrich_stopped(session: &Session, resp: &mut CommandResponse) {
     }
 }
 
-/// 命中（Stopped / ExceptionCaught）后回填命中线程的 jdb id，供 `thread <id>` 直接切换。
+/// After a hit (Stopped / ExceptionCaught), backfill the hit thread's jdb id for direct `thread <id>` switching.
 ///
-/// PartialStop 路径已在 session 层填好 id（复用那次 `threads` 查询），此处只处理完整 banner
-/// 路径：若 `thread_id` 仍为 None 且事件带线程名/有 at-breakpoint 线程，则跑一次 `threads`
-/// 用 `thread_id_for` 反查。查不到写 WARNING（绝不静默）。
+/// The PartialStop path already fills the id in the session layer by reusing its `threads` query. This handles
+/// only full-banner paths: if `thread_id` is still None and the event has a thread name or an at-breakpoint
+/// thread exists, run `threads` once and reverse-lookup with `thread_id_for`. If lookup fails, write WARNING.
 fn enrich_thread_id(session: &Session, resp: &mut CommandResponse) {
-    // 取出当前线程名 + 是否已有 id（避免长生命周期借用）。
+    // Extract current thread name and whether id already exists, avoiding long-lived borrows.
     let (have_id, name) = match &resp.result {
-        CommandResult::Stopped { thread_id, thread, .. }
-        | CommandResult::ExceptionCaught { thread_id, thread, .. } => {
-            (thread_id.is_some(), thread.clone())
+        CommandResult::Stopped {
+            thread_id, thread, ..
         }
+        | CommandResult::ExceptionCaught {
+            thread_id, thread, ..
+        } => (thread_id.is_some(), thread.clone()),
         _ => return,
     };
     if have_id {
-        return; // PartialStop 路径已填。
+        return; // PartialStop path already filled it.
     }
 
     let found = match session.threads(None) {
@@ -554,25 +694,32 @@ fn enrich_thread_id(session: &Session, resp: &mut CommandResponse) {
     }
 }
 
-/// 断点命中时，与最近设置的 break_at 行号比对；不匹配则添加 note。
+/// On breakpoint hit, compare with the most recent break_at line and add a note if it differs.
 fn check_line_mismatch(session: &Session, resp: &mut CommandResponse) {
     let location = match &resp.result {
-        CommandResult::Stopped { event: Event::Breakpoint { .. }, location, .. } => location,
+        CommandResult::Stopped {
+            event: Event::Breakpoint { .. },
+            location,
+            ..
+        } => location,
         _ => return,
     };
 
     if let Some((ref cls, req_line)) = session.take_break_target() {
         if cls == &location.class && req_line != location.line {
-            append_note(resp, &format!(
-                "Breakpoint requested at line {} but hit at line {} — \
+            append_note(
+                resp,
+                &format!(
+                    "Breakpoint requested at line {} but hit at line {} — \
                  JVM rounded to nearest executable bytecode.",
-                req_line, location.line
-            ));
+                    req_line, location.line
+                ),
+            );
         }
     }
 }
 
-/// `inspect` 命令：获取集合/数组的 size + 前 N 个元素。
+/// `inspect` command: fetch collection/array size plus the first N elements.
 fn handle_inspect(
     session: &Session,
     expr: &str,
@@ -581,7 +728,7 @@ fn handle_inspect(
 ) -> Result<CommandResponse> {
     let max = max_elements.min(50);
 
-    // 尝试获取 size（.size() 优先，fallback .length）
+    // Try to get size, preferring .size() and falling back to .length.
     let size = try_eval_int(session, &format!("{expr}.size()"), timeout)
         .or_else(|| try_eval_int(session, &format!("{expr}.length"), timeout));
 
@@ -590,7 +737,7 @@ fn handle_inspect(
         None => max,
     };
 
-    // 逐个取元素
+    // Fetch elements one by one.
     let mut elements = Vec::new();
     for i in 0..count {
         if let Some(val) = try_get_element(session, expr, i, timeout) {
@@ -642,7 +789,7 @@ fn try_get_element(
     None
 }
 
-/// 写响应（JSONL：一行 JSON + newline）。
+/// Write a response as JSONL: one JSON object plus newline.
 fn write_response(mut stream: &Stream, resp: &Response) -> anyhow::Result<()> {
     let json = serde_json::to_string(resp)?;
     stream.write_all(json.as_bytes())?;
@@ -651,19 +798,19 @@ fn write_response(mut stream: &Stream, resp: &Response) -> anyhow::Result<()> {
     Ok(())
 }
 
-// ─── Thread 辅助纯函数 ────────────────────────────────────────────────────────────
+// ─── Thread Helper Pure Functions ──────────────────────────────────────────────
 
-/// 在 `threads` 列表里找出命中线程的 id。
+/// Find the hit thread id in a `threads` list.
 ///
-/// - `name` 非空 → 优先按线程名**精确**匹配；唯一命中即返回其 id。
-/// - 名字为空（PartialStop 截断 banner 兜底）、或同名多个 → 退而取 state 含
-///   `"at breakpoint"` 的线程。
-/// - 都找不到 → `None`（调用方写 WARNING，绝不静默）。
+/// - Non-empty `name`: prefer an **exact** thread-name match; if unique, return its id.
+/// - Empty name (PartialStop truncated-banner fallback), or multiple threads with the same name: fall back to
+///   a thread whose state contains `"at breakpoint"`.
+/// - If nothing matches, return `None`; the caller writes WARNING and never silently falls back.
 fn thread_id_for(threads: &[ThreadInfo], name: &str) -> Option<String> {
     if !name.is_empty() {
         let mut matches = threads.iter().filter(|t| t.name == name);
         if let Some(first) = matches.next() {
-            // 唯一同名 → 直接用；多个同名 → 落到 at-breakpoint 兜底。
+            // Unique same-name match: use it directly; multiple same-name matches fall back to at-breakpoint.
             if matches.next().is_none() {
                 return Some(first.id.clone());
             }
@@ -675,7 +822,7 @@ fn thread_id_for(threads: &[ThreadInfo], name: &str) -> Option<String> {
         .map(|t| t.id.clone())
 }
 
-/// 按线程名**大小写不敏感子串**过滤；`filter` 为 None/空串时原样返回全部。
+/// Filter by **case-insensitive substring** in thread name; None/empty filter returns all threads unchanged.
 fn filter_threads(threads: Vec<ThreadInfo>, filter: Option<&str>) -> Vec<ThreadInfo> {
     match filter {
         Some(f) if !f.is_empty() => {
@@ -694,7 +841,12 @@ mod tests {
     use super::*;
 
     fn ti(id: &str, name: &str, state: &str) -> ThreadInfo {
-        ThreadInfo { id: id.into(), name: name.into(), group: None, state: state.into() }
+        ThreadInfo {
+            id: id.into(),
+            name: name.into(),
+            group: None,
+            state: state.into(),
+        }
     }
 
     #[test]
@@ -704,7 +856,10 @@ mod tests {
             ti("18315", "http-nio-9702-exec-1", "running (at breakpoint)"),
             ti("18316", "http-nio-9702-exec-2", "cond. waiting"),
         ];
-        assert_eq!(thread_id_for(&threads, "http-nio-9702-exec-2").as_deref(), Some("18316"));
+        assert_eq!(
+            thread_id_for(&threads, "http-nio-9702-exec-2").as_deref(),
+            Some("18316")
+        );
     }
 
     #[test]
@@ -718,7 +873,7 @@ mod tests {
 
     #[test]
     fn thread_id_for_duplicate_names_uses_at_breakpoint() {
-        // 两个同名线程（线程池常见）→ 精确匹配有歧义，落到 at-breakpoint 那个。
+        // Two threads with the same name are common in pools; exact match is ambiguous, so fall back to at-breakpoint.
         let threads = vec![
             ti("0xaa", "worker", "cond. waiting"),
             ti("0xbb", "worker", "running (at breakpoint)"),
@@ -742,7 +897,10 @@ mod tests {
         ];
         let out = filter_threads(threads, Some("http-nio"));
         assert_eq!(out.len(), 2);
-        assert!(out.iter().all(|t| t.name.to_lowercase().contains("http-nio")));
+        assert!(
+            out.iter()
+                .all(|t| t.name.to_lowercase().contains("http-nio"))
+        );
     }
 
     #[test]

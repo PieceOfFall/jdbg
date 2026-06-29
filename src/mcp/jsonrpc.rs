@@ -1,23 +1,24 @@
-//! JSON-RPC 2.0 基础类型——MCP over stdio 的最小子集。
+//! Basic JSON-RPC 2.0 types: the minimal subset needed for MCP over stdio.
 //!
-//! 只覆盖 server 需要的：解析入站请求/通知、构造成功/错误响应。纯 serde/serde_json，无 tokio。
+//! Covers only what the server needs: parsing inbound requests/notifications and building success/error responses.
+//! Pure serde/serde_json, no tokio.
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// 标准 JSON-RPC 2.0 错误码。
+/// Standard JSON-RPC 2.0 error codes.
 pub const PARSE_ERROR: i32 = -32700;
 pub const INVALID_REQUEST: i32 = -32600;
 pub const METHOD_NOT_FOUND: i32 = -32601;
 pub const INVALID_PARAMS: i32 = -32602;
 pub const INTERNAL_ERROR: i32 = -32603;
 
-/// 一条入站 JSON-RPC 消息（请求或通知）。
+/// One inbound JSON-RPC message, either a request or a notification.
 #[derive(Debug, Clone, Deserialize)]
 pub struct JsonRpcRequest {
     #[allow(dead_code)]
     pub jsonrpc: String,
-    /// 请求有 id（string/number）；通知无 id 字段。
+    /// Requests have an id (string/number); notifications omit the id field.
     #[serde(default)]
     pub id: Option<Value>,
     pub method: String,
@@ -26,13 +27,13 @@ pub struct JsonRpcRequest {
 }
 
 impl JsonRpcRequest {
-    /// 通知（无 id）不需要响应。
+    /// Notifications have no id and do not require a response.
     pub fn is_notification(&self) -> bool {
         self.id.is_none()
     }
 }
 
-/// 出站 JSON-RPC 响应。
+/// Outbound JSON-RPC response.
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonRpcResponse {
     pub jsonrpc: &'static str,
@@ -43,7 +44,7 @@ pub struct JsonRpcResponse {
     pub error: Option<JsonRpcError>,
 }
 
-/// JSON-RPC 错误对象。
+/// JSON-RPC error object.
 #[derive(Debug, Clone, Serialize)]
 pub struct JsonRpcError {
     pub code: i32,
@@ -53,21 +54,35 @@ pub struct JsonRpcError {
 }
 
 impl JsonRpcError {
-    /// 构造一个无 data 的错误。
+    /// Build an error without data.
     pub fn new(code: i32, message: impl Into<String>) -> Self {
-        Self { code, message: message.into(), data: None }
+        Self {
+            code,
+            message: message.into(),
+            data: None,
+        }
     }
 }
 
 impl JsonRpcResponse {
-    /// 成功响应：回显请求 id。
+    /// Success response: echo the request id.
     pub fn success(id: Value, result: Value) -> Self {
-        Self { jsonrpc: "2.0", id, result: Some(result), error: None }
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: Some(result),
+            error: None,
+        }
     }
 
-    /// 错误响应：回显请求 id（解析失败拿不到 id 时用 `Value::Null`）。
+    /// Error response: echo the request id, or use `Value::Null` when parse failure prevents reading an id.
     pub fn error(id: Value, err: JsonRpcError) -> Self {
-        Self { jsonrpc: "2.0", id, result: None, error: Some(err) }
+        Self {
+            jsonrpc: "2.0",
+            id,
+            result: None,
+            error: Some(err),
+        }
     }
 }
 
@@ -80,12 +95,18 @@ mod tests {
     fn success_response_omits_error_field() {
         let r = JsonRpcResponse::success(json!(1), json!({"ok": true}));
         let v = serde_json::to_value(&r).unwrap();
-        assert_eq!(v, json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}}));
+        assert_eq!(
+            v,
+            json!({"jsonrpc": "2.0", "id": 1, "result": {"ok": true}})
+        );
     }
 
     #[test]
     fn error_response_omits_result_field() {
-        let r = JsonRpcResponse::error(json!(2), JsonRpcError::new(METHOD_NOT_FOUND, "no such method"));
+        let r = JsonRpcResponse::error(
+            json!(2),
+            JsonRpcError::new(METHOD_NOT_FOUND, "no such method"),
+        );
         let v = serde_json::to_value(&r).unwrap();
         assert_eq!(
             v,
@@ -112,7 +133,8 @@ mod tests {
     #[test]
     fn message_without_id_is_notification() {
         let req: JsonRpcRequest =
-            serde_json::from_str(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#).unwrap();
+            serde_json::from_str(r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#)
+                .unwrap();
         assert!(req.is_notification());
     }
 

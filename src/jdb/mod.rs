@@ -1,4 +1,4 @@
-//! jdb 子模块——控制 jdb 子进程、读取输出、解析结果。
+//! jdb subsystem: control the jdb child process, read output, and parse results.
 
 pub mod parser;
 pub mod process;

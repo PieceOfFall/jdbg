@@ -1,4 +1,4 @@
-//! clap 命令行定义——1:1 映射 CLAUDE.md §7 CLI 命令面。
+//! clap command-line definitions, mapping 1:1 to the CLI surface in CLAUDE.md §7.
 
 use clap::{Parser, Subcommand};
 
@@ -29,7 +29,6 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Commands {
     // ── Session lifecycle ──
-
     /// Launch a Java program under jdb.
     Launch {
         /// Fully qualified main class name.
@@ -77,14 +76,13 @@ pub enum Commands {
     Kill,
 
     // ── Daemon control ──
-
     /// Daemon management subcommands.
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
     },
 
-    /// Register (or remove) the jdbg MCP server in Claude Code's config.
+    /// Register (or remove) the jdbg MCP server for coding agents.
     Setup {
         /// Remove the registration instead of adding it.
         #[arg(long)]
@@ -92,13 +90,18 @@ pub enum Commands {
         /// Print the config snippet instead of writing any files.
         #[arg(long)]
         print: bool,
+        /// Agent targets: claude,codex or auto/all/none.
+        #[arg(long)]
+        target: Option<String>,
+        /// Use non-interactive defaults.
+        #[arg(long)]
+        yes: bool,
     },
 
     /// Update jdbg: remove old setup, install latest release from GitHub, then re-register.
     Update,
 
     // ── Breakpoints ──
-
     /// Set a line breakpoint: stop at Class:line.
     BreakAt {
         /// Class name (e.g. com.example.Main).
@@ -164,7 +167,6 @@ pub enum Commands {
     },
 
     // ── Execution control ──
-
     /// Start the debugged application (launch mode only).
     Run,
     /// Continue execution.
@@ -177,7 +179,6 @@ pub enum Commands {
     StepOut,
 
     // ── Class/method search ──
-
     /// Search loaded classes (filter by substring pattern).
     Classes {
         /// Substring pattern to filter class names.
@@ -191,7 +192,6 @@ pub enum Commands {
     },
 
     // ── Inspection ──
-
     /// Print call stack.
     Where {
         /// Show all threads.
@@ -255,7 +255,6 @@ pub enum Commands {
     },
 
     // ── Thread control / state mutation / locks ──
-
     /// Suspend a thread (or all threads if no id given).
     Suspend {
         /// Thread id (from `threads` output). Omit to suspend all threads.

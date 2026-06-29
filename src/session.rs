@@ -1,15 +1,15 @@
-//! 调试会话：绑定 jdb 子进程与 reader/stderr 线程，驱动 RunState 状态机。
+//! Debug session: bind the jdb child process and reader/stderr threads, and drive the RunState machine.
 //!
-//! `Session` 是引擎的核心协调层（roadmap 3）：
-//! - 拥有 [`JdbProcess`] + [`PromptReader`] + stderr drain 线程（§5 三线程模型）。
-//! - 每会话单命令锁（内部 `Mutex`）：同一时刻只有一条命令在飞。
-//! - [`Session::execute`] 把 `ReadOutcome` + parser → [`CommandResponse`]
-//!   （event → `Stopped` / `ExceptionCaught`，VM 退出 → `VmExited`，超时 → `Timeout`）。
-//! - 语义便捷方法（[`Session::run`]、[`Session::stop_at`]…）封装 jdb 命令字符串，
-//!   使上层（CLI）无需了解 jdb 语法——低耦合。
+//! `Session` is the engine's core coordination layer (roadmap 3):
+//! - Owns [`JdbProcess`] + [`PromptReader`] + stderr drain thread (§5 three-thread model).
+//! - Uses a per-session command lock (internal `Mutex`) so only one command is in flight at a time.
+//! - [`Session::execute`] maps `ReadOutcome` + parser → [`CommandResponse`]
+//!   (event → `Stopped` / `ExceptionCaught`, VM exit → `VmExited`, timeout → `Timeout`).
+//! - Semantic convenience methods ([`Session::run`], [`Session::stop_at`], ...) wrap jdb command strings,
+//!   so upper layers like the CLI do not need to know jdb syntax.
 //!
-//! `Session` 通过内部可变性（`Mutex<SessionInner>`）做到 `&self` 即可执行命令，
-//! 便于以 `Arc<Session>` 在 daemon 的多线程间共享。
+//! `Session` uses interior mutability (`Mutex<SessionInner>`) so commands can execute through `&self`,
+//! making it easy to share as `Arc<Session>` across daemon threads.
 
 use std::process::ChildStderr;
 use std::sync::{Arc, Mutex};
@@ -18,18 +18,20 @@ use std::time::Duration;
 
 use crate::error::{Error, Result};
 use crate::jdb::parser::{CommandHint, classify_output, parse_threads, parse_where};
-use crate::jdb::process::{AttachConfig, JdbProcess, LaunchConfig, normalize_attach_host, spawn_attach, spawn_launch};
+use crate::jdb::process::{
+    AttachConfig, JdbProcess, LaunchConfig, normalize_attach_host, spawn_attach, spawn_launch,
+};
 use crate::jdb::reader::{DetectedEvent, PromptReader, ReadMode, ReadOutcome};
 use crate::protocol::*;
 
-/// 普通命令默认超时。
+/// Default timeout for normal commands.
 const TIMEOUT_NORMAL: Duration = Duration::from_secs(15);
-/// 阻塞命令（run/cont/step…）默认超时。
+/// Default timeout for blocking commands (run/cont/step...).
 const TIMEOUT_BLOCKING: Duration = Duration::from_secs(30);
 
-// ─── 会话元信息（不变）──────────────────────────────────────────────────────────
+// ─── Session Metadata (Immutable) ──────────────────────────────────────────────
 
-/// 会话的不变元信息。
+/// Immutable metadata for a session.
 #[derive(Debug, Clone)]
 pub struct SessionMeta {
     pub id: String,
@@ -37,13 +39,13 @@ pub struct SessionMeta {
     pub mode: SessionMode,
     pub target: String,
     pub jdb_pid: u32,
-    /// 创建时间戳（后续阶段接 `jiff`，本阶段留 None）。
+    /// Creation timestamp. Later phases wire this to `jiff`; this phase leaves it as None.
     pub created_at: Option<String>,
 }
 
-// ─── 命令执行特性 ────────────────────────────────────────────────────────────────
+// ─── Command Execution Traits ─────────────────────────────────────────────────
 
-/// 描述一条 jdb 命令如何执行：读取模式、解析提示、超时。
+/// Describes how a jdb command executes: read mode, parser hint, and timeout.
 #[derive(Debug, Clone, Copy)]
 pub struct CommandKind {
     pub mode: ReadMode,
@@ -52,23 +54,31 @@ pub struct CommandKind {
 }
 
 impl CommandKind {
-    /// 普通命令（locals/where/print…）：任何 prompt 即完成，小超时。
+    /// Normal command (locals/where/print...): any prompt completes it; short timeout.
     pub fn normal(hint: CommandHint) -> Self {
-        Self { mode: ReadMode::Normal, hint, timeout: TIMEOUT_NORMAL }
+        Self {
+            mode: ReadMode::Normal,
+            hint,
+            timeout: TIMEOUT_NORMAL,
+        }
     }
 
-    /// 阻塞命令（run/cont/step/next/step-out）：等事件 / thread-prompt / VM 退出，大超时。
+    /// Blocking command (run/cont/step/next/step-out): wait for event / thread-prompt / VM exit; long timeout.
     pub fn blocking(hint: CommandHint) -> Self {
-        Self { mode: ReadMode::Blocking, hint, timeout: TIMEOUT_BLOCKING }
+        Self {
+            mode: ReadMode::Blocking,
+            hint,
+            timeout: TIMEOUT_BLOCKING,
+        }
     }
 
-    /// 覆盖超时（对应 CLI 的 `--timeout`）。
+    /// Timeout override matching CLI `--timeout`.
     pub fn with_timeout(mut self, timeout: Duration) -> Self {
         self.timeout = timeout;
         self
     }
 
-    /// 按可选秒值覆盖超时；None 保持默认。
+    /// Override timeout with an optional seconds value; None keeps the default.
     pub fn with_timeout_secs(self, secs: Option<u64>) -> Self {
         match secs {
             Some(s) => self.with_timeout(Duration::from_secs(s)),
@@ -79,20 +89,20 @@ impl CommandKind {
 
 // ─── Session ────────────────────────────────────────────────────────────────────
 
-/// 一个后台调试会话：一个 jdb 子进程 + 一个被调试的 JVM。
+/// One background debug session: one jdb child process plus one debugged JVM.
 pub struct Session {
     pub meta: SessionMeta,
     inner: Mutex<SessionInner>,
-    /// stderr drain 线程累积的内容（每次 execute 后取出作为 side band）。
+    /// Content accumulated by the stderr drain thread, taken after each execute as a side band.
     stderr: Arc<Mutex<String>>,
     _stderr_handle: JoinHandle<()>,
-    /// 最近一次 `break_at` 的目标（class, line），用于命中时比对行号偏差。
+    /// Most recent `break_at` target (class, line), used to compare hit-line drift.
     last_break_target: Mutex<Option<(String, u32)>>,
-    /// 活跃的条件断点：key = "Class:line" 或 "Class.method"，value = condition expr。
+    /// Active conditional breakpoints: key = "Class:line" or "Class.method", value = condition expr.
     conditions: Mutex<Vec<(String, String)>>,
 }
 
-/// 受命令锁保护的可变状态。
+/// Mutable state protected by the command lock.
 struct SessionInner {
     process: JdbProcess,
     reader: PromptReader,
@@ -101,7 +111,7 @@ struct SessionInner {
 }
 
 impl Session {
-    /// 以 launch 模式启动会话：spawn jdb、起读取线程、读掉初始 prompt，状态 `Loaded`。
+    /// Start a launch-mode session: spawn jdb, start reader threads, consume the initial prompt, state `Loaded`.
     pub fn launch(
         jdb_path: &std::path::Path,
         config: &LaunchConfig,
@@ -113,7 +123,7 @@ impl Session {
         let mut reader = PromptReader::new(spawned.stdout);
         let (stderr, stderr_handle) = spawn_stderr_drain(spawned.stderr);
 
-        // launch 后 jdb 立刻输出一个初始 `> ` prompt（VM 尚未启动）。
+        // After launch, jdb immediately prints an initial `> ` prompt before the VM has started.
         let _ = reader.read_until_prompt(TIMEOUT_NORMAL, ReadMode::Normal);
 
         let inner = SessionInner {
@@ -140,27 +150,28 @@ impl Session {
         })
     }
 
-    /// 以 attach 模式连接已运行的 JVM：spawn `jdb -attach`、起读取线程、读掉连接握手输出。
+    /// Connect to a running JVM in attach mode: spawn attach-mode jdb, start reader threads, consume handshake output.
     ///
-    /// 初始状态设为 `Suspended`：DESIGN §10 推荐目标 JVM 用 `suspend=y` 启动，
-    /// attach 后线程处于挂起、调试器掌控（典型流程：attach → 断点 → cont）。
-    /// attach 模式没有 `run`（VM 已在运行），见 [`Session::run`]。
+    /// Initial state is `Suspended`: DESIGN §10 recommends starting the target JVM with `suspend=y`, so after
+    /// attach the threads are suspended and debugger-controlled (typical flow: attach → breakpoints → cont).
+    /// Attach mode has no `run` because the VM is already running; see [`Session::run`].
     pub fn attach(
         jdb_path: &std::path::Path,
         config: &AttachConfig,
         id: String,
         name: Option<String>,
     ) -> Result<Session> {
-        // localhost 在双栈机器上常被解析到 IPv6 `::1`，而 JDWP 默认（`address=5005` / `*:5005`）
-        // 多数只在 IPv4 `0.0.0.0` 监听 → probe_tcp 与 jdb SocketAttach 都会连 `::1` 被拒。
-        // 入口处一次性规范化为 127.0.0.1，使探测、spawn、meta.target 全部用真实可达地址。
+        // On dual-stack machines, localhost often resolves to IPv6 `::1`, while JDWP defaults
+        // (`address=5005` / `*:5005`) usually listen only on IPv4 `0.0.0.0`. Then probe_tcp and jdb
+        // SocketAttach both connect to `::1` and get refused. Normalize once at the entry point to
+        // 127.0.0.1 so probing, spawn, and meta.target all use the reachable address.
         let normalized = AttachConfig {
             host: normalize_attach_host(&config.host),
             ..config.clone()
         };
         let config = &normalized;
 
-        // TCP 探测：快速检查端口可达性，避免 jdb 长时间挂起后才报晦涩错误。
+        // TCP probe: quickly check port reachability so jdb does not hang for a long time and report a vague error.
         probe_tcp(&config.host, config.port)?;
 
         let spawned = spawn_attach(jdb_path, config)?;
@@ -169,10 +180,10 @@ impl Session {
         let mut reader = PromptReader::new(spawned.stdout);
         let (stderr, stderr_handle) = spawn_stderr_drain(spawned.stderr);
 
-        // attach 握手：jdb 连上 JVM 后输出初始化信息并给出 prompt。
+        // Attach handshake: after jdb connects to the JVM, it prints initialization info and a prompt.
         let outcome = reader.read_until_prompt(TIMEOUT_NORMAL, ReadMode::Normal);
-        // 连接失败：jdb 报致命错误（stdout）或把错误写到 stderr 后直接退出（→ Eof）。
-        // 两种都杀掉 jdb 并报错，避免悬挂子进程。
+        // Connection failure: jdb either reports a fatal error on stdout or writes to stderr and exits (→ Eof).
+        // In both cases, kill jdb and return an error to avoid a dangling child process.
         match outcome {
             ReadOutcome::Fatal { message } => {
                 let _ = process.kill();
@@ -182,13 +193,17 @@ impl Session {
                 let _ = process.kill();
                 let detail = drain_buf(&stderr)
                     .unwrap_or_else(|| "jdb exited during attach handshake".into());
-                return Err(Error::Connection(format!("attach failed: {}", detail.trim())));
+                return Err(Error::Connection(format!(
+                    "attach failed: {}",
+                    detail.trim()
+                )));
             }
             _ => {}
         }
 
-        // attach 到 suspend=y 的 VM 后，jdb 会异步追加 `VM Started` 事件 banner + 额外 prompt。
-        // 排空这些待处理输出，否则后续命令会读到上一个 prompt 的滞后内容（attach 特有的双 prompt）。
+        // After attaching to a suspend=y VM, jdb asynchronously appends a `VM Started` event banner plus an
+        // extra prompt. Drain these pending bytes or later commands will read stale output from the previous
+        // prompt, an attach-specific double-prompt behavior.
         for _ in 0..3 {
             match reader.read_until_prompt(Duration::from_millis(800), ReadMode::Normal) {
                 ReadOutcome::Prompt { .. } => continue,
@@ -220,13 +235,13 @@ impl Session {
         })
     }
 
-    /// 执行一条原始 jdb 命令并映射为结构化响应。
+    /// Execute one raw jdb command and map it into a structured response.
     ///
-    /// 持有命令锁直到读到 prompt——保证每会话同时只有一条命令在飞（§5）。
+    /// Hold the command lock until the prompt is read, ensuring only one command per session is in flight (§5).
     pub fn execute(&self, raw: &str, kind: CommandKind) -> Result<CommandResponse> {
         let mut inner = self.inner.lock().expect("session mutex poisoned");
 
-        // 已终止的会话拒绝新命令。
+        // Reject new commands for terminated sessions.
         if matches!(inner.state, RunState::Exited | RunState::Dead) {
             return Err(Error::SessionDead(format!(
                 "session {} is {:?}",
@@ -234,11 +249,11 @@ impl Session {
             )));
         }
 
-        // Normal 命令发出前，清掉 channel 里可能残留的 stale bare-prompt 或迟到字节。
-        // purge_pending 是 try_recv（非阻塞），无论当前 state 如何都应执行：
-        // - Suspended: 上一条 blocking 命令遗留的迟到 bare-prompt `> `
-        // - Running: timeout 后 channel 中迟到的事件 banner / prompt
-        // Blocking 命令不 purge，因为它需要读到后续的事件 banner。
+        // Before Normal commands, clear possible stale bare-prompts or late bytes from the channel.
+        // purge_pending uses try_recv (non-blocking) and must run regardless of current state:
+        // - Suspended: late bare-prompt `> ` left by the previous blocking command
+        // - Running: late event banner / prompt after timeout
+        // Blocking commands do not purge because they need to read subsequent event banners.
         if kind.mode == ReadMode::Normal {
             inner.reader.purge_pending();
         }
@@ -246,15 +261,15 @@ impl Session {
         inner.process.write_command(raw)?;
         let outcome = inner.reader.read_until_prompt(kind.timeout, kind.mode);
 
-        // jdb 致命错误 → 失败（会话标记 Dead）。
+        // jdb fatal error: fail and mark the session Dead.
         if let ReadOutcome::Fatal { message } = &outcome {
             inner.state = RunState::Dead;
             return Err(Error::Connection(message.clone()));
         }
 
-        // Blocking 命令命中事件（断点/异常/单步）后，jdb 可能在 reader 匹配 prompt 之后的极短
-        // 窗口里继续 flush 尾部输出（源码行、追加 prompt 等）。排空这些残留，否则下一条命令会
-        // 读到错位的滞后内容（attach+suspend=n 高并发场景下尤其明显）。
+        // After a Blocking command hits an event (breakpoint/exception/step), jdb may keep flushing tail output
+        // for a tiny window after the reader matched the prompt (source lines, extra prompt, etc.). Drain that
+        // residue or the next command may read misaligned stale content, especially in attach+suspend=n cases.
         if kind.mode == ReadMode::Blocking
             && matches!(&outcome, ReadOutcome::Prompt { event: Some(_), .. })
         {
@@ -264,8 +279,8 @@ impl Session {
         let stderr = self.take_stderr();
         let mut response = inner.map_outcome(outcome, kind.hint, stderr);
 
-        // PartialStop 补全：截断 banner（SUSPEND_THREAD）命中后 thread/location 全未知，
-        // 在同一锁内用 threads→thread<id>→where 自动填充。
+        // PartialStop enrichment: after a truncated SUSPEND_THREAD banner, thread/location are unknown.
+        // Fill them under the same lock via threads→thread<id>→where.
         if is_partial_stopped(&response) {
             enrich_partial_stop_inner(&mut inner, &mut response);
         }
@@ -273,12 +288,12 @@ impl Session {
         Ok(response)
     }
 
-    /// 当前运行状态。
+    /// Current run state.
     pub fn state(&self) -> RunState {
         self.inner.lock().expect("session mutex poisoned").state
     }
 
-    /// 会话状态报告（不向 jdb 发命令）。
+    /// Session status report without sending a command to jdb.
     pub fn status(&self) -> CommandResult {
         let mut inner = self.inner.lock().expect("session mutex poisoned");
         let jdb_alive = inner.process.is_alive();
@@ -290,13 +305,13 @@ impl Session {
         }
     }
 
-    /// 结束会话：先 resume（确保 VM 不卡在 SUSPEND_ALL）、发 `quit`、等 jdb 退出、标记 `Dead`。
+    /// End the session: resume first so the VM is not stuck in SUSPEND_ALL, send `quit`, wait for jdb exit, mark `Dead`.
     pub fn kill(&self) -> Result<()> {
         let mut inner = self.inner.lock().expect("session mutex poisoned");
-        // resume 确保 VM 所有线程恢复执行——否则 jdb detach 后 VM 永久卡死。
+        // resume ensures all VM threads resume; otherwise the VM can remain stuck forever after jdb detaches.
         let _ = inner.process.write_command("resume");
         let _ = inner.process.write_command("quit");
-        // 给 jdb 短暂的时间处理 resume+quit 并正常退出，之后再强杀兜底。
+        // Give jdb a short window to process resume+quit and exit normally, then force-kill as fallback.
         for _ in 0..10 {
             std::thread::sleep(std::time::Duration::from_millis(50));
             if !inner.process.is_alive() {
@@ -308,7 +323,7 @@ impl Session {
         Ok(())
     }
 
-    /// 取出 stderr drain 累积的内容并清空。
+    /// Take and clear content accumulated by the stderr drain.
     fn take_stderr(&self) -> Option<String> {
         let mut s = self.stderr.lock().expect("stderr mutex poisoned");
         if s.is_empty() {
@@ -318,106 +333,164 @@ impl Session {
         }
     }
 
-    /// 记录最近一次 `break_at` 的目标，供命中时比对行号偏差。
+    /// Record the latest `break_at` target for hit-line drift comparison.
     pub fn record_break_target(&self, class: &str, line: u32) {
-        *self.last_break_target.lock().expect("break_target mutex poisoned") =
-            Some((class.to_string(), line));
+        *self
+            .last_break_target
+            .lock()
+            .expect("break_target mutex poisoned") = Some((class.to_string(), line));
     }
 
-    /// 取出并清空最近的 break target（one-shot 消费）。
+    /// Take and clear the latest break target as a one-shot value.
     pub fn take_break_target(&self) -> Option<(String, u32)> {
-        self.last_break_target.lock().expect("break_target mutex poisoned").take()
+        self.last_break_target
+            .lock()
+            .expect("break_target mutex poisoned")
+            .take()
     }
 
-    /// 注册条件断点：命中 spec 时只有 condition 为 true 才真正停下。
+    /// Register a conditional breakpoint: when the spec is hit, stop only if condition evaluates true.
     pub fn add_condition(&self, spec: &str, condition: &str) {
         let mut conds = self.conditions.lock().expect("conditions mutex poisoned");
         conds.retain(|(s, _)| s != spec);
         conds.push((spec.to_string(), condition.to_string()));
     }
 
-    /// 查询 spec 对应的条件表达式。
+    /// Look up the condition expression for a spec.
     pub fn get_condition(&self, spec: &str) -> Option<String> {
-        self.conditions.lock().expect("conditions mutex poisoned")
+        self.conditions
+            .lock()
+            .expect("conditions mutex poisoned")
             .iter()
             .find(|(s, _)| s == spec)
             .map(|(_, c)| c.clone())
     }
 
-    // ── 语义便捷方法（封装 jdb 命令字符串，§7 命令面）──────────────────────────
+    // ── Semantic Convenience Methods (wrap jdb command strings, §7 CLI surface) ─
 
-    /// `stop at Class:line`；`suspend == Some("thread")` 时改用 `stop thread at`
-    /// （jdb 原生 SUSPEND_THREAD policy：命中时只挂起触发线程，VM 其余线程继续运行）。
-    pub fn stop_at(&self, class: &str, line: u32, suspend: Option<&str>, timeout: Option<u64>) -> Result<CommandResponse> {
-        // 条件断点由 handler 层实现（命中时 eval + 自动 cont），不依赖 jdb 的 if 语法（JDK 8 不支持）。
+    /// `stop at Class:line`; when `suspend == Some("thread")`, use `stop thread at` instead.
+    /// Native jdb SUSPEND_THREAD policy suspends only the triggering thread while the rest of the VM keeps running.
+    pub fn stop_at(
+        &self,
+        class: &str,
+        line: u32,
+        suspend: Option<&str>,
+        timeout: Option<u64>,
+    ) -> Result<CommandResponse> {
+        // Conditional breakpoints are implemented in handler (eval on hit + auto-cont), not with jdb `if` syntax,
+        // which JDK 8 does not support.
         let cmd = if suspend == Some("thread") {
             format!("stop thread at {class}:{line}")
         } else {
             format!("stop at {class}:{line}")
         };
-        self.execute(&cmd, CommandKind::normal(CommandHint::BreakpointSet).with_timeout_secs(timeout))
+        self.execute(
+            &cmd,
+            CommandKind::normal(CommandHint::BreakpointSet).with_timeout_secs(timeout),
+        )
     }
 
-    /// `stop in Class.method`（可选签名以区分重载）；`suspend == Some("thread")` 时
-    /// 改用 `stop thread in`（SUSPEND_THREAD policy：命中时只挂起触发线程）。
-    pub fn stop_in(&self, class: &str, method: &str, args: Option<&str>, suspend: Option<&str>, timeout: Option<u64>) -> Result<CommandResponse> {
-        // 条件断点由 handler 层实现。
-        let kw = if suspend == Some("thread") { "stop thread in" } else { "stop in" };
+    /// `stop in Class.method` with optional signature to disambiguate overloads. When `suspend == Some("thread")`,
+    /// use `stop thread in` (SUSPEND_THREAD policy suspends only the triggering thread).
+    pub fn stop_in(
+        &self,
+        class: &str,
+        method: &str,
+        args: Option<&str>,
+        suspend: Option<&str>,
+        timeout: Option<u64>,
+    ) -> Result<CommandResponse> {
+        // Conditional breakpoints are implemented in the handler layer.
+        let kw = if suspend == Some("thread") {
+            "stop thread in"
+        } else {
+            "stop in"
+        };
         let spec = match args {
             Some(a) => format!("{kw} {class}.{method}({a})"),
             None => format!("{kw} {class}.{method}"),
         };
-        self.execute(&spec, CommandKind::normal(CommandHint::BreakpointSet).with_timeout_secs(timeout))
+        self.execute(
+            &spec,
+            CommandKind::normal(CommandHint::BreakpointSet).with_timeout_secs(timeout),
+        )
     }
 
-    /// `run`（仅 launch 模式）
+    /// `run`, launch mode only.
     pub fn run(&self, timeout: Option<u64>) -> Result<CommandResponse> {
         if self.meta.mode == SessionMode::Attach {
             return Err(Error::SessionDead(
                 "`run` is launch-mode only; an attached JVM is already running (use `cont`)".into(),
             ));
         }
-        self.execute("run", CommandKind::blocking(CommandHint::Run).with_timeout_secs(timeout))
+        self.execute(
+            "run",
+            CommandKind::blocking(CommandHint::Run).with_timeout_secs(timeout),
+        )
     }
 
     /// `cont`
     pub fn cont(&self, timeout: Option<u64>) -> Result<CommandResponse> {
-        self.execute("cont", CommandKind::blocking(CommandHint::Cont).with_timeout_secs(timeout))
+        self.execute(
+            "cont",
+            CommandKind::blocking(CommandHint::Cont).with_timeout_secs(timeout),
+        )
     }
 
     /// `step`（step into）
     pub fn step(&self, timeout: Option<u64>) -> Result<CommandResponse> {
-        self.execute("step", CommandKind::blocking(CommandHint::Step).with_timeout_secs(timeout))
+        self.execute(
+            "step",
+            CommandKind::blocking(CommandHint::Step).with_timeout_secs(timeout),
+        )
     }
 
     /// `next`（step over）
     pub fn next(&self, timeout: Option<u64>) -> Result<CommandResponse> {
-        self.execute("next", CommandKind::blocking(CommandHint::Next).with_timeout_secs(timeout))
+        self.execute(
+            "next",
+            CommandKind::blocking(CommandHint::Next).with_timeout_secs(timeout),
+        )
     }
 
     /// `step up`（run until method returns）
     pub fn step_out(&self, timeout: Option<u64>) -> Result<CommandResponse> {
-        self.execute("step up", CommandKind::blocking(CommandHint::StepOut).with_timeout_secs(timeout))
+        self.execute(
+            "step up",
+            CommandKind::blocking(CommandHint::StepOut).with_timeout_secs(timeout),
+        )
     }
 
     /// `where`
     pub fn stack(&self, timeout: Option<u64>) -> Result<CommandResponse> {
-        self.execute("where", CommandKind::normal(CommandHint::Where).with_timeout_secs(timeout))
+        self.execute(
+            "where",
+            CommandKind::normal(CommandHint::Where).with_timeout_secs(timeout),
+        )
     }
 
     /// `locals`
     pub fn locals(&self, timeout: Option<u64>) -> Result<CommandResponse> {
-        self.execute("locals", CommandKind::normal(CommandHint::Locals).with_timeout_secs(timeout))
+        self.execute(
+            "locals",
+            CommandKind::normal(CommandHint::Locals).with_timeout_secs(timeout),
+        )
     }
 
     /// `print <expr>`
     pub fn print(&self, expr: &str, timeout: Option<u64>) -> Result<CommandResponse> {
-        self.execute(&format!("print {expr}"), CommandKind::normal(CommandHint::Print).with_timeout_secs(timeout))
+        self.execute(
+            &format!("print {expr}"),
+            CommandKind::normal(CommandHint::Print).with_timeout_secs(timeout),
+        )
     }
 
     /// `threads`
     pub fn threads(&self, timeout: Option<u64>) -> Result<CommandResponse> {
-        self.execute("threads", CommandKind::normal(CommandHint::Threads).with_timeout_secs(timeout))
+        self.execute(
+            "threads",
+            CommandKind::normal(CommandHint::Threads).with_timeout_secs(timeout),
+        )
     }
 
     /// `list [line]`
@@ -426,30 +499,39 @@ impl Session {
             Some(l) => format!("list {l}"),
             None => "list".to_string(),
         };
-        self.execute(&cmd, CommandKind::normal(CommandHint::ListSource).with_timeout_secs(timeout))
+        self.execute(
+            &cmd,
+            CommandKind::normal(CommandHint::ListSource).with_timeout_secs(timeout),
+        )
     }
 
-    /// 透传任意 jdb 命令（escape hatch）。
+    /// Pass through any jdb command as an escape hatch.
     pub fn raw(&self, cmd: &str, timeout: Option<u64>) -> Result<CommandResponse> {
-        self.execute(cmd, CommandKind::normal(CommandHint::Other).with_timeout_secs(timeout))
+        self.execute(
+            cmd,
+            CommandKind::normal(CommandHint::Other).with_timeout_secs(timeout),
+        )
     }
 }
 
 impl SessionInner {
-    /// 在持锁状态下发一条普通（Normal 模式）jdb 命令并返回其 prompt 之前的原始输出文本。
-    /// 仅用于 PartialStop 补全（threads/thread/where）——不推进状态机、不做 classify。
-    /// 任何非 Prompt 结局（超时/EOF/VM退出/致命）都返回 None，由调用方写 WARNING 兜底。
+    /// Send one Normal-mode jdb command while holding the lock and return raw output before the prompt.
+    /// Used only for PartialStop enrichment (threads/thread/where); does not advance state or classify.
+    /// Any non-Prompt outcome (timeout/EOF/VM exit/fatal) returns None, and the caller writes a WARNING fallback.
     fn run_query(&mut self, raw: &str) -> Option<String> {
         if self.process.write_command(raw).is_err() {
             return None;
         }
-        match self.reader.read_until_prompt(Duration::from_secs(5), ReadMode::Normal) {
+        match self
+            .reader
+            .read_until_prompt(Duration::from_secs(5), ReadMode::Normal)
+        {
             ReadOutcome::Prompt { output, .. } => Some(output),
             _ => None,
         }
     }
 
-    /// 把 reader 的 `ReadOutcome` 映射为 `CommandResponse`，并推进状态机。
+    /// Map the reader's `ReadOutcome` into `CommandResponse` and advance the state machine.
     fn map_outcome(
         &mut self,
         outcome: ReadOutcome,
@@ -458,75 +540,133 @@ impl SessionInner {
     ) -> CommandResponse {
         let (result, note) = match outcome {
             ReadOutcome::Prompt { output, event } => match event {
-                // 事件（断点/单步/异常）→ Suspended，产出 Stopped/ExceptionCaught。
+                // Event (breakpoint/step/exception): Suspended, yielding Stopped/ExceptionCaught.
                 Some(ev) => {
                     let (result, evt) = event_to_result(ev);
                     self.state = RunState::Suspended;
                     self.last_event = Some(evt);
                     (result, None)
                 }
-                // 普通命令 → 用 parser 分类，状态不变。
+                // Normal command: classify with parser, state unchanged.
                 None => classify_output(&output, hint),
             },
             ReadOutcome::VmExit { output } => {
                 self.state = RunState::Exited;
                 self.last_event = Some(Event::VmExit);
                 (
-                    CommandResult::VmExited { exit_code: None, tail: Some(output) },
+                    CommandResult::VmExited {
+                        exit_code: None,
+                        tail: Some(output),
+                    },
                     None,
                 )
             }
             ReadOutcome::Timeout { partial } => {
-                // 应用可能死锁/长循环——非破坏性，保留会话存活并标 Running（§5）。
+                // The app may be deadlocked or in a long loop. Non-destructive: keep session alive and mark Running (§5).
                 self.state = RunState::Running;
                 (
-                    CommandResult::Timeout { partial_output: partial, state: RunState::Running },
+                    CommandResult::Timeout {
+                        partial_output: partial,
+                        state: RunState::Running,
+                    },
                     None,
                 )
             }
             ReadOutcome::Eof { output } => {
                 self.state = RunState::Dead;
                 (
-                    CommandResult::VmExited { exit_code: None, tail: Some(output) },
+                    CommandResult::VmExited {
+                        exit_code: None,
+                        tail: Some(output),
+                    },
                     None,
                 )
             }
-            // Fatal 已在 execute 中拦截转为 Err，这里兜底。
+            // Fatal is intercepted in execute and turned into Err; this is a fallback.
             ReadOutcome::Fatal { message } => {
                 self.state = RunState::Dead;
                 (CommandResult::Raw { text: message }, None)
             }
         };
-        CommandResponse { result, stderr, note }
+        CommandResponse {
+            result,
+            stderr,
+            note,
+        }
     }
 }
 
-/// 把 reader 的 `DetectedEvent` 转为 `CommandResult` + 记录用的 `Event`。
+/// Convert reader `DetectedEvent` into `CommandResult` plus the recorded `Event`.
 fn event_to_result(ev: DetectedEvent) -> (CommandResult, Event) {
     match ev {
-        DetectedEvent::Breakpoint { thread, class, method, line } => {
-            let loc = Location { class, method, file: None, line };
-            let event = Event::Breakpoint { location: loc.clone(), thread: thread.clone() };
+        DetectedEvent::Breakpoint {
+            thread,
+            class,
+            method,
+            line,
+        } => {
+            let loc = Location {
+                class,
+                method,
+                file: None,
+                line,
+            };
+            let event = Event::Breakpoint {
+                location: loc.clone(),
+                thread: thread.clone(),
+            };
             (
                 CommandResult::Stopped {
-                    event: event.clone(), location: loc, thread, thread_id: None, frame: None, source_context: None,
+                    event: event.clone(),
+                    location: loc,
+                    thread,
+                    thread_id: None,
+                    frame: None,
+                    source_context: None,
                 },
                 event,
             )
         }
-        DetectedEvent::Step { thread, class, method, line } => {
-            let loc = Location { class, method, file: None, line };
-            let event = Event::Step { location: loc.clone(), thread: thread.clone() };
+        DetectedEvent::Step {
+            thread,
+            class,
+            method,
+            line,
+        } => {
+            let loc = Location {
+                class,
+                method,
+                file: None,
+                line,
+            };
+            let event = Event::Step {
+                location: loc.clone(),
+                thread: thread.clone(),
+            };
             (
                 CommandResult::Stopped {
-                    event: event.clone(), location: loc, thread, thread_id: None, frame: None, source_context: None,
+                    event: event.clone(),
+                    location: loc,
+                    thread,
+                    thread_id: None,
+                    frame: None,
+                    source_context: None,
                 },
                 event,
             )
         }
-        DetectedEvent::Exception { thread, exception, caught } => {
-            // 异常 banner 不含位置；后续可由 `where` 补全。这里用空 location 占位。
-            let loc = Location { class: String::new(), method: String::new(), file: None, line: 0 };
+        DetectedEvent::Exception {
+            thread,
+            exception,
+            caught,
+        } => {
+            // Exception banners do not include location; `where` may fill it later. Use an empty placeholder here.
+            let loc = Location {
+                class: String::new(),
+                method: String::new(),
+                file: None,
+                line: 0,
+            };
             let event = Event::Exception {
                 exception: exception.clone(),
                 caught,
@@ -534,12 +674,30 @@ fn event_to_result(ev: DetectedEvent) -> (CommandResult, Event) {
                 thread: thread.clone(),
             };
             (
-                CommandResult::ExceptionCaught { exception, caught, location: loc, thread, thread_id: None },
+                CommandResult::ExceptionCaught {
+                    exception,
+                    caught,
+                    location: loc,
+                    thread,
+                    thread_id: None,
+                },
                 event,
             )
         }
-        DetectedEvent::FieldWatch { thread, field, access_type, class, method, line } => {
-            let loc = Location { class: class.clone(), method: method.clone(), file: None, line };
+        DetectedEvent::FieldWatch {
+            thread,
+            field,
+            access_type,
+            class,
+            method,
+            line,
+        } => {
+            let loc = Location {
+                class: class.clone(),
+                method: method.clone(),
+                file: None,
+                line,
+            };
             let event = Event::FieldWatch {
                 field: field.clone(),
                 access_type: access_type.clone(),
@@ -547,23 +705,44 @@ fn event_to_result(ev: DetectedEvent) -> (CommandResult, Event) {
             };
             (
                 CommandResult::Stopped {
-                    event: event.clone(), location: loc, thread, thread_id: None, frame: None, source_context: None,
+                    event: event.clone(),
+                    location: loc,
+                    thread,
+                    thread_id: None,
+                    frame: None,
+                    source_context: None,
                 },
                 event,
             )
         }
-        // JDK 8 SUSPEND_THREAD 截断 banner：thread/location 全未知，先用空占位，
-        // 由 `enrich_partial_stop`（threads→thread<id>→where）补全。
+        // JDK 8 SUSPEND_THREAD truncated banner: thread/location are unknown, so start with empty placeholders.
+        // `enrich_partial_stop` fills them through threads→thread<id>→where.
         DetectedEvent::PartialStop { is_step } => {
-            let loc = Location { class: String::new(), method: String::new(), file: None, line: 0 };
+            let loc = Location {
+                class: String::new(),
+                method: String::new(),
+                file: None,
+                line: 0,
+            };
             let event = if is_step {
-                Event::Step { location: loc.clone(), thread: String::new() }
+                Event::Step {
+                    location: loc.clone(),
+                    thread: String::new(),
+                }
             } else {
-                Event::Breakpoint { location: loc.clone(), thread: String::new() }
+                Event::Breakpoint {
+                    location: loc.clone(),
+                    thread: String::new(),
+                }
             };
             (
                 CommandResult::Stopped {
-                    event: event.clone(), location: loc, thread: String::new(), thread_id: None, frame: None, source_context: None,
+                    event: event.clone(),
+                    location: loc,
+                    thread: String::new(),
+                    thread_id: None,
+                    frame: None,
+                    source_context: None,
                 },
                 event,
             )
@@ -571,7 +750,7 @@ fn event_to_result(ev: DetectedEvent) -> (CommandResult, Event) {
     }
 }
 
-/// PartialStop 标志：thread 与 location 全空的 `Stopped`（截断 banner 经 `event_to_result` 后的形态）。
+/// PartialStop marker: a `Stopped` whose thread and location are empty after `event_to_result` handles a truncated banner.
 fn is_partial_stopped(resp: &CommandResponse) -> bool {
     matches!(
         &resp.result,
@@ -580,7 +759,7 @@ fn is_partial_stopped(resp: &CommandResponse) -> bool {
     )
 }
 
-/// 把 WARNING 追加到 response 的 note（与 handler 层 `append_note` 同语义：绝不静默 fallback）。
+/// Append a WARNING to response.note, matching handler-layer `append_note` semantics: never silently fallback.
 fn append_warning(resp: &mut CommandResponse, msg: &str) {
     match &mut resp.note {
         Some(existing) => {
@@ -591,42 +770,61 @@ fn append_warning(resp: &mut CommandResponse, msg: &str) {
     }
 }
 
-/// 补全 PartialStop（JDK 8 SUSPEND_THREAD 截断 banner）的 thread/location：
-/// `threads`（找 `(at breakpoint)` 线程）→ `thread <id>`（切当前线程）→ `where`（取栈顶帧）。
-/// 在持有命令锁的 `SessionInner` 上执行（与命中是同一次 execute）。失败任一步即写 WARNING 并保留空字段。
+/// Enrich PartialStop (JDK 8 SUSPEND_THREAD truncated banner) with thread/location:
+/// `threads` (find `(at breakpoint)` thread) → `thread <id>` (select current thread) → `where` (top frame).
+/// Runs on `SessionInner` while the command lock is held, during the same execute as the hit. Any failure writes
+/// a WARNING and leaves empty fields in place.
 fn enrich_partial_stop_inner(inner: &mut SessionInner, resp: &mut CommandResponse) {
-    // 1. threads → 找命中线程（state 含 "at breakpoint"）。
+    // 1. threads: find the hit thread whose state contains "at breakpoint".
     let Some(threads_out) = inner.run_query("threads") else {
-        append_warning(resp, "WARNING: thread breakpoint hit, but `threads` query failed; thread/location unknown. Run `threads` manually.");
+        append_warning(
+            resp,
+            "WARNING: thread breakpoint hit, but `threads` query failed; thread/location unknown. Run `threads` manually.",
+        );
         return;
     };
     let hit = match parse_threads(&threads_out) {
-        CommandResult::Threads { threads } => {
-            threads.into_iter().find(|t| t.state.contains("at breakpoint"))
-        }
+        CommandResult::Threads { threads } => threads
+            .into_iter()
+            .find(|t| t.state.contains("at breakpoint")),
         _ => None,
     };
     let Some(hit) = hit else {
-        append_warning(resp, "WARNING: thread breakpoint hit, but no thread is marked `(at breakpoint)` in `threads` output; location unknown.");
+        append_warning(
+            resp,
+            "WARNING: thread breakpoint hit, but no thread is marked `(at breakpoint)` in `threads` output; location unknown.",
+        );
         return;
     };
 
-    // 回填线程名 + id（即便 where 失败也能给出触发线程及其 id，供 `thread <id>` 切换）。
-    if let CommandResult::Stopped { thread, thread_id, event, .. } = &mut resp.result {
+    // Backfill thread name + id, so even if where fails the triggering thread and id are available for `thread <id>`.
+    if let CommandResult::Stopped {
+        thread,
+        thread_id,
+        event,
+        ..
+    } = &mut resp.result
+    {
         *thread = hit.name.clone();
         *thread_id = Some(hit.id.clone());
         set_event_thread(event, &hit.name);
     }
 
-    // 2. thread <id> → 切到命中线程（否则 where 报 "No thread specified."）。
+    // 2. thread <id>: switch to the hit thread, otherwise where reports "No thread specified."
     if inner.run_query(&format!("thread {}", hit.id)).is_none() {
-        append_warning(resp, "WARNING: failed to select the hit thread (`thread <id>`); location unknown.");
+        append_warning(
+            resp,
+            "WARNING: failed to select the hit thread (`thread <id>`); location unknown.",
+        );
         return;
     }
 
-    // 3. where → 栈顶帧给出 class/method/file/line。
+    // 3. where: top frame gives class/method/file/line.
     let Some(where_out) = inner.run_query("where") else {
-        append_warning(resp, "WARNING: `where` query failed after selecting the hit thread; location unknown.");
+        append_warning(
+            resp,
+            "WARNING: `where` query failed after selecting the hit thread; location unknown.",
+        );
         return;
     };
     let top = match parse_where(&where_out) {
@@ -634,19 +832,28 @@ fn enrich_partial_stop_inner(inner: &mut SessionInner, resp: &mut CommandRespons
         _ => None,
     };
     let Some(top) = top else {
-        append_warning(resp, "WARNING: could not parse the hit thread's stack (`where`); location unknown.");
+        append_warning(
+            resp,
+            "WARNING: could not parse the hit thread's stack (`where`); location unknown.",
+        );
         return;
     };
 
-    // 回填 location + frame（frame 直接复用，省得 handler 的 enrich_stopped 再查一次 where）。
-    if let CommandResult::Stopped { location, frame, event, .. } = &mut resp.result {
+    // Backfill location + frame. Reuse the frame so handler enrich_stopped does not need another where query.
+    if let CommandResult::Stopped {
+        location,
+        frame,
+        event,
+        ..
+    } = &mut resp.result
+    {
         *location = top.location.clone();
         set_event_location(event, &top.location);
         *frame = Some(top);
     }
 }
 
-/// 把补全到的线程名写回事件（Breakpoint/Step 的 thread 字段）。
+/// Write the enriched thread name back into the event (Breakpoint/Step thread field).
 fn set_event_thread(event: &mut Event, thread: &str) {
     match event {
         Event::Breakpoint { thread: t, .. } | Event::Step { thread: t, .. } => {
@@ -656,7 +863,7 @@ fn set_event_thread(event: &mut Event, thread: &str) {
     }
 }
 
-/// 把补全到的位置写回事件（Breakpoint/Step 的 location 字段）。
+/// Write the enriched location back into the event (Breakpoint/Step location field).
 fn set_event_location(event: &mut Event, loc: &Location) {
     match event {
         Event::Breakpoint { location, .. } | Event::Step { location, .. } => {
@@ -665,7 +872,6 @@ fn set_event_location(event: &mut Event, loc: &Location) {
         _ => {}
     }
 }
-
 
 fn spawn_stderr_drain(stderr: ChildStderr) -> (Arc<Mutex<String>>, JoinHandle<()>) {
     use std::io::{BufRead, BufReader};
@@ -690,7 +896,7 @@ fn spawn_stderr_drain(stderr: ChildStderr) -> (Arc<Mutex<String>>, JoinHandle<()
     (buf, handle)
 }
 
-/// 取出并清空一个共享文本缓冲（用于 attach 失败时读 stderr 线程已捕获的错误）。
+/// Take and clear a shared text buffer, used for stderr captured by the reader thread during attach failures.
 fn drain_buf(buf: &Arc<Mutex<String>>) -> Option<String> {
     let mut b = buf.lock().ok()?;
     if b.is_empty() {
@@ -700,7 +906,7 @@ fn drain_buf(buf: &Arc<Mutex<String>>) -> Option<String> {
     }
 }
 
-/// TCP 探测：尝试连接 host:port，超时 3 秒。失败时返回清晰的诊断信息。
+/// TCP probe: try to connect to host:port with a 3-second timeout. On failure, return a clear diagnostic.
 fn probe_tcp(host: &str, port: u16) -> Result<()> {
     use std::net::{TcpStream, ToSocketAddrs};
 
@@ -722,7 +928,7 @@ fn probe_tcp(host: &str, port: u16) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    //! session 层映射逻辑的单元测试——聚焦 `event_to_result`（纯函数）。
+    //! Unit tests for session-layer mapping logic, focused on pure function `event_to_result`.
     use super::{CommandKind, event_to_result};
     use crate::jdb::reader::DetectedEvent;
     use crate::protocol::*;
@@ -737,7 +943,15 @@ mod tests {
         };
         let (result, event) = event_to_result(ev);
 
-        let CommandResult::Stopped { location, thread, event: inner_event, frame, source_context, .. } = result else {
+        let CommandResult::Stopped {
+            location,
+            thread,
+            event: inner_event,
+            frame,
+            source_context,
+            ..
+        } = result
+        else {
             panic!("expected Stopped, got {result:?}");
         };
         assert_eq!(thread, "main");
@@ -760,7 +974,12 @@ mod tests {
         };
         let (result, event) = event_to_result(ev);
 
-        let CommandResult::Stopped { location, event: inner_event, .. } = result else {
+        let CommandResult::Stopped {
+            location,
+            event: inner_event,
+            ..
+        } = result
+        else {
             panic!("expected Stopped, got {result:?}");
         };
         assert_eq!(location.line, 10);
@@ -777,7 +996,13 @@ mod tests {
         };
         let (result, event) = event_to_result(ev);
 
-        let CommandResult::ExceptionCaught { exception, caught, thread, .. } = result else {
+        let CommandResult::ExceptionCaught {
+            exception,
+            caught,
+            thread,
+            ..
+        } = result
+        else {
             panic!("expected ExceptionCaught, got {result:?}");
         };
         assert_eq!(exception, "java.lang.NullPointerException");

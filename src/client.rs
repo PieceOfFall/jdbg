@@ -1,19 +1,19 @@
-//! CLI 端 client：connect-or-auto-spawn daemon，发一条 Request，收一条 Response。
+//! CLI-side client: connect to or auto-spawn the daemon, send one Request, receive one Response.
 
 use std::io::{BufRead, BufReader, Write};
 use std::time::{Duration, Instant};
 
-use interprocess::local_socket::{prelude::*, Stream as LocalStream};
+use interprocess::local_socket::{Stream as LocalStream, prelude::*};
 
 use crate::protocol::{Request, Response};
 use crate::registry;
 
-/// 连接超时。
+/// Connection timeout.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
-/// 自动 spawn 后轮询间隔。
+/// Poll interval after auto-spawning the daemon.
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-/// 发送请求并接收响应（公共 API，daemon 模块 `stop_daemon` 也用到）。
+/// Send a request and receive a response. This public API is also used by `daemon::stop_daemon`.
 pub fn send_request(req: &Request) -> anyhow::Result<Response> {
     let stream = connect_or_spawn()?;
     let mut writer = stream;
@@ -30,19 +30,19 @@ pub fn send_request(req: &Request) -> anyhow::Result<Response> {
     Ok(resp)
 }
 
-/// 连接到 daemon socket；若连接失败则自动 spawn daemon 并重试。
+/// Connect to the daemon socket; if connecting fails, auto-spawn the daemon and retry.
 fn connect_or_spawn() -> anyhow::Result<LocalStream> {
     let sock_name = registry::socket_name();
 
-    // 先尝试直连。
+    // Try a direct connection first.
     if let Ok(stream) = try_connect(&sock_name) {
         return Ok(stream);
     }
 
-    // 连接失败——自动拉起 daemon。
+    // Connection failed: auto-spawn the daemon.
     crate::daemon::spawn_daemon_detached()?;
 
-    // 轮询等待 daemon 就绪（bounded by CONNECT_TIMEOUT）。
+    // Poll until the daemon is ready, bounded by CONNECT_TIMEOUT.
     let deadline = Instant::now() + CONNECT_TIMEOUT;
     loop {
         if Instant::now() >= deadline {
@@ -58,7 +58,7 @@ fn connect_or_spawn() -> anyhow::Result<LocalStream> {
     }
 }
 
-/// 尝试连接一次。
+/// Try to connect once.
 fn try_connect(sock_name: &str) -> Result<LocalStream, std::io::Error> {
     let name = sock_name
         .to_ns_name::<interprocess::local_socket::GenericNamespaced>()

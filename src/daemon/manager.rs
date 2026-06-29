@@ -1,7 +1,7 @@
-//! SessionManager：持有所有活跃会话，提供创建/查找/列表/删除。
+//! SessionManager: owns all active sessions and provides create/find/list/remove operations.
 //!
-//! 内部用 `Mutex<HashMap<SessionId, Arc<Session>>>`——daemon accept loop 的多线程安全。
-//! daemon 是单写者，同时把快照写入 sessions.json 供离线查看。
+//! Internally uses `Mutex<HashMap<SessionId, Arc<Session>>>` for thread safety in the daemon accept loop.
+//! The daemon is the single writer and also writes snapshots to sessions.json for offline inspection.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -14,7 +14,7 @@ use crate::protocol::{CommandResult, RunState, SessionInfo};
 use crate::registry::{Registry, SessionRecord};
 use crate::session::Session;
 
-/// 生成 8 字符随机 session id。
+/// Generate an 8-character random session id.
 fn gen_session_id() -> String {
     use rand::Rng;
     rand::rng()
@@ -29,7 +29,7 @@ pub struct SessionManager {
     registry: Registry,
 }
 
-/// `create_launch` 的参数包。
+/// Parameter bundle for `create_launch`.
 pub struct LaunchParams {
     pub main_class: String,
     pub classpath: Vec<String>,
@@ -40,7 +40,7 @@ pub struct LaunchParams {
     pub jdb_path: Option<String>,
 }
 
-/// `create_attach` 的参数包。
+/// Parameter bundle for `create_attach`.
 pub struct AttachParams {
     pub host: String,
     pub port: u16,
@@ -57,7 +57,7 @@ impl SessionManager {
         }
     }
 
-    /// 创建 launch 会话。
+    /// Create a launch session.
     pub fn create_launch(&self, params: LaunchParams) -> Result<Arc<Session>> {
         let jdb_path = match params.jdb_path {
             Some(ref p) => {
@@ -87,10 +87,11 @@ impl SessionManager {
         Ok(session)
     }
 
-    /// 创建 attach 会话（连接已运行 JVM 的 JDWP 端口）。
+    /// Create an attach session connected to a running JVM's JDWP port.
     ///
-    /// 去重：若已有存活 session 连接到同一 host:port，拒绝创建并提示复用或先 kill。
-    /// 两个 jdb 连同一 JDWP 端口会互相干扰（kill 发 resume 解冻对方的断点）。
+    /// Deduplication: if a live session already connects to the same host:port, reject creation and ask the
+    /// caller to reuse it or kill it first. Two jdb clients on the same JDWP port interfere with each other
+    /// because kill sends resume and can unfreeze the other client's breakpoint.
     pub fn create_attach(&self, params: AttachParams) -> Result<Arc<Session>> {
         let jdb_path = match params.jdb_path {
             Some(ref p) => {
@@ -100,11 +101,11 @@ impl SessionManager {
             None => jdkpath::find_jdb(None)?,
         };
 
-        // 规范化 host 以确保去重比对一致（localhost → 127.0.0.1）。
+        // Normalize the host so deduplication compares consistently (localhost → 127.0.0.1).
         let norm_host = crate::jdb::process::normalize_attach_host(&params.host);
         let target = format!("{}:{}", norm_host, params.port);
 
-        // 去重检测：拒绝连接到已有存活 session 的同一目标。
+        // Deduplication: reject connections to the same target as an existing live session.
         {
             let map = self.sessions.lock().expect("sessions mutex poisoned");
             for s in map.values() {
@@ -135,7 +136,7 @@ impl SessionManager {
         Ok(session)
     }
 
-    /// 查找会话：指定 id 或默认（唯一存活会话）。
+    /// Find a session by explicit id or by default unique live session.
     pub fn get(&self, session_id: Option<&str>) -> Result<Arc<Session>> {
         let map = self.sessions.lock().expect("sessions mutex poisoned");
         match session_id {
@@ -144,8 +145,9 @@ impl SessionManager {
                 .cloned()
                 .ok_or_else(|| Error::SessionNotFound(id.to_string())),
             None => {
-                // 默认会话：如果恰好只有一个存活会话则返回它。
-                let alive: Vec<_> = map.values()
+                // Default session: return it only when exactly one live session exists.
+                let alive: Vec<_> = map
+                    .values()
                     .filter(|s| !matches!(s.state(), RunState::Dead))
                     .collect();
                 match alive.len() {
@@ -159,7 +161,7 @@ impl SessionManager {
         }
     }
 
-    /// 列出所有会话。
+    /// List all sessions.
     pub fn list(&self) -> CommandResult {
         let map = self.sessions.lock().expect("sessions mutex poisoned");
         let sessions: Vec<SessionInfo> = map
@@ -177,7 +179,7 @@ impl SessionManager {
         CommandResult::SessionList { sessions }
     }
 
-    /// 终止并移除一个会话。
+    /// Kill and remove one session.
     pub fn kill(&self, session_id: &str) -> Result<()> {
         let session = {
             let mut map = self.sessions.lock().expect("sessions mutex poisoned");
@@ -189,7 +191,7 @@ impl SessionManager {
         Ok(())
     }
 
-    /// daemon 关闭：杀掉所有会话。
+    /// Daemon shutdown: kill all sessions.
     pub fn shutdown(&self) {
         let map = self.sessions.lock().expect("sessions mutex poisoned");
         for session in map.values() {
@@ -197,7 +199,7 @@ impl SessionManager {
         }
     }
 
-    /// 把当前会话快照持久化到 sessions.json。
+    /// Persist the current session snapshot to sessions.json.
     fn persist_sessions(&self) {
         let map = self.sessions.lock().expect("sessions mutex poisoned");
         let records: Vec<SessionRecord> = map

@@ -2,7 +2,7 @@
 
 ## 1. 项目概述
 
-`jdbg` 是一个跨平台 **Rust CLI 工具**，让 AI 编程 Agent（如 Claude Code）能**在任意 Java 项目中交互式调试程序**，
+`jdbg` 是一个跨平台 **Rust CLI 工具**，让 AI 编程 Agent（如 Claude Code / Codex）能**在任意 Java 项目中交互式调试程序**，
 以 **Windows 为首要目标**平台。
 
 它替代了参考项目 `jdb-agentic-debugger/`（Unix-only 的 Bash 脚本，用 sleep 定时驱动 jdb、不解析输出），
@@ -12,8 +12,8 @@
 
 **两种接入方式**（共用同一套 daemon/session/jdb 引擎）：
 - **CLI**——`jdbg <subcommand>`，人类/脚本直接调用，输出人类文本或 `--json`。
-- **MCP server**——`jdbg __mcp`，作为 stdio MCP server 被 Claude Code 识别为**原生工具调用**
-  （`mcp__jdbg__launch` 等 25 个工具），无需经 Bash。见 §2.5。
+- **MCP server**——`jdbg __mcp`，作为 stdio MCP server 被 Claude Code / Codex 等 agent 识别为**原生工具调用**
+  （`mcp__jdbg__launch` 等 36 个工具），无需经 Bash。见 §2.5。
 
 ## 2. 架构设计
 
@@ -94,14 +94,14 @@
   registry.rs            ← 磁盘注册表
 ```
 
-### 2.5 MCP server（Claude Code 原生工具）
+### 2.5 MCP server（agent 原生工具）
 
 MCP server 是 **daemon 的第二种客户端**，与 CLI 平级——CLI 把 clap 解析结果转成 `Request` 发给 daemon；
 MCP server 把 `tools/call` 转成 `Request` 发给 daemon。两者共用同一条下游链路，**daemon/session/jdb 引擎/
 protocol 零改动**。
 
 ```
-  Claude Code ──stdio (JSON-RPC 2.0, 行分隔)──►  jdbg __mcp  (Claude 拉起的子进程)
+  Claude Code / Codex ──stdio (JSON-RPC 2.0, 行分隔)──►  jdbg __mcp  (agent 拉起的子进程)
                                                      │  tools/call → protocol::Command + Request
                                                      │  client::send_request(&Request)
                                                      ▼
@@ -110,15 +110,18 @@ protocol 零改动**。
 
 - **传输**：手写极简 JSON-RPC 2.0 over stdio（无 tokio，复用 serde_json + blocking IO，与既有 JSONL IPC 同构）。
   实现的方法：`initialize` / `notifications/initialized` / `tools/list` / `tools/call` / `ping`。
-- **工具粒度**：细粒度 1:1——每个 jdbg 子命令一个工具，共 25 个（不暴露 daemon 控制；`daemon start/stop/status`
+- **工具粒度**：细粒度 1:1——每个 jdbg 子命令一个工具，共 36 个（不暴露 daemon 控制；`daemon start/stop/status`
   不该交给 LLM，且 auto-spawn 已覆盖）。`session`/`timeout` 作为通用可选参数注入相关工具的 inputSchema。
 - **结果映射**：`Response.ok` → `output::render` 文本塞进 `CallToolResult.content`（`isError:false`）；
-  业务错误/daemon 连接失败 → tool-level error（`isError:true`，Claude 可见并继续）；仅协议层问题
+  业务错误/daemon 连接失败 → tool-level error（`isError:true`，agent 可见并继续）；仅协议层问题
   （未知工具、缺必填参数、JSON 解析失败）才用 JSON-RPC error（`-32601`/`-32602`/`-32700`）。
 - **stdout 纪律**：stdout 只承载 JSON-RPC，所有日志走 stderr（`eprintln!`），否则污染协议流。
 - **接入配置**：开发期 `.mcp.json` 指向 `target/debug/jdbg.exe __mcp`；分发期 `.claude-plugin/plugin.json`
-  内联 `mcpServers` 指向 `${CLAUDE_PLUGIN_ROOT}/bin/jdbg`。工具呈现为 `mcp__jdbg__<tool>`
-  （plugin 打包时为 `mcp__plugin_java-agent-debugger_jdbg__<tool>`）。
+  内联 Claude `mcpServers` 指向 `${CLAUDE_PLUGIN_ROOT}/bin/jdbg`。`jdbg setup` 可安装到 Claude Code
+  和 Codex：Claude 写 `~/.claude.json`、`~/.claude/settings.json`、`~/.claude/skills/jdbg/SKILL.md`；
+  Codex 写 `~/.codex/config.toml` 的 `[mcp_servers.jdbg]` 和 `~/.codex/skills/jdbg/SKILL.md`。
+  Claude 工具呈现为 `mcp__jdbg__<tool>`（plugin 打包时为
+  `mcp__plugin_java-agent-debugger_jdbg__<tool>`）。
 
 ## 3. 模块说明
 
@@ -140,6 +143,8 @@ protocol 零改动**。
 | client | `src/client.rs` | connect-or-auto-spawn，发一条 Request 收一条 Response |
 | cli | `src/cli.rs` | clap derive：完整 §7 命令面 + 隐藏 `__daemon` / `__mcp` 入口 |
 | output | `src/output.rs` | 人类可读文本渲染 + `--json` 模式（返回 String，MCP 层复用） |
+| setup | `src/setup.rs` | multi-agent setup registry：Claude/Codex MCP + skill install/remove，Codex TOML upsert，target detection for update |
+| update | `src/update.rs` | self-update：安装新版本后按已配置的 setup targets 重新注册，未检测到配置时 fallback Claude |
 | mcp | `src/mcp/mod.rs` | MCP server `run_mcp()`：stdio JSON-RPC 主循环 + 生命周期 + 结果映射 |
 | mcp/jsonrpc | `src/mcp/jsonrpc.rs` | JSON-RPC 2.0 请求/响应/错误类型 + 标准错误码 |
 | mcp/tools | `src/mcp/tools.rs` | 36 工具 spec（name/description/inputSchema）+ `dispatch_tool` 工具→Command 翻译层 |
@@ -163,12 +168,16 @@ jdbg where [--all] | locals | print <expr> | dump <obj> | eval <expr>
 jdbg threads | thread <id> | frame <up|down> [n] | list-source [line]
 jdbg raw <jdb command...>
 
+jdbg setup [--remove] [--print] [--target claude,codex|auto|all|none] [--yes]
+jdbg update
+
 全局参数：--session <id> --json --timeout <secs> --jdb-path <path>
 ```
 
-**MCP 工具面**：上述子命令 1:1 映射为 25 个 MCP 工具（`launch`/`attach`/`status`/`list`/`kill`/
-`break_at`/`break_in`/`catch`/`breakpoints`/`clear`/`run`/`cont`/`step`/`next`/`step_out`/`where`/
-`locals`/`print`/`dump`/`eval`/`threads`/`thread`/`frame`/`list_source`/`raw`），命名用 snake_case，
+**MCP 工具面**：调试子命令 1:1 映射为 36 个 MCP 工具（`launch`/`attach`/`status`/`list`/`kill`/
+`break_at`/`break_in`/`watch`/`unwatch`/`catch`/`breakpoints`/`clear`/`run`/`cont`/`step`/`next`/
+`step_out`/`where`/`locals`/`print`/`dump`/`eval`/`classes`/`methods`/`inspect`/`threads`/`thread`/
+`frame`/`list_source`/`suspend`/`resume`/`set`/`ignore`/`lock`/`threadlocks`/`raw`），命名用 snake_case，
 参数用 JSON object。`daemon` 控制命令不暴露为工具。详见 §2.5。
 
 ## 5. RunState 状态机
@@ -193,6 +202,7 @@ Loaded  ──run──►  Suspended  ──cont/step/next──►  Suspended
 | 5. cli.rs + output.rs | ✅ 完成 | clap 完整命令面 + 文本/JSON 渲染 |
 | 6. SKILL.md + plugin manifest | ✅ 完成 | native-first `skills/jdbg/SKILL.md` + `.claude-plugin/{plugin,marketplace}.json`，subagent 应用场景验证通过 |
 | 7. MCP server | ✅ 完成 | `src/mcp/{mod,jsonrpc,tools}.rs`：手写 stdio JSON-RPC、36 工具 1:1 映射、`.mcp.json` + plugin 内联 mcpServers、SKILL.md 改写为 MCP 工具面；真实 jdb e2e 验证（launch→break→run→locals→cont） |
+| 8. Multi-agent setup | ✅ 完成 | `jdbg setup --target claude,codex|auto|all|none --yes`；Claude + Codex MCP/skill 安装删除；`jdbg update` 保留并重注册已配置 targets；零新增依赖 |
 
 ## 7. 未实现 / TODO 项
 
@@ -210,9 +220,10 @@ Loaded  ──run──►  Suspended  ──cont/step/next──►  Suspended
 
 | 功能 | 说明 |
 |------|------|
-| **v0.8.0：定位线程提速 + 6 命令 + 十进制 thread id** | 真实大型 Spring Boot（Tomcat+nacos+redisson，90+ 线程）attach 调试体验增强。**① 十进制 thread id 解析**——某些 JDK 的 `threads` 输出把 id 打成纯十进制（`18315`）而非 `0x` hex，`RE_THREAD_LINE` 的 id 捕获改 `0x[0-9a-fA-F]+|\d+`（hex 分支在前避免截断），否则整段回退 Raw 透传、且 SKILL 误导加 `0x` 前缀致 jdb 拒绝。**② `Stopped`/`ExceptionCaught` 带 `thread_id`**——命中后回填命中线程 id（PartialStop 路径复用既有 `threads` 查询零开销；完整 banner 路径在 `enrich_thread_id` 跑一次 `threads` 用纯函数 `thread_id_for` 按名/at-breakpoint 反查），Claude 直接拿 id 切线程，无需肉眼搜。**③ `threads { filter }`**——handler 层纯函数 `filter_threads` 按名大小写不敏感子串过滤，命中行 output 加 `*` 标记。**④ 6 新工具**：`suspend`/`resume`（单线程挂起恢复）、`set`（改变量/字段/数组元素，镜像赋值）、`ignore`（`catch` 的对称移除，复用 mode dispatch）、`lock`/`threadlocks`（锁排查）——全部 Normal + Raw 透传。30→36 工具。 |
+| **Multi-agent setup（Claude + Codex）** | `src/setup.rs` 新增 target registry，支持交互多选、`--target` CSV/`auto`/`all`/`none`、`--yes`、`--print`、按 target 删除。Claude 继续写 `~/.claude.json` / `~/.claude/settings.json` / `~/.claude/skills/jdbg/SKILL.md`；Codex 写 `~/.codex/config.toml` 的 `[mcp_servers.jdbg]` 和 `~/.codex/skills/jdbg/SKILL.md`。`src/update.rs` 在安装新 binary 前检测已配置 jdbg targets，更新后重注册同一组；无配置时 fallback Claude。 |
+| **v0.8.0：定位线程提速 + 6 命令 + 十进制 thread id** | 真实大型 Spring Boot（Tomcat+nacos+redisson，90+ 线程）attach 调试体验增强。**① 十进制 thread id 解析**——某些 JDK 的 `threads` 输出把 id 打成纯十进制（`18315`）而非 `0x` hex，`RE_THREAD_LINE` 的 id 捕获改 `0x[0-9a-fA-F]+|\d+`（hex 分支在前避免截断），否则整段回退 Raw 透传、且 SKILL 误导加 `0x` 前缀致 jdb 拒绝。**② `Stopped`/`ExceptionCaught` 带 `thread_id`**——命中后回填命中线程 id（PartialStop 路径复用既有 `threads` 查询零开销；完整 banner 路径在 `enrich_thread_id` 跑一次 `threads` 用纯函数 `thread_id_for` 按名/at-breakpoint 反查），agent 直接拿 id 切线程，无需肉眼搜。**③ `threads { filter }`**——handler 层纯函数 `filter_threads` 按名大小写不敏感子串过滤，命中行 output 加 `*` 标记。**④ 6 新工具**：`suspend`/`resume`（单线程挂起恢复）、`set`（改变量/字段/数组元素，镜像赋值）、`ignore`（`catch` 的对称移除，复用 mode dispatch）、`lock`/`threadlocks`（锁排查）——全部 Normal + Raw 透传。30→36 工具。 |
 | **Thread 断点（native `stop thread`）** | `suspend: "thread"` → jdb 原生 `stop thread at/in`（SUSPEND_THREAD policy：仅挂起触发线程，VM 其余线程继续跑）。**关键修复：JDK 8 截断 banner**——SUSPEND_THREAD 下命中时 jdb 只写出 `"Breakpoint hit: "` 前缀（无 thread/location，无 thread-prompt，光标停此），原有 blocking 完成检测三信号全不满足 → 死等到超时。reader 用 500ms patience window 把"截断前缀 + 无后续字节"识别为 `DetectedEvent::PartialStop`；session 层随即 `threads`(找 `(at breakpoint)` 线程)→`thread <id>`(切当前线程，否则 `where` 报 No thread specified)→`where`(取栈顶帧) 补全 thread/location/frame，失败写 WARNING note 不静默。完整 banner（SUSPEND_ALL / 选中线程后的 step）仍走原 `RE_BREAKPOINT_OR_STEP`，两路径并存天然向后兼容（JDK 9+ 若写完整 banner 不受影响）。 |
-| **MCP server（本轮）** | `src/mcp/{jsonrpc,tools,mod}.rs`：手写极简 stdio JSON-RPC 2.0（无 tokio，零新增依赖），25 工具 1:1 映射现有子命令，复用 `client::send_request` + `output::render`，daemon/session/jdb 零改动。`.mcp.json` + `plugin.json` 内联 mcpServers，SKILL.md 改写为 MCP 工具面（保留何时用/react-to-each-result）。21 个新单测 + 真实 jdb e2e。**关键修复：Windows 句柄继承泄漏**——MCP server `run_mcp()` 入口用零依赖 `SetHandleInformation` 裸 FFI 清除自身 stdout/stderr 的 `HANDLE_FLAG_INHERIT`，否则 auto-spawn 的 detached daemon 继承 MCP 的 stdout 管道写端，使 Claude 端读不到 EOF。 |
+| **MCP server（本轮）** | `src/mcp/{jsonrpc,tools,mod}.rs`：手写极简 stdio JSON-RPC 2.0（无 tokio，零新增依赖），MCP 工具 1:1 映射现有调试子命令，复用 `client::send_request` + `output::render`，daemon/session/jdb 零改动。`.mcp.json` + `plugin.json` 内联 mcpServers，SKILL.md 改写为 MCP 工具面（保留何时用/react-to-each-result）。21 个新单测 + 真实 jdb e2e。**关键修复：Windows 句柄继承泄漏**——MCP server `run_mcp()` 入口用零依赖 `SetHandleInformation` 裸 FFI 清除自身 stdout/stderr 的 `HANDLE_FLAG_INHERIT`，否则 auto-spawn 的 detached daemon 继承 MCP 的 stdout 管道写端，使 agent 端读不到 EOF。 |
 | **Roadmap 6: SKILL.md + plugin** | native-first `skills/jdbg/SKILL.md`（命令面 §7、stateful "react to each result" 工作流、JDWP 版本感知启用、`-g` 提示、attach；剔除参考的 WSL/temp/sleep/`--auto-inspect`）+ `.claude-plugin/{plugin,marketplace}.json`。subagent 应用场景验证通过（仅凭 skill 正确驱动 launch→break→run→inspect）。 |
 | **Attach 模式** | `Session::attach` + `process::spawn_attach` + `manager::create_attach`，handler 顶层路由。**关键修复：用 `-connect com.sun.jdi.SocketAttach:hostname=H,port=P` 而非 `jdb -attach host:port`**——Windows 上 `-attach` 默认走共享内存(dt_shmem)，与 JDWP dt_socket 不匹配会 attach 失败、jdb 立即退出。attach 后排空 `VM Started` 异步 banner 避免输出滞后；失败路径捕获 stderr 报错。`run` 在 attach 模式被拒绝。 |
 | jdkpath 常见目录扫描 | `find_jdb` 第 4 步扫描 `Program Files\Java\*`、`.jdks\*`、Eclipse Adoptium、Microsoft、`/usr/lib/jvm/*`、macOS bundle 布局；纯 `std::fs`，无新依赖。 |
@@ -236,9 +247,9 @@ Loaded  ──run──►  Suspended  ──cont/step/next──►  Suspended
 | rand | 0.9 | 生成 session ID |
 | jiff | 0.2 | 时间戳 |
 
-> MCP server **零新增依赖**：手写 JSON-RPC（serde_json）、Windows 句柄修复用 `std` 裸 FFI（kernel32
-> `SetHandleInformation`，无 windows/winapi crate）。刻意排除 `rmcp`（会引入 tokio）、`tokio`、`once_cell`、
-> `nix`、`daemonize`、ConPTY、TCP/RPC 框架。
+> MCP server / setup **零新增依赖**：MCP 手写 JSON-RPC（serde_json）、Windows 句柄修复用 `std` 裸 FFI
+>（kernel32 `SetHandleInformation`，无 windows/winapi crate）；setup 的 Codex TOML 使用窄范围文本 upsert/remove。
+> 刻意排除 `rmcp`（会引入 tokio）、`tokio`、`once_cell`、`nix`、`daemonize`、ConPTY、TCP/RPC 框架。
 
 ## 9. 构建与运行
 
@@ -296,9 +307,17 @@ tools/call locals                         → count=3, label="hello", sum=3
 tools/call cont                           → The application exited
 ```
 
-- ✅ 完整链路 Claude → MCP server → daemon → jdb → JVM，结构化结果正确（1.3s 完成）
+- ✅ 完整链路 agent → MCP server → daemon → jdb → JVM，结构化结果正确（1.3s 完成）
 - ✅ 句柄修复后 auto-spawn daemon 不再泄漏 stdout 管道，进程干净退出
-- ✅ 37 个库单测全绿（16 既有 + 21 MCP，零破坏）
+- ✅ `cargo test` 全绿（111 unit + 16 integration）
+
+**Setup 路径验证**：
+
+```bash
+jdbg setup --target codex --print          # prints [mcp_servers.jdbg] + Codex skill path, no writes
+jdbg setup --target claude,codex --yes     # installs both targets
+jdbg setup --remove --target codex --yes   # removes only Codex jdbg config + skill
+```
 
 ## 11. 开源项目规范
 

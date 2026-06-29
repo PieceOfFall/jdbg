@@ -1,16 +1,17 @@
-//! MCP（Model Context Protocol）server——把 jdbg 暴露为 Claude Code 的原生工具调用。
+//! MCP (Model Context Protocol) server: expose jdbg as native tool calls for coding agents.
 //!
-//! 设计：MCP server 是 daemon 的**第二种客户端**，与 CLI 平级。它通过 stdio 跑一个手写的
-//! JSON-RPC 2.0 循环（无 tokio，复用现有 serde_json + blocking IO），把每个 `tools/call`
-//! 翻译成 [`crate::protocol::Command`] + [`crate::protocol::Request`]，经 [`crate::client::send_request`]
-//! 发给 daemon，再把 [`crate::protocol::Response`] 渲染回 MCP 的 `CallToolResult`。
+//! Design: the MCP server is the daemon's **second client**, peer to the CLI. It runs a handwritten
+//! JSON-RPC 2.0 loop over stdio (no tokio; reuse serde_json + blocking IO), translates each `tools/call`
+//! into [`crate::protocol::Command`] + [`crate::protocol::Request`], sends it to the daemon via
+//! [`crate::client::send_request`], then renders [`crate::protocol::Response`] back into an MCP
+//! `CallToolResult`.
 //!
-//! 模块划分：
-//! - [`jsonrpc`]：JSON-RPC 2.0 基础类型（请求/响应/错误）。
-//! - [`tools`]：25 个工具的 spec（name/description/inputSchema）+ 工具名→`Command` 翻译层。
+//! Module split:
+//! - [`jsonrpc`]: basic JSON-RPC 2.0 types (request/response/error).
+//! - [`tools`]: 36 tool specs (name/description/inputSchema) plus tool-name → `Command` translation.
 //!
-//! **stdout 纪律**：stdout 只承载 JSON-RPC 消息，任何日志/诊断必须走 stderr（`eprintln!`），
-//! 否则会污染协议流。
+//! **stdout discipline**: stdout carries only JSON-RPC messages. Any logs/diagnostics must go to stderr
+//! (`eprintln!`), otherwise they corrupt the protocol stream.
 
 pub mod jsonrpc;
 pub mod tools;
@@ -22,15 +23,18 @@ use serde_json::{Value, json};
 use crate::client;
 use crate::output;
 use crate::protocol::Response;
-use jsonrpc::{INVALID_PARAMS, JsonRpcError, JsonRpcRequest, JsonRpcResponse, METHOD_NOT_FOUND, PARSE_ERROR};
+use jsonrpc::{
+    INVALID_PARAMS, JsonRpcError, JsonRpcRequest, JsonRpcResponse, METHOD_NOT_FOUND, PARSE_ERROR,
+};
 
-/// 我们默认通告的 MCP 协议版本（initialize 时若客户端给了版本则回显其值）。
+/// Default MCP protocol version we announce. If the client supplies a version during initialize, echo it.
 const PROTOCOL_VERSION: &str = "2025-06-18";
 
-/// 运行 MCP server：stdin/stdout 上的 JSON-RPC 2.0 行分隔循环，直到 stdin EOF。
+/// Run the MCP server: a line-delimited JSON-RPC 2.0 loop over stdin/stdout until stdin EOF.
 pub fn run_mcp() -> anyhow::Result<()> {
-    // Windows：把本进程的 stdout/stderr 标记为不可继承，否则首次工具调用 auto-spawn 的
-    // detached daemon 会继承 MCP server 的 stdout 管道写端，使 Claude 端永远读不到 EOF。
+    // Windows: mark this process's stdout/stderr as non-inheritable. Otherwise the detached daemon
+    // auto-spawned by the first tool call inherits the MCP server's stdout pipe writer, so the agent
+    // never observes EOF.
     #[cfg(windows)]
     detach_std_handles_from_children();
 
@@ -43,7 +47,7 @@ pub fn run_mcp() -> anyhow::Result<()> {
         line.clear();
         let n = reader.read_line(&mut line)?;
         if n == 0 {
-            break; // EOF：客户端关闭了管道。
+            break; // EOF: the client closed the pipe.
         }
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -55,13 +59,16 @@ pub fn run_mcp() -> anyhow::Result<()> {
             Err(e) => {
                 write_message(
                     &stdout,
-                    &JsonRpcResponse::error(Value::Null, JsonRpcError::new(PARSE_ERROR, format!("parse error: {e}"))),
+                    &JsonRpcResponse::error(
+                        Value::Null,
+                        JsonRpcError::new(PARSE_ERROR, format!("parse error: {e}")),
+                    ),
                 )?;
                 continue;
             }
         };
 
-        // 通知（无 id）：处理但不回响应。notifications/initialized 等目前无需动作。
+        // Notifications have no id: handle them without responding. notifications/initialized currently needs no action.
         if req.is_notification() {
             continue;
         }
@@ -73,7 +80,7 @@ pub fn run_mcp() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// 路由一条带 id 的请求。
+/// Route one request with an id.
 fn handle_request(req: &JsonRpcRequest, id: Value) -> JsonRpcResponse {
     match req.method.as_str() {
         "initialize" => JsonRpcResponse::success(id, initialize_result(req)),
@@ -83,13 +90,14 @@ fn handle_request(req: &JsonRpcRequest, id: Value) -> JsonRpcResponse {
             Err(err) => JsonRpcResponse::error(id, err),
         },
         "ping" => JsonRpcResponse::success(id, json!({})),
-        other => {
-            JsonRpcResponse::error(id, JsonRpcError::new(METHOD_NOT_FOUND, format!("method not found: {other}")))
-        }
+        other => JsonRpcResponse::error(
+            id,
+            JsonRpcError::new(METHOD_NOT_FOUND, format!("method not found: {other}")),
+        ),
     }
 }
 
-/// initialize 响应：通告 tools 能力 + serverInfo。
+/// initialize response: announce tools capability plus serverInfo.
 fn initialize_result(req: &JsonRpcRequest) -> Value {
     let version = req
         .params
@@ -104,11 +112,11 @@ fn initialize_result(req: &JsonRpcRequest) -> Value {
     })
 }
 
-/// 处理 `tools/call`：翻译 → 发给 daemon → 映射成 `CallToolResult`。
+/// Handle `tools/call`: translate, send to daemon, then map to `CallToolResult`.
 ///
-/// 协议层问题（缺 params/name、未知工具、缺必填参数）→ `Err(JsonRpcError)`（JSON-RPC error）。
-/// 业务/连接问题（session dead、daemon 拉起失败）→ `Ok` 的 tool-level error（`isError: true`），
-/// 让 Claude 能看到信息并继续。
+/// Protocol-layer problems (missing params/name, unknown tool, missing required params) become
+/// `Err(JsonRpcError)` JSON-RPC errors. Business/connection failures (dead session, daemon spawn failure)
+/// become `Ok` tool-level errors (`isError: true`) so the agent can see the message and continue.
 fn call_tool(req: &JsonRpcRequest) -> Result<Value, JsonRpcError> {
     let params = req
         .params
@@ -129,7 +137,7 @@ fn call_tool(req: &JsonRpcRequest) -> Result<Value, JsonRpcError> {
     }
 }
 
-/// 把 daemon 的 `Response` 映射成 MCP `CallToolResult`（文本内容 + isError）。
+/// Map a daemon `Response` into an MCP `CallToolResult` with text content plus isError.
 fn response_to_call_result(resp: Response) -> Value {
     if resp.ok {
         let text = resp
@@ -147,12 +155,12 @@ fn response_to_call_result(resp: Response) -> Value {
     }
 }
 
-/// 构造一个 tool-level 错误结果（`isError: true`）。
+/// Build a tool-level error result (`isError: true`).
 fn tool_error(message: impl Into<String>) -> Value {
     json!({ "content": [{ "type": "text", "text": message.into() }], "isError": true })
 }
 
-/// 写一条 JSON-RPC 消息到 stdout（单行 + flush）。stdout 只承载协议。
+/// Write one JSON-RPC message to stdout as a single flushed line. stdout carries only protocol data.
 fn write_message(stdout: &std::io::Stdout, msg: &JsonRpcResponse) -> anyhow::Result<()> {
     let s = serde_json::to_string(msg)?;
     let mut lock = stdout.lock();
@@ -162,11 +170,12 @@ fn write_message(stdout: &std::io::Stdout, msg: &JsonRpcResponse) -> anyhow::Res
     Ok(())
 }
 
-/// Windows：清除本进程 stdout/stderr 句柄的 `HANDLE_FLAG_INHERIT`，使后续 spawn 的子进程
-/// （auto-spawn 的 daemon）不再继承它们。零依赖裸 FFI（kernel32）。
+/// Windows: clear `HANDLE_FLAG_INHERIT` on this process's stdout/stderr handles so later child processes
+/// (the auto-spawned daemon) no longer inherit them. Zero-dependency raw FFI (kernel32).
 ///
-/// 不动 stdin：stdin 由 Claude 写、随管道关闭自然结束，无继承问题。失败静默忽略——
-/// 句柄无效（如被重定向到文件）时本就没有继承泄漏风险。
+/// Do not touch stdin: the agent writes to stdin and pipe closure naturally ends the server, so there is no
+/// inheritance issue. Failures are ignored; invalid handles (for example redirected to files) do not have
+/// this inheritance leak risk.
 #[cfg(windows)]
 fn detach_std_handles_from_children() {
     use std::os::windows::io::AsRawHandle;
@@ -180,7 +189,7 @@ fn detach_std_handles_from_children() {
     let stderr = std::io::stderr();
     for raw in [stdout.as_raw_handle(), stderr.as_raw_handle()] {
         if !raw.is_null() {
-            // flags=0 清除 INHERIT 位。
+            // flags=0 clears the INHERIT bit.
             unsafe { SetHandleInformation(raw as *mut std::ffi::c_void, HANDLE_FLAG_INHERIT, 0) };
         }
     }

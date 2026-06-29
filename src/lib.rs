@@ -1,17 +1,18 @@
-//! `java-agent-debugger` — 库根。
+//! `java-agent-debugger` — library root.
 //!
-//! 跨平台 jdb 包装引擎：spawn JDK 的 `jdb`、prompt-aware 读取输出、解析为结构化结果，
-//! 并以有状态的 [`session::Session`] 在后台维持调试会话。模块划分见 CLAUDE.md §6。
+//! Cross-platform jdb wrapper engine: spawn the JDK's `jdb`, read output with prompt awareness,
+//! parse it into structured results, and keep debug sessions alive in stateful [`session::Session`]s.
+//! See CLAUDE.md §6 for module boundaries.
 //!
-//! 分层（高内聚低耦合）：
-//! - [`error`] / [`protocol`]：基础类型，无内部依赖。
-//! - [`jdkpath`]：定位 jdb 可执行文件。
-//! - [`jdb`]：jdb 引擎子系统（spawn / 读取 / 解析），彼此协作但不依赖上层。
-//! - [`session`]：协调层——绑定 jdb 子进程与读取线程，驱动 RunState 状态机。
-//! - [`registry`]：磁盘注册表（daemon.json / sessions.json）。
-//! - [`daemon`]：IPC 监听、会话管理、生命周期。
-//! - [`client`]：CLI 端连接 daemon 的 RPC 客户端。
-//! - bin (`src/main.rs`)：CLI / daemon 入口，仅依赖本库的公共 API。
+//! Layering, with high cohesion and low coupling:
+//! - [`error`] / [`protocol`]: foundational types with no internal dependencies.
+//! - [`jdkpath`]: locate the jdb executable.
+//! - [`jdb`]: jdb engine subsystem (spawn / read / parse), cooperating internally without depending on upper layers.
+//! - [`session`]: coordination layer that binds the jdb child and reader thread and drives the RunState machine.
+//! - [`registry`]: on-disk registry (`daemon.json` / `sessions.json`).
+//! - [`daemon`]: IPC listener, session management, and lifecycle.
+//! - [`client`]: CLI-side RPC client for connecting to the daemon.
+//! - bin (`src/main.rs`): CLI / daemon entry point, depending only on the library's public API.
 
 pub mod cli;
 pub mod client;

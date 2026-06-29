@@ -52,19 +52,24 @@ cargo build --release   # binary at target/release/jdbg
 
 </details>
 
-### 2. Register with Claude Code
+### 2. Register with your coding agent
 
-One command wires `jdbg` into Claude Code as an MCP server:
+One command wires `jdbg` into Claude Code and/or Codex as an MCP server:
 
 ```bash
 jdbg setup
 ```
 
+When Claude Code is selected:
+
 This writes the MCP server entry to `~/.claude.json` and an auto-allow permission (`mcp__jdbg__*`) to `~/.claude/settings.json`. **Restart Claude Code** to pick up the new server — its tools then appear as `mcp__jdbg__<tool>`.
 
 ```bash
-jdbg setup --print    # preview the config snippet without writing anything
+jdbg setup --target claude,codex --yes
+jdbg setup --target codex --print    # preview the Codex config snippet without writing anything
 ```
+
+With no flags, `jdbg setup` prompts for the agent targets to configure. Claude Code gets `~/.claude.json`, `~/.claude/settings.json`, and `~/.claude/skills/jdbg/SKILL.md`; Codex gets `~/.codex/config.toml` and `~/.codex/skills/jdbg/SKILL.md`. Restart or reload the configured agent to pick up the new server.
 
 ### 3. Start debugging
 
@@ -101,12 +106,13 @@ In Claude Code, just ask it to debug — it drives the same flow through the `mc
 jdbg update
 ```
 
-This removes the old registration, downloads and installs the latest release from GitHub, then re-registers. On Windows it handles the running-exe file lock automatically.
+This detects which agents already have jdbg configured, removes those registrations, downloads and installs the latest release from GitHub, then re-registers the same agents. On Windows it handles the running-exe file lock automatically.
 
 ### Uninstall
 
 ```bash
-jdbg setup --remove   # removes the MCP server entry and the permission; leaves the binary
+jdbg setup --remove                  # removes configured jdbg agent registrations; leaves the binary
+jdbg setup --remove --target codex   # remove only Codex registration
 ```
 
 ## Requirements
@@ -146,7 +152,7 @@ jdbg threads | thread <id> | frame <up|down> [n] | list-source [line]
 jdbg raw <jdb command...>
 
 # Setup & maintenance
-jdbg setup [--remove] [--print]
+jdbg setup [--remove] [--print] [--target claude,codex|auto|all|none] [--yes]
 jdbg update
 --session <id>   target a specific session (defaults to the sole live one)
 --json           machine-readable JSON output
@@ -154,13 +160,13 @@ jdbg update
 --jdb-path <p>   explicit path to the jdb executable
 ```
 
-## MCP Server (Claude Code native tools)
+## MCP Server (agent native tools)
 
-`jdbg __mcp` runs a stdio JSON-RPC 2.0 MCP server, exposing the CLI surface as **30 native tools**
+`jdbg __mcp` runs a stdio JSON-RPC 2.0 MCP server, exposing the CLI surface as **36 native tools**
 (`launch`, `break_at`, `run`, `locals`, `cont`, `inspect`, …) so Claude Code can drive a debug session
-without going through Bash. Tools appear as `mcp__jdbg__<tool>`.
+without going through Bash. In Claude Code, tools appear as `mcp__jdbg__<tool>`.
 
-`jdbg setup` ([Get Started step 2](#2-register-with-claude-code)) wires this up for you. To configure it
+`jdbg setup` ([Get Started step 2](#2-register-with-your-coding-agent)) wires this up for you. To configure it
 manually instead — or to point at a **dev build** while hacking on jdbg itself:
 
 ```json
@@ -169,6 +175,14 @@ manually instead — or to point at a **dev build** while hacking on jdbg itself
     "jdbg": { "command": "target/debug/jdbg", "args": ["__mcp"] }
   }
 }
+```
+
+For Codex, add the equivalent TOML table to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.jdbg]
+command = "target/debug/jdbg"
+args = ["__mcp"]
 ```
 
 The repo ships `.mcp.json` (dev) and `.claude-plugin/plugin.json` (distribution) wiring this up.

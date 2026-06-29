@@ -1,8 +1,9 @@
-//! 工具目录 + 翻译层——MCP `tools/call` ↔ [`crate::protocol::Command`] 的唯一映射点。
+//! Tool catalog and translation layer: the sole mapping point between MCP `tools/call` and [`crate::protocol::Command`].
 //!
-//! 每个 jdbg 子命令对应一个 MCP 工具（细粒度 1:1）。[`tool_specs`] 供 `tools/list` 列出；
-//! [`dispatch_tool`] 把 (工具名, arguments) 翻译成 [`Request`]，对齐 `main.rs::build_command`
-//! 的既有转换（如 `classpath` string→`Vec`、`raw` 单 string、各默认值）。
+//! Each jdbg subcommand maps to one MCP tool (fine-grained 1:1). [`tool_specs`] is used by `tools/list`;
+//! [`dispatch_tool`] translates (tool name, arguments) into a [`Request`], matching the existing
+//! `main.rs::build_command` conversions (for example `classpath` string→`Vec`, single-string `raw`,
+//! and default values).
 
 use serde::Serialize;
 use serde_json::{Map, Value, json};
@@ -10,7 +11,7 @@ use serde_json::{Map, Value, json};
 use super::jsonrpc::{INVALID_PARAMS, JsonRpcError, METHOD_NOT_FOUND};
 use crate::protocol::{Command, Request};
 
-/// 一个工具的对外描述（序列化进 `tools/list`）。
+/// Public description of a tool, serialized into `tools/list`.
 #[derive(Debug, Clone, Serialize)]
 pub struct ToolSpec {
     pub name: &'static str,
@@ -19,10 +20,10 @@ pub struct ToolSpec {
     pub input_schema: Value,
 }
 
-/// 全部 25 个工具的 spec（供 `tools/list`）。
+/// Specs for all 36 tools, used by `tools/list`.
 pub fn tool_specs() -> Vec<ToolSpec> {
     vec![
-        // ── 会话 ──
+        // ── Sessions ──
         tool(
             "launch",
             "Launch a Java program under the debugger. Returns a session in state 'loaded' \
@@ -55,10 +56,31 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             false,
             false,
         ),
-        tool("status", "Report a session's run state, mode, target, and last event (sends no jdb command).", json!({}), &[], true, false),
-        tool("list", "List all active debug sessions.", json!({}), &[], false, false),
-        tool("kill", "End a debug session (defaults to the sole session if exactly one exists).", json!({}), &[], true, false),
-        // ── 断点 ──
+        tool(
+            "status",
+            "Report a session's run state, mode, target, and last event (sends no jdb command).",
+            json!({}),
+            &[],
+            true,
+            false,
+        ),
+        tool(
+            "list",
+            "List all active debug sessions.",
+            json!({}),
+            &[],
+            false,
+            false,
+        ),
+        tool(
+            "kill",
+            "End a debug session (defaults to the sole session if exactly one exists).",
+            json!({}),
+            &[],
+            true,
+            false,
+        ),
+        // ── Breakpoints ──
         tool(
             "break_at",
             "Set a line breakpoint at Class:line. Execution stops BEFORE this line runs (the line \
@@ -127,7 +149,14 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             true,
             false,
         ),
-        tool("breakpoints", "List the currently set breakpoints.", json!({}), &[], true, false),
+        tool(
+            "breakpoints",
+            "List the currently set breakpoints.",
+            json!({}),
+            &[],
+            true,
+            false,
+        ),
         tool(
             "clear",
             "Remove a breakpoint by spec (Class:line or Class.method).",
@@ -136,13 +165,48 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             true,
             false,
         ),
-        // ── 执行控制（阻塞，较大默认超时）──
-        tool("run", "Start the debugged application (launch mode only). Blocks until a breakpoint, exception, or exit. Returns the stop location with source context and top stack frame when available.", json!({}), &[], true, true),
-        tool("cont", "Continue execution until the next stop (breakpoint, exception, or program exit). Returns the stop location with source context and top stack frame when available.", json!({}), &[], true, true),
-        tool("step", "Step into the next line, entering called methods. Returns the stop location with source context and top stack frame when available.", json!({}), &[], true, true),
-        tool("next", "Step over the next line, without entering called methods. Returns the stop location with source context and top stack frame when available.", json!({}), &[], true, true),
-        tool("step_out", "Run until the current method returns. Returns the stop location with source context and top stack frame when available.", json!({}), &[], true, true),
-        // ── 检查（快）──
+        // ── Execution control (blocking, larger default timeout) ──
+        tool(
+            "run",
+            "Start the debugged application (launch mode only). Blocks until a breakpoint, exception, or exit. Returns the stop location with source context and top stack frame when available.",
+            json!({}),
+            &[],
+            true,
+            true,
+        ),
+        tool(
+            "cont",
+            "Continue execution until the next stop (breakpoint, exception, or program exit). Returns the stop location with source context and top stack frame when available.",
+            json!({}),
+            &[],
+            true,
+            true,
+        ),
+        tool(
+            "step",
+            "Step into the next line, entering called methods. Returns the stop location with source context and top stack frame when available.",
+            json!({}),
+            &[],
+            true,
+            true,
+        ),
+        tool(
+            "next",
+            "Step over the next line, without entering called methods. Returns the stop location with source context and top stack frame when available.",
+            json!({}),
+            &[],
+            true,
+            true,
+        ),
+        tool(
+            "step_out",
+            "Run until the current method returns. Returns the stop location with source context and top stack frame when available.",
+            json!({}),
+            &[],
+            true,
+            true,
+        ),
+        // ── Inspection (fast) ──
         tool(
             "where",
             "Show the current thread's call stack. Set all=true for every thread's stack.",
@@ -151,7 +215,14 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             true,
             false,
         ),
-        tool("locals", "Show local variables in the current frame (requires classes compiled with `javac -g`).", json!({}), &[], true, false),
+        tool(
+            "locals",
+            "Show local variables in the current frame (requires classes compiled with `javac -g`).",
+            json!({}),
+            &[],
+            true,
+            false,
+        ),
         tool(
             "print",
             "Evaluate an expression and show its value (can call methods on live objects).",
@@ -325,7 +396,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
     ]
 }
 
-/// 把一次 `tools/call`（工具名 + arguments）翻译成发往 daemon 的 [`Request`]。
+/// Translate one `tools/call` (tool name + arguments) into a [`Request`] sent to the daemon.
 pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> {
     let session = optional_str(args, "session");
     let timeout = args.get("timeout").and_then(Value::as_u64);
@@ -371,35 +442,63 @@ pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> 
             field: require_str(args, "field")?,
             mode: optional_str(args, "mode").unwrap_or_else(|| "modification".to_string()),
         },
-        "unwatch" => Command::Unwatch { field: require_str(args, "field")? },
+        "unwatch" => Command::Unwatch {
+            field: require_str(args, "field")?,
+        },
         "breakpoints" => Command::Breakpoints,
-        "clear" => Command::Clear { spec: require_str(args, "spec")? },
+        "clear" => Command::Clear {
+            spec: require_str(args, "spec")?,
+        },
         "run" => Command::Run,
         "cont" => Command::Cont,
         "step" => Command::Step,
         "next" => Command::Next,
         "step_out" => Command::StepOut,
-        "where" => Command::Where { all: optional_bool(args, "all") },
+        "where" => Command::Where {
+            all: optional_bool(args, "all"),
+        },
         "locals" => Command::Locals,
-        "print" => Command::Print { expr: require_str(args, "expr")? },
-        "dump" => Command::Dump { expr: require_str(args, "expr")? },
-        "eval" => Command::Eval { expr: require_str(args, "expr")? },
-        "threads" => Command::Threads { filter: optional_str(args, "filter") },
-        "classes" => Command::Classes { pattern: optional_str(args, "pattern") },
-        "methods" => Command::Methods { class: require_str(args, "class")? },
-        "thread" => Command::Thread { id: require_str(args, "id")? },
+        "print" => Command::Print {
+            expr: require_str(args, "expr")?,
+        },
+        "dump" => Command::Dump {
+            expr: require_str(args, "expr")?,
+        },
+        "eval" => Command::Eval {
+            expr: require_str(args, "expr")?,
+        },
+        "threads" => Command::Threads {
+            filter: optional_str(args, "filter"),
+        },
+        "classes" => Command::Classes {
+            pattern: optional_str(args, "pattern"),
+        },
+        "methods" => Command::Methods {
+            class: require_str(args, "class")?,
+        },
+        "thread" => Command::Thread {
+            id: require_str(args, "id")?,
+        },
         "frame" => Command::Frame {
             direction: require_str(args, "direction")?,
             n: optional_u32(args, "n").unwrap_or(1),
         },
-        "list_source" => Command::ListSource { line: optional_u32(args, "line") },
+        "list_source" => Command::ListSource {
+            line: optional_u32(args, "line"),
+        },
         "inspect" => Command::Inspect {
             expr: require_str(args, "expr")?,
             max_elements: optional_u32(args, "max_elements").unwrap_or(10),
         },
-        "raw" => Command::Raw { command: require_str(args, "command")? },
-        "suspend" => Command::Suspend { id: optional_str(args, "id") },
-        "resume" => Command::Resume { id: optional_str(args, "id") },
+        "raw" => Command::Raw {
+            command: require_str(args, "command")?,
+        },
+        "suspend" => Command::Suspend {
+            id: optional_str(args, "id"),
+        },
+        "resume" => Command::Resume {
+            id: optional_str(args, "id"),
+        },
         "set" => Command::Set {
             lvalue: require_str(args, "lvalue")?,
             value: require_str(args, "value")?,
@@ -408,17 +507,26 @@ pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> 
             exception: require_str(args, "exception")?,
             mode: optional_str(args, "mode").unwrap_or_else(|| "all".to_string()),
         },
-        "lock" => Command::Lock { expr: require_str(args, "expr")? },
-        "threadlocks" => Command::ThreadLocks { id: optional_str(args, "id") },
-        _ => return Err(JsonRpcError::new(METHOD_NOT_FOUND, format!("unknown tool: {name}"))),
+        "lock" => Command::Lock {
+            expr: require_str(args, "expr")?,
+        },
+        "threadlocks" => Command::ThreadLocks {
+            id: optional_str(args, "id"),
+        },
+        _ => {
+            return Err(JsonRpcError::new(
+                METHOD_NOT_FOUND,
+                format!("unknown tool: {name}"),
+            ));
+        }
     };
 
     Ok(Request::new(cmd, session).with_timeout(timeout))
 }
 
-// ── 内部 helpers ──────────────────────────────────────────────────────────────
+// ── Internal helpers ───────────────────────────────────────────────────────────
 
-/// 构建一个工具 spec，自动按需注入通用的 `session` / `timeout` 属性。
+/// Build a tool spec, automatically injecting common `session` / `timeout` properties when needed.
 fn tool(
     name: &'static str,
     description: &'static str,
@@ -446,14 +554,23 @@ fn tool(
     if !required.is_empty() {
         schema.insert("required".into(), json!(required));
     }
-    ToolSpec { name, description, input_schema: Value::Object(schema) }
+    ToolSpec {
+        name,
+        description,
+        input_schema: Value::Object(schema),
+    }
 }
 
 fn require_str(args: &Value, key: &str) -> Result<String, JsonRpcError> {
     args.get(key)
         .and_then(Value::as_str)
         .map(String::from)
-        .ok_or_else(|| JsonRpcError::new(INVALID_PARAMS, format!("missing required string parameter: {key}")))
+        .ok_or_else(|| {
+            JsonRpcError::new(
+                INVALID_PARAMS,
+                format!("missing required string parameter: {key}"),
+            )
+        })
 }
 
 fn optional_str(args: &Value, key: &str) -> Option<String> {
@@ -464,7 +581,12 @@ fn require_u32(args: &Value, key: &str) -> Result<u32, JsonRpcError> {
     args.get(key)
         .and_then(Value::as_u64)
         .map(|n| n as u32)
-        .ok_or_else(|| JsonRpcError::new(INVALID_PARAMS, format!("missing required integer parameter: {key}")))
+        .ok_or_else(|| {
+            JsonRpcError::new(
+                INVALID_PARAMS,
+                format!("missing required integer parameter: {key}"),
+            )
+        })
 }
 
 fn optional_u32(args: &Value, key: &str) -> Option<u32> {
@@ -482,11 +604,16 @@ fn optional_bool(args: &Value, key: &str) -> bool {
 fn optional_str_array(args: &Value, key: &str) -> Vec<String> {
     args.get(key)
         .and_then(Value::as_array)
-        .map(|arr| arr.iter().filter_map(Value::as_str).map(String::from).collect())
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(String::from)
+                .collect()
+        })
         .unwrap_or_default()
 }
 
-/// classpath/sourcepath：MCP 收单个 string，包成长度≤1 的 `Vec`（与 `main.rs` 一致）。
+/// classpath/sourcepath: MCP accepts a single string and wraps it in a Vec of length <= 1, matching `main.rs`.
 fn str_to_vec(opt: Option<String>) -> Vec<String> {
     opt.map(|s| vec![s]).unwrap_or_default()
 }
@@ -507,16 +634,26 @@ mod tests {
         let specs = tool_specs();
         let mut names = std::collections::HashSet::new();
         for s in &specs {
-            assert_eq!(s.input_schema["type"], json!("object"), "tool {} schema not object", s.name);
+            assert_eq!(
+                s.input_schema["type"],
+                json!("object"),
+                "tool {} schema not object",
+                s.name
+            );
             assert!(names.insert(s.name), "duplicate tool name: {}", s.name);
         }
     }
 
     #[test]
     fn launch_maps_classpath_string_to_vec() {
-        let req = dispatch_tool("launch", &json!({"main_class": "Main", "classpath": "out"})).unwrap();
+        let req =
+            dispatch_tool("launch", &json!({"main_class": "Main", "classpath": "out"})).unwrap();
         match req.cmd {
-            Command::Launch { main_class, classpath, .. } => {
+            Command::Launch {
+                main_class,
+                classpath,
+                ..
+            } => {
                 assert_eq!(main_class, "Main");
                 assert_eq!(classpath, vec!["out".to_string()]);
             }
@@ -526,9 +663,15 @@ mod tests {
 
     #[test]
     fn launch_app_args_array_passed_through() {
-        let req = dispatch_tool("launch", &json!({"main_class": "Main", "app_args": ["a", "b"]})).unwrap();
+        let req = dispatch_tool(
+            "launch",
+            &json!({"main_class": "Main", "app_args": ["a", "b"]}),
+        )
+        .unwrap();
         match req.cmd {
-            Command::Launch { app_args, .. } => assert_eq!(app_args, vec!["a".to_string(), "b".to_string()]),
+            Command::Launch { app_args, .. } => {
+                assert_eq!(app_args, vec!["a".to_string(), "b".to_string()])
+            }
             other => panic!("expected Launch, got {other:?}"),
         }
     }
@@ -536,7 +679,9 @@ mod tests {
     #[test]
     fn break_at_maps_class_and_line() {
         let req = dispatch_tool("break_at", &json!({"class": "Main", "line": 42})).unwrap();
-        assert!(matches!(req.cmd, Command::BreakAt { ref class, line, .. } if class == "Main" && line == 42));
+        assert!(
+            matches!(req.cmd, Command::BreakAt { ref class, line, .. } if class == "Main" && line == 42)
+        );
     }
 
     #[test]
@@ -556,19 +701,27 @@ mod tests {
     #[test]
     fn frame_defaults_n_to_one() {
         let req = dispatch_tool("frame", &json!({"direction": "up"})).unwrap();
-        assert!(matches!(req.cmd, Command::Frame { ref direction, n } if direction == "up" && n == 1));
+        assert!(
+            matches!(req.cmd, Command::Frame { ref direction, n } if direction == "up" && n == 1)
+        );
     }
 
     #[test]
     fn catch_defaults_mode_to_all() {
-        let req = dispatch_tool("catch", &json!({"exception": "java.lang.NullPointerException"})).unwrap();
+        let req = dispatch_tool(
+            "catch",
+            &json!({"exception": "java.lang.NullPointerException"}),
+        )
+        .unwrap();
         assert!(matches!(req.cmd, Command::Catch { ref mode, .. } if mode == "all"));
     }
 
     #[test]
     fn raw_takes_single_command_string() {
         let req = dispatch_tool("raw", &json!({"command": "methods java.lang.String"})).unwrap();
-        assert!(matches!(req.cmd, Command::Raw { ref command } if command == "methods java.lang.String"));
+        assert!(
+            matches!(req.cmd, Command::Raw { ref command } if command == "methods java.lang.String")
+        );
     }
 
     #[test]
@@ -603,21 +756,34 @@ mod tests {
 
     #[test]
     fn no_arg_tools_dispatch_without_arguments() {
-        assert!(matches!(dispatch_tool("status", &json!({})).unwrap().cmd, Command::Status));
-        assert!(matches!(dispatch_tool("list", &json!({})).unwrap().cmd, Command::List));
-        assert!(matches!(dispatch_tool("run", &json!({})).unwrap().cmd, Command::Run));
+        assert!(matches!(
+            dispatch_tool("status", &json!({})).unwrap().cmd,
+            Command::Status
+        ));
+        assert!(matches!(
+            dispatch_tool("list", &json!({})).unwrap().cmd,
+            Command::List
+        ));
+        assert!(matches!(
+            dispatch_tool("run", &json!({})).unwrap().cmd,
+            Command::Run
+        ));
     }
 
     #[test]
     fn inspect_maps_expr_and_defaults_max() {
         let req = dispatch_tool("inspect", &json!({"expr": "myList"})).unwrap();
-        assert!(matches!(req.cmd, Command::Inspect { ref expr, max_elements } if expr == "myList" && max_elements == 10));
+        assert!(
+            matches!(req.cmd, Command::Inspect { ref expr, max_elements } if expr == "myList" && max_elements == 10)
+        );
     }
 
     #[test]
     fn inspect_accepts_custom_max_elements() {
         let req = dispatch_tool("inspect", &json!({"expr": "arr", "max_elements": 5})).unwrap();
-        assert!(matches!(req.cmd, Command::Inspect { ref expr, max_elements } if expr == "arr" && max_elements == 5));
+        assert!(
+            matches!(req.cmd, Command::Inspect { ref expr, max_elements } if expr == "arr" && max_elements == 5)
+        );
     }
 
     // ─── suspend parameter tests ─────────────────────────────────────────────
@@ -688,7 +854,11 @@ mod tests {
 
     #[test]
     fn break_at_suspend_thread_maps() {
-        let req = dispatch_tool("break_at", &json!({"class": "Main", "line": 10, "suspend": "thread"})).unwrap();
+        let req = dispatch_tool(
+            "break_at",
+            &json!({"class": "Main", "line": 10, "suspend": "thread"}),
+        )
+        .unwrap();
         match req.cmd {
             Command::BreakAt { suspend, .. } => assert_eq!(suspend, Some("thread".to_string())),
             other => panic!("expected BreakAt, got {other:?}"),
@@ -697,7 +867,11 @@ mod tests {
 
     #[test]
     fn break_at_suspend_all_maps() {
-        let req = dispatch_tool("break_at", &json!({"class": "Main", "line": 10, "suspend": "all"})).unwrap();
+        let req = dispatch_tool(
+            "break_at",
+            &json!({"class": "Main", "line": 10, "suspend": "all"}),
+        )
+        .unwrap();
         match req.cmd {
             Command::BreakAt { suspend, .. } => assert_eq!(suspend, Some("all".to_string())),
             other => panic!("expected BreakAt, got {other:?}"),
@@ -715,7 +889,11 @@ mod tests {
 
     #[test]
     fn break_in_suspend_thread_maps() {
-        let req = dispatch_tool("break_in", &json!({"class": "Main", "method": "foo", "suspend": "thread"})).unwrap();
+        let req = dispatch_tool(
+            "break_in",
+            &json!({"class": "Main", "method": "foo", "suspend": "thread"}),
+        )
+        .unwrap();
         match req.cmd {
             Command::BreakIn { suspend, .. } => assert_eq!(suspend, Some("thread".to_string())),
             other => panic!("expected BreakIn, got {other:?}"),
@@ -733,13 +911,19 @@ mod tests {
 
     #[test]
     fn break_at_with_condition_and_suspend() {
-        let req = dispatch_tool("break_at", &json!({
-            "class": "Main", "line": 10,
-            "condition": "x > 5",
-            "suspend": "thread"
-        })).unwrap();
+        let req = dispatch_tool(
+            "break_at",
+            &json!({
+                "class": "Main", "line": 10,
+                "condition": "x > 5",
+                "suspend": "thread"
+            }),
+        )
+        .unwrap();
         match req.cmd {
-            Command::BreakAt { condition, suspend, .. } => {
+            Command::BreakAt {
+                condition, suspend, ..
+            } => {
                 assert_eq!(condition, Some("x > 5".to_string()));
                 assert_eq!(suspend, Some("thread".to_string()));
             }
@@ -781,7 +965,10 @@ mod tests {
 
     #[test]
     fn resume_maps() {
-        match dispatch_tool("resume", &json!({"id": "18315"})).unwrap().cmd {
+        match dispatch_tool("resume", &json!({"id": "18315"}))
+            .unwrap()
+            .cmd
+        {
             Command::Resume { id } => assert_eq!(id, Some("18315".to_string())),
             other => panic!("expected Resume, got {other:?}"),
         }
@@ -789,7 +976,10 @@ mod tests {
 
     #[test]
     fn set_maps_lvalue_and_value() {
-        match dispatch_tool("set", &json!({"lvalue": "this.count", "value": "42"})).unwrap().cmd {
+        match dispatch_tool("set", &json!({"lvalue": "this.count", "value": "42"}))
+            .unwrap()
+            .cmd
+        {
             Command::Set { lvalue, value } => {
                 assert_eq!(lvalue, "this.count");
                 assert_eq!(value, "42");
@@ -805,14 +995,20 @@ mod tests {
 
     #[test]
     fn ignore_maps_with_mode_default() {
-        match dispatch_tool("ignore", &json!({"exception": "java.lang.NPE"})).unwrap().cmd {
+        match dispatch_tool("ignore", &json!({"exception": "java.lang.NPE"}))
+            .unwrap()
+            .cmd
+        {
             Command::Ignore { exception, mode } => {
                 assert_eq!(exception, "java.lang.NPE");
                 assert_eq!(mode, "all");
             }
             other => panic!("expected Ignore, got {other:?}"),
         }
-        match dispatch_tool("ignore", &json!({"exception": "E", "mode": "uncaught"})).unwrap().cmd {
+        match dispatch_tool("ignore", &json!({"exception": "E", "mode": "uncaught"}))
+            .unwrap()
+            .cmd
+        {
             Command::Ignore { mode, .. } => assert_eq!(mode, "uncaught"),
             other => panic!("expected Ignore, got {other:?}"),
         }
@@ -820,7 +1016,10 @@ mod tests {
 
     #[test]
     fn lock_maps_expr() {
-        match dispatch_tool("lock", &json!({"expr": "this.mutex"})).unwrap().cmd {
+        match dispatch_tool("lock", &json!({"expr": "this.mutex"}))
+            .unwrap()
+            .cmd
+        {
             Command::Lock { expr } => assert_eq!(expr, "this.mutex"),
             other => panic!("expected Lock, got {other:?}"),
         }
@@ -828,7 +1027,10 @@ mod tests {
 
     #[test]
     fn threadlocks_with_and_without_id() {
-        match dispatch_tool("threadlocks", &json!({"id": "0xbb"})).unwrap().cmd {
+        match dispatch_tool("threadlocks", &json!({"id": "0xbb"}))
+            .unwrap()
+            .cmd
+        {
             Command::ThreadLocks { id } => assert_eq!(id, Some("0xbb".to_string())),
             other => panic!("expected ThreadLocks, got {other:?}"),
         }
