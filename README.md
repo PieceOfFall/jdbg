@@ -1,13 +1,13 @@
 # jdbg
 
-**Agent-friendly Java debugger** CLI for Claude Code, Codex, Pi, and humans, wrapping JDK `jdb` with persistent sessions, structured output, and native MCP tools.
+**Agent-friendly Java debugger** CLI for Claude Code, Codex, OpenCode, Pi, and humans, wrapping JDK `jdb` with persistent sessions, structured output, and native MCP tools.
 
 ## Highlights
 
 - **Prompt-aware, not sleep-based** — reads jdb output until the prompt returns; never guesses with timeouts.
 - **Stateful daemon** — a background process keeps debug sessions alive across CLI invocations.
 - **Windows-first, cross-platform** — pure Rust, no Bash/WSL/temp-file dependencies.
-- **Two access paths** — CLI (`jdbg <cmd>`) and MCP server (`jdbg __mcp`) for native tool calls from Claude Code and Codex; Pi uses the CLI skill.
+- **Two access paths** — CLI (`jdbg <cmd>`) and MCP server (`jdbg __mcp`) for native tool calls from Claude Code, Codex, and OpenCode; Pi uses the CLI skill.
 - **Structured output** — human-readable text by default, `--json` for machine consumption.
 - **Auto-enriched stop results** — breakpoint/step hits include source context and top stack frame automatically.
 - **Conditional breakpoints** — filter high-traffic code with boolean expressions (e.g. `userId == 123`).
@@ -54,7 +54,7 @@ cargo build --release   # binary at target/release/jdbg
 
 ### 2. Register with your coding agent
 
-One command wires `jdbg` into Claude Code and/or Codex as an MCP server, or into Pi as a CLI skill:
+One command wires `jdbg` into Claude Code, Codex, and/or OpenCode as an MCP server, or into Pi as a CLI skill:
 
 ```bash
 jdbg setup
@@ -65,12 +65,13 @@ When Claude Code is selected:
 This writes the MCP server entry to `~/.claude.json` and an auto-allow permission (`mcp__jdbg__*`) to `~/.claude/settings.json`. **Restart Claude Code** to pick up the new server — its tools then appear as `mcp__jdbg__<tool>`.
 
 ```bash
-jdbg setup --target claude,codex,pi --yes
+jdbg setup --target claude,codex,opencode,pi --yes
 jdbg setup --target codex --print    # preview the Codex config snippet without writing anything
+jdbg setup --target opencode --print # preview the OpenCode config snippet without writing anything
 jdbg setup --target pi --print       # preview the Pi CLI skill destination
 ```
 
-With no flags, `jdbg setup` prompts for the agent targets to configure. Claude Code gets `~/.claude.json`, `~/.claude/settings.json`, and the MCP skill at `~/.claude/skills/jdbg/SKILL.md`; Codex gets `~/.codex/config.toml` and the MCP skill at `~/.codex/skills/jdbg/SKILL.md`; Pi gets the CLI skill at `~/.pi/agent/skills/jdbg/SKILL.md`. Restart or reload the configured agent to pick up jdbg.
+With no flags, `jdbg setup` prompts for the agent targets to configure. Claude Code gets `~/.claude.json`, `~/.claude/settings.json`, and the MCP skill at `~/.claude/skills/jdbg/SKILL.md`; Codex gets `~/.codex/config.toml` and the MCP skill at `~/.codex/skills/jdbg/SKILL.md`; OpenCode gets `~/.config/opencode/opencode.json` and the MCP skill at `~/.config/opencode/skills/jdbg/SKILL.md`; Pi gets the CLI skill at `~/.pi/agent/skills/jdbg/SKILL.md`. Restart or reload the configured agent to pick up jdbg.
 
 ### 3. Start debugging
 
@@ -99,7 +100,7 @@ jdbg kill
 jdbg daemon stop
 ```
 
-In Claude Code or Codex, just ask it to debug — it drives the same flow through the `mcp__jdbg__*` tools. In Pi, the installed skill teaches the agent to drive the same flow through the `jdbg` CLI.
+In Claude Code, Codex, or OpenCode, just ask it to debug — it drives the same flow through the `mcp__jdbg__*` tools. In Pi, the installed skill teaches the agent to drive the same flow through the `jdbg` CLI.
 
 ### Update to latest version
 
@@ -107,13 +108,14 @@ In Claude Code or Codex, just ask it to debug — it drives the same flow throug
 jdbg update
 ```
 
-This detects which agents already have jdbg configured, removes those registrations, downloads and installs the latest release from GitHub, then re-registers the same Claude/Codex/Pi targets. On Windows it handles the running-exe file lock automatically.
+This detects which agents already have jdbg configured, removes those registrations, downloads and installs the latest release from GitHub, then re-registers the same Claude/Codex/OpenCode/Pi targets. On Windows it handles the running-exe file lock automatically.
 
 ### Uninstall
 
 ```bash
 jdbg setup --remove                  # removes configured jdbg agent registrations; leaves the binary
 jdbg setup --remove --target codex   # remove only Codex registration
+jdbg setup --remove --target opencode # remove only OpenCode registration
 jdbg setup --remove --target pi      # remove only Pi's CLI skill
 ```
 
@@ -154,7 +156,7 @@ jdbg threads | thread <id> | frame <up|down> [n] | list-source [line]
 jdbg raw <jdb command...>
 
 # Setup & maintenance
-jdbg setup [--remove] [--print] [--target claude,codex,pi|auto|all|none] [--yes]
+jdbg setup [--remove] [--print] [--target claude,codex,opencode,pi|auto|all|none] [--yes]
 jdbg update
 --session <id>   target a specific session (defaults to the sole live one)
 --json           machine-readable JSON output
@@ -165,8 +167,8 @@ jdbg update
 ## MCP Server (agent native tools)
 
 `jdbg __mcp` runs a stdio JSON-RPC 2.0 MCP server, exposing the CLI surface as **36 native tools**
-(`launch`, `break_at`, `run`, `locals`, `cont`, `inspect`, …) so Claude Code and Codex can drive a debug session
-without going through Bash. In Claude Code and Codex, tools appear as `mcp__jdbg__<tool>`.
+(`launch`, `break_at`, `run`, `locals`, `cont`, `inspect`, …) so Claude Code, Codex, and OpenCode can drive a debug session
+without going through Bash. In Claude Code, Codex, and OpenCode, tools appear as `mcp__jdbg__<tool>`.
 
 `jdbg setup` ([Get Started step 2](#2-register-with-your-coding-agent)) wires this up for you. To configure it
 manually instead — or to point at a **dev build** while hacking on jdbg itself:
@@ -185,6 +187,21 @@ For Codex, add the equivalent TOML table to `~/.codex/config.toml`:
 [mcp_servers.jdbg]
 command = "target/debug/jdbg"
 args = ["__mcp"]
+```
+
+For OpenCode, add the equivalent local MCP server to `~/.config/opencode/opencode.json`:
+
+```json
+{
+  "$schema": "https://opencode.ai/config.json",
+  "mcp": {
+    "jdbg": {
+      "type": "local",
+      "command": ["target/debug/jdbg", "__mcp"],
+      "enabled": true
+    }
+  }
+}
 ```
 
 The repo ships `.mcp.json` (dev) and `.claude-plugin/plugin.json` (distribution) wiring this up.

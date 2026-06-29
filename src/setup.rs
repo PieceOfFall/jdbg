@@ -3,6 +3,7 @@
 //! First-version targets:
 //! - Claude Code: `~/.claude.json`, `~/.claude/settings.json`, `~/.claude/skills/jdbg/`
 //! - Codex: `~/.codex/config.toml`, `~/.codex/skills/jdbg/`
+//! - OpenCode: `~/.config/opencode/opencode.json`, `~/.config/opencode/skills/jdbg/`
 //! - Pi: `~/.pi/agent/skills/jdbg/`
 
 use std::fs;
@@ -15,6 +16,7 @@ use serde_json::{Value, json};
 const MCP_SERVER_KEY: &str = "jdbg";
 const PERMISSION_ENTRY: &str = "mcp__jdbg__*";
 const CODEX_TOML_HEADER: &str = "mcp_servers.jdbg";
+const OPENCODE_SCHEMA: &str = "https://opencode.ai/config.json";
 
 const MCP_SKILL_MD: &str = include_str!("../skills/jdbg/mcp/SKILL.md");
 const CLI_SKILL_MD: &str = include_str!("../skills/jdbg/cli/SKILL.md");
@@ -23,6 +25,7 @@ const CLI_SKILL_MD: &str = include_str!("../skills/jdbg/cli/SKILL.md");
 pub enum TargetId {
     Claude,
     Codex,
+    Opencode,
     Pi,
 }
 
@@ -31,6 +34,7 @@ impl TargetId {
         match self {
             TargetId::Claude => "claude",
             TargetId::Codex => "codex",
+            TargetId::Opencode => "opencode",
             TargetId::Pi => "pi",
         }
     }
@@ -39,12 +43,18 @@ impl TargetId {
         match self {
             TargetId::Claude => "Claude Code",
             TargetId::Codex => "Codex",
+            TargetId::Opencode => "OpenCode",
             TargetId::Pi => "Pi",
         }
     }
 }
 
-const ALL_TARGETS: [TargetId; 3] = [TargetId::Claude, TargetId::Codex, TargetId::Pi];
+const ALL_TARGETS: [TargetId; 4] = [
+    TargetId::Claude,
+    TargetId::Codex,
+    TargetId::Opencode,
+    TargetId::Pi,
+];
 
 #[derive(Debug)]
 struct Paths {
@@ -83,6 +93,18 @@ impl Paths {
 
     fn codex_skill_dir(&self) -> PathBuf {
         self.codex_dir().join("skills").join("jdbg")
+    }
+
+    fn opencode_dir(&self) -> PathBuf {
+        self.home.join(".config").join("opencode")
+    }
+
+    fn opencode_config(&self) -> PathBuf {
+        self.opencode_dir().join("opencode.json")
+    }
+
+    fn opencode_skill_dir(&self) -> PathBuf {
+        self.opencode_dir().join("skills").join("jdbg")
     }
 
     fn pi_dir(&self) -> PathBuf {
@@ -131,11 +153,28 @@ fn mcp_server_value() -> Value {
     })
 }
 
+fn opencode_mcp_server_value() -> Value {
+    json!({
+        "type": "local",
+        "command": ["jdbg", "__mcp"],
+        "enabled": true
+    })
+}
+
 fn read_json(path: &Path) -> Value {
     fs::read_to_string(path)
         .ok()
         .and_then(|s| serde_json::from_str(&s).ok())
         .unwrap_or_else(|| json!({}))
+}
+
+fn read_json_strict(path: &Path) -> Result<Value> {
+    match fs::read_to_string(path) {
+        Ok(s) => serde_json::from_str(&s)
+            .with_context(|| format!("failed to parse JSON config {}", path.display())),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(json!({})),
+        Err(err) => Err(err).with_context(|| format!("failed to read {}", path.display())),
+    }
 }
 
 fn write_json(path: &Path, value: &Value) -> Result<()> {
@@ -206,6 +245,39 @@ fn apply_mcp_remove(config: &mut Value) -> bool {
     }
     if servers.is_empty() {
         obj.remove("mcpServers");
+    }
+    true
+}
+
+fn apply_opencode_mcp_install(config: &mut Value) {
+    if !config.is_object() {
+        *config = json!({});
+    }
+    let obj = config.as_object_mut().unwrap();
+    obj.entry("$schema")
+        .or_insert_with(|| json!(OPENCODE_SCHEMA));
+    let servers = obj.entry("mcp").or_insert_with(|| json!({}));
+    if !servers.is_object() {
+        *servers = json!({});
+    }
+    servers
+        .as_object_mut()
+        .unwrap()
+        .insert(MCP_SERVER_KEY.to_owned(), opencode_mcp_server_value());
+}
+
+fn apply_opencode_mcp_remove(config: &mut Value) -> bool {
+    let Some(obj) = config.as_object_mut() else {
+        return false;
+    };
+    let Some(servers) = obj.get_mut("mcp").and_then(|v| v.as_object_mut()) else {
+        return false;
+    };
+    if servers.remove(MCP_SERVER_KEY).is_none() {
+        return false;
+    }
+    if servers.is_empty() {
+        obj.remove("mcp");
     }
     true
 }
@@ -351,6 +423,19 @@ fn detect_codex_configured(paths: &Paths) -> bool {
         .unwrap_or(false)
 }
 
+fn detect_opencode_configured(paths: &Paths) -> bool {
+    read_json_strict(&paths.opencode_config())
+        .ok()
+        .and_then(|config| {
+            config
+                .get("mcp")
+                .and_then(|v| v.as_object())
+                .and_then(|servers| servers.get(MCP_SERVER_KEY))
+                .cloned()
+        })
+        .is_some()
+}
+
 fn detect_pi_configured(paths: &Paths) -> bool {
     paths.pi_skill_dir().join("SKILL.md").exists()
 }
@@ -359,6 +444,7 @@ fn detect_installed(target: TargetId, paths: &Paths) -> bool {
     match target {
         TargetId::Claude => paths.home.join(".claude").exists() || paths.claude_config().exists(),
         TargetId::Codex => paths.codex_dir().exists() || paths.codex_config().exists(),
+        TargetId::Opencode => paths.opencode_dir().exists() || paths.opencode_config().exists(),
         TargetId::Pi => {
             paths.pi_dir().exists()
                 || paths.pi_settings().exists()
@@ -372,6 +458,7 @@ fn detect_configured(target: TargetId, paths: &Paths) -> bool {
     match target {
         TargetId::Claude => detect_claude_configured(paths),
         TargetId::Codex => detect_codex_configured(paths),
+        TargetId::Opencode => detect_opencode_configured(paths),
         TargetId::Pi => detect_pi_configured(paths),
     }
 }
@@ -422,6 +509,7 @@ fn target_by_id(id: &str) -> Option<TargetId> {
     match id {
         "claude" => Some(TargetId::Claude),
         "codex" => Some(TargetId::Codex),
+        "opencode" => Some(TargetId::Opencode),
         "pi" => Some(TargetId::Pi),
         _ => None,
     }
@@ -451,7 +539,7 @@ fn parse_target_flag(value: &str, paths: &Paths) -> Result<Vec<TargetId>> {
 
     if !unknown.is_empty() {
         bail!(
-            "unknown --target id(s): {}. Known: claude, codex, pi, plus auto/all/none",
+            "unknown --target id(s): {}. Known: claude, codex, opencode, pi, plus auto/all/none",
             unknown.join(", ")
         );
     }
@@ -493,7 +581,8 @@ fn prompt_targets(defaults: &[TargetId]) -> Result<Vec<TargetId>> {
         let target = match item {
             "1" => Some(TargetId::Claude),
             "2" => Some(TargetId::Codex),
-            "3" => Some(TargetId::Pi),
+            "3" => Some(TargetId::Opencode),
+            "4" => Some(TargetId::Pi),
             other => target_by_id(other),
         };
         match target {
@@ -604,6 +693,37 @@ fn remove_codex(paths: &Paths) -> Result<Vec<PathBuf>> {
     Ok(changed)
 }
 
+fn install_opencode(paths: &Paths) -> Result<Vec<PathBuf>> {
+    let config_path = paths.opencode_config();
+    let mut config = read_json_strict(&config_path)?;
+    apply_opencode_mcp_install(&mut config);
+    write_json(&config_path, &config)?;
+    let skill_path = install_skill(&paths.opencode_skill_dir(), MCP_SKILL_MD)?;
+    Ok(vec![config_path, skill_path])
+}
+
+fn remove_opencode(paths: &Paths) -> Result<Vec<PathBuf>> {
+    let config_path = paths.opencode_config();
+    let mut changed = Vec::new();
+
+    if config_path.exists() {
+        let mut config = read_json_strict(&config_path)?;
+        if apply_opencode_mcp_remove(&mut config) {
+            if config.as_object().map(|o| o.is_empty()).unwrap_or(false) {
+                let _ = fs::remove_file(&config_path);
+            } else {
+                write_json(&config_path, &config)?;
+            }
+            changed.push(config_path);
+        }
+    }
+
+    if remove_skill(&paths.opencode_skill_dir())? {
+        changed.push(paths.opencode_skill_dir());
+    }
+    Ok(changed)
+}
+
 fn install_pi(paths: &Paths) -> Result<Vec<PathBuf>> {
     let skill_path = install_skill(&paths.pi_skill_dir(), CLI_SKILL_MD)?;
     Ok(vec![skill_path])
@@ -627,6 +747,18 @@ fn print_target_config(target: TargetId, paths: &Paths) -> Result<()> {
         TargetId::Codex => {
             println!("# Codex: add to {}", paths.codex_config().display());
             println!("{}", codex_mcp_block());
+        }
+        TargetId::Opencode => {
+            let snippet = json!({
+                "$schema": OPENCODE_SCHEMA,
+                "mcp": { MCP_SERVER_KEY: opencode_mcp_server_value() }
+            });
+            println!("# OpenCode: add to {}", paths.opencode_config().display());
+            println!("{}", serde_json::to_string_pretty(&snippet)?);
+            println!(
+                "# OpenCode discovers skills under {}.",
+                paths.opencode_dir().join("skills").display()
+            );
         }
         TargetId::Pi => {
             println!(
@@ -672,6 +804,7 @@ pub fn run_setup(remove: bool, print: bool, target: Option<&str>, yes: bool) -> 
             let changed = match target {
                 TargetId::Claude => remove_claude(&paths)?,
                 TargetId::Codex => remove_codex(&paths)?,
+                TargetId::Opencode => remove_opencode(&paths)?,
                 TargetId::Pi => remove_pi(&paths)?,
             };
             if changed.is_empty() {
@@ -692,6 +825,7 @@ pub fn run_setup(remove: bool, print: bool, target: Option<&str>, yes: bool) -> 
             let written = match target {
                 TargetId::Claude => install_claude(&paths)?,
                 TargetId::Codex => install_codex(&paths)?,
+                TargetId::Opencode => install_opencode(&paths)?,
                 TargetId::Pi => install_pi(&paths)?,
             };
             println!("Registered jdbg for {}.", target.display_name());
@@ -743,6 +877,33 @@ mod tests {
         apply_mcp_install(&mut config);
         assert_eq!(config["mcpServers"][MCP_SERVER_KEY], mcp_server_value());
         assert_eq!(config["mcpServers"].as_object().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn opencode_install_preserves_other_servers_and_schema() {
+        let mut config = json!({
+            "mcp": { "other": { "type": "local", "command": ["x"] } },
+            "theme": "system"
+        });
+        apply_opencode_mcp_install(&mut config);
+        assert_eq!(config["$schema"], json!(OPENCODE_SCHEMA));
+        assert_eq!(config["mcp"][MCP_SERVER_KEY], opencode_mcp_server_value());
+        assert_eq!(config["mcp"]["other"]["command"], json!(["x"]));
+        assert_eq!(config["theme"], json!("system"));
+    }
+
+    #[test]
+    fn opencode_remove_keeps_sibling_servers() {
+        let mut config = json!({
+            "mcp": {
+                MCP_SERVER_KEY: opencode_mcp_server_value(),
+                "other": { "type": "local", "command": ["x"] }
+            }
+        });
+        let changed = apply_opencode_mcp_remove(&mut config);
+        assert!(changed);
+        assert!(config["mcp"].get(MCP_SERVER_KEY).is_none());
+        assert_eq!(config["mcp"]["other"]["command"], json!(["x"]));
     }
 
     #[test]
@@ -827,8 +988,13 @@ mod tests {
             ALL_TARGETS.to_vec()
         );
         assert_eq!(
-            parse_target_flag("claude,codex,pi,claude", &paths).unwrap(),
-            vec![TargetId::Claude, TargetId::Codex, TargetId::Pi]
+            parse_target_flag("claude,codex,opencode,pi,claude", &paths).unwrap(),
+            vec![
+                TargetId::Claude,
+                TargetId::Codex,
+                TargetId::Opencode,
+                TargetId::Pi
+            ]
         );
         assert!(parse_target_flag("claude,bogus", &paths).is_err());
     }
@@ -843,6 +1009,10 @@ mod tests {
         assert_eq!(resolve_auto_targets(&paths), vec![TargetId::Codex]);
 
         let _ = fs::remove_dir_all(paths.codex_dir());
+        fs::create_dir_all(paths.opencode_dir()).unwrap();
+        assert_eq!(resolve_auto_targets(&paths), vec![TargetId::Opencode]);
+
+        let _ = fs::remove_dir_all(paths.opencode_dir());
         fs::create_dir_all(paths.pi_dir()).unwrap();
         assert_eq!(resolve_auto_targets(&paths), vec![TargetId::Pi]);
 
@@ -885,7 +1055,7 @@ mod tests {
     }
 
     #[test]
-    fn detect_configured_finds_claude_and_codex() {
+    fn detect_configured_finds_claude_codex_opencode_and_pi() {
         let home = temp_home("detect");
         let paths = Paths::for_home(&home);
         assert!(detect_configured_targets(&paths).is_empty());
@@ -901,10 +1071,21 @@ mod tests {
             vec![TargetId::Claude, TargetId::Codex]
         );
 
+        install_opencode(&paths).unwrap();
+        assert_eq!(
+            detect_configured_targets(&paths),
+            vec![TargetId::Claude, TargetId::Codex, TargetId::Opencode]
+        );
+
         install_pi(&paths).unwrap();
         assert_eq!(
             detect_configured_targets(&paths),
-            vec![TargetId::Claude, TargetId::Codex, TargetId::Pi]
+            vec![
+                TargetId::Claude,
+                TargetId::Codex,
+                TargetId::Opencode,
+                TargetId::Pi
+            ]
         );
 
         let _ = fs::remove_dir_all(home);
@@ -935,6 +1116,48 @@ mod tests {
         assert!(after_remove.contains("[tail]"));
         assert!(!after_remove.contains("[mcp_servers.jdbg]"));
         assert!(!paths.codex_skill_dir().exists());
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn install_and_remove_opencode_preserves_sibling_mcp_servers() {
+        let home = temp_home("opencode");
+        let paths = Paths::for_home(&home);
+        write_json(
+            &paths.opencode_config(),
+            &json!({
+                "mcp": {
+                    "other": { "type": "local", "command": ["other-mcp"], "enabled": true }
+                },
+                "model": "test-model"
+            }),
+        )
+        .unwrap();
+
+        let written = install_opencode(&paths).unwrap();
+        assert_eq!(written.len(), 2);
+        let after_install = read_json_strict(&paths.opencode_config()).unwrap();
+        assert_eq!(
+            after_install["mcp"][MCP_SERVER_KEY],
+            opencode_mcp_server_value()
+        );
+        assert_eq!(
+            after_install["mcp"]["other"]["command"],
+            json!(["other-mcp"])
+        );
+        assert_eq!(after_install["model"], json!("test-model"));
+        assert!(paths.opencode_skill_dir().join("SKILL.md").exists());
+
+        let removed = remove_opencode(&paths).unwrap();
+        assert_eq!(removed.len(), 2);
+        let after_remove = read_json_strict(&paths.opencode_config()).unwrap();
+        assert!(after_remove["mcp"].get(MCP_SERVER_KEY).is_none());
+        assert_eq!(
+            after_remove["mcp"]["other"]["command"],
+            json!(["other-mcp"])
+        );
+        assert!(!paths.opencode_skill_dir().exists());
 
         let _ = fs::remove_dir_all(home);
     }

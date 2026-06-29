@@ -9,7 +9,7 @@
 `jdbg` is a cross-platform **Rust CLI** (binary `jdbg`, crate `java-agent-debugger`, edition 2024) that lets an
 AI agent **debug Java interactively** by wrapping the JDK's `jdb` — prompt-aware (never sleep-based), stateful
 (a background daemon keeps sessions alive across calls), Windows-first. It is consumed two ways: the **CLI** and
-an **MCP server** (`jdbg __mcp`, native tool calls for Claude Code and Codex). Full detail in `DESIGN.md`.
+an **MCP server** (`jdbg __mcp`, native tool calls for Claude Code, Codex, and OpenCode). Full detail in `DESIGN.md`.
 
 ## Binding constraints (do not violate without asking)
 
@@ -82,12 +82,14 @@ These are settled decisions. Changing them needs explicit user sign-off.
 
 ## Setup / agent registration rules
 
-- **`jdbg setup` is multi-agent.** First-class setup targets are `claude`, `codex`, and `pi`; `--target`
-  accepts `claude,codex,pi`, `auto`, `all`, or `none`, and `--yes` must make setup non-interactive.
+- **`jdbg setup` is multi-agent.** First-class setup targets are `claude`, `codex`, `opencode`, and `pi`; `--target`
+  accepts `claude,codex,opencode,pi`, `auto`, `all`, or `none`, and `--yes` must make setup non-interactive.
 - **Claude Code target:** write only `mcpServers.jdbg` in `~/.claude.json`, `mcp__jdbg__*` in
   `~/.claude/settings.json`, and the embedded MCP skill to `~/.claude/skills/jdbg/SKILL.md`.
 - **Codex target:** write only `[mcp_servers.jdbg]` in `~/.codex/config.toml` and the embedded MCP skill to
   `~/.codex/skills/jdbg/SKILL.md`. Do not invent a Codex permissions surface.
+- **OpenCode target:** write only `mcp.jdbg` in `~/.config/opencode/opencode.json` and the embedded MCP skill to
+  `~/.config/opencode/skills/jdbg/SKILL.md`. Do not invent an OpenCode permissions surface.
 - **Pi target:** write only the embedded CLI skill to `~/.pi/agent/skills/jdbg/SKILL.md`. Do not invent a Pi
   MCP surface.
 - **Removal is surgical.** `setup --remove` removes only jdbg-owned MCP entries, permissions, and skill dirs;

@@ -90,7 +90,7 @@ pub enum Commands {
         /// Print the config snippet instead of writing any files.
         #[arg(long)]
         print: bool,
-        /// Agent targets: claude,codex,pi or auto/all/none.
+        /// Agent targets: claude,codex,opencode,pi or auto/all/none.
         #[arg(long)]
         target: Option<String>,
         /// Use non-interactive defaults.
