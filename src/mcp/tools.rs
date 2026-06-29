@@ -561,20 +561,31 @@ fn tool(
     }
 }
 
+/// Read a JSON value as a string, coercing numbers and booleans to their text
+/// form. LLM clients routinely emit a bare number for a string-typed parameter
+/// (e.g. a thread id as `582` instead of `"582"`); rejecting that would surface
+/// a confusing "missing required string parameter" error. Objects, arrays, and
+/// null are not coercible and yield `None`.
+fn coerce_str(v: &Value) -> Option<String> {
+    match v {
+        Value::String(s) => Some(s.clone()),
+        Value::Number(n) => Some(n.to_string()),
+        Value::Bool(b) => Some(b.to_string()),
+        _ => None,
+    }
+}
+
 fn require_str(args: &Value, key: &str) -> Result<String, JsonRpcError> {
-    args.get(key)
-        .and_then(Value::as_str)
-        .map(String::from)
-        .ok_or_else(|| {
-            JsonRpcError::new(
-                INVALID_PARAMS,
-                format!("missing required string parameter: {key}"),
-            )
-        })
+    args.get(key).and_then(coerce_str).ok_or_else(|| {
+        JsonRpcError::new(
+            INVALID_PARAMS,
+            format!("missing required string parameter: {key}"),
+        )
+    })
 }
 
 fn optional_str(args: &Value, key: &str) -> Option<String> {
-    args.get(key).and_then(Value::as_str).map(String::from)
+    args.get(key).and_then(coerce_str)
 }
 
 fn require_u32(args: &Value, key: &str) -> Result<u32, JsonRpcError> {
@@ -991,6 +1002,29 @@ mod tests {
     #[test]
     fn set_missing_value_is_error() {
         assert!(dispatch_tool("set", &json!({"lvalue": "x"})).is_err());
+    }
+
+    #[test]
+    fn thread_id_accepts_numeric_json() {
+        // LLM clients frequently emit a numeric thread id (e.g. {"id": 582})
+        // instead of a string. require_str must coerce it, not reject it.
+        match dispatch_tool("thread", &json!({"id": 582})).unwrap().cmd {
+            Command::Thread { id } => assert_eq!(id, "582"),
+            other => panic!("expected Thread, got {other:?}"),
+        }
+        match dispatch_tool("thread", &json!({"id": "0x37f2"})).unwrap().cmd {
+            Command::Thread { id } => assert_eq!(id, "0x37f2"),
+            other => panic!("expected Thread, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn suspend_id_accepts_numeric_json() {
+        // A numeric id must target that thread, not silently fall back to "all".
+        match dispatch_tool("suspend", &json!({"id": 1})).unwrap().cmd {
+            Command::Suspend { id } => assert_eq!(id, Some("1".to_string())),
+            other => panic!("expected Suspend, got {other:?}"),
+        }
     }
 
     #[test]

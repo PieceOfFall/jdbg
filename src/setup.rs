@@ -547,6 +547,26 @@ fn parse_target_flag(value: &str, paths: &Paths) -> Result<Vec<TargetId>> {
 }
 
 fn prompt_targets(defaults: &[TargetId]) -> Result<Vec<TargetId>> {
+    let labels: Vec<String> = ALL_TARGETS
+        .iter()
+        .map(|t| format!("{} ({})", t.display_name(), t.id()))
+        .collect();
+    let initial: Vec<bool> = ALL_TARGETS.iter().map(|t| defaults.contains(t)).collect();
+
+    match crate::tui::multi_select("Which agents should jdbg configure?", &labels, &initial) {
+        Ok(Some(states)) => Ok(ALL_TARGETS
+            .iter()
+            .zip(states)
+            .filter_map(|(t, on)| on.then_some(*t))
+            .collect()),
+        Ok(None) => bail!("setup cancelled"),
+        // Raw terminal mode unavailable (e.g. a dumb terminal): fall back to the
+        // plain line-based prompt.
+        Err(_) => prompt_targets_text(defaults),
+    }
+}
+
+fn prompt_targets_text(defaults: &[TargetId]) -> Result<Vec<TargetId>> {
     println!("Which agents should jdbg configure?");
     for (idx, target) in ALL_TARGETS.iter().enumerate() {
         let checked = if defaults.contains(target) { "x" } else { " " };
