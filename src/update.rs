@@ -131,8 +131,8 @@ mod tests {
     fn update_target_arg_preserves_detected_targets() {
         assert_eq!(setup::targets_to_arg(&[TargetId::Codex]), "codex");
         assert_eq!(
-            setup::targets_to_arg(&[TargetId::Claude, TargetId::Codex]),
-            "claude,codex"
+            setup::targets_to_arg(&[TargetId::Claude, TargetId::Codex, TargetId::Pi]),
+            "claude,codex,pi"
         );
     }
 }

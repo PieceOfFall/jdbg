@@ -82,12 +82,14 @@ These are settled decisions. Changing them needs explicit user sign-off.
 
 ## Setup / agent registration rules
 
-- **`jdbg setup` is multi-agent.** First-class setup targets are `claude` and `codex`; `--target` accepts
-  `claude,codex`, `auto`, `all`, or `none`, and `--yes` must make setup non-interactive.
+- **`jdbg setup` is multi-agent.** First-class setup targets are `claude`, `codex`, and `pi`; `--target`
+  accepts `claude,codex,pi`, `auto`, `all`, or `none`, and `--yes` must make setup non-interactive.
 - **Claude Code target:** write only `mcpServers.jdbg` in `~/.claude.json`, `mcp__jdbg__*` in
-  `~/.claude/settings.json`, and the embedded skill to `~/.claude/skills/jdbg/SKILL.md`.
-- **Codex target:** write only `[mcp_servers.jdbg]` in `~/.codex/config.toml` and the embedded skill to
+  `~/.claude/settings.json`, and the embedded MCP skill to `~/.claude/skills/jdbg/SKILL.md`.
+- **Codex target:** write only `[mcp_servers.jdbg]` in `~/.codex/config.toml` and the embedded MCP skill to
   `~/.codex/skills/jdbg/SKILL.md`. Do not invent a Codex permissions surface.
+- **Pi target:** write only the embedded CLI skill to `~/.pi/agent/skills/jdbg/SKILL.md`. Do not invent a Pi
+  MCP surface.
 - **Removal is surgical.** `setup --remove` removes only jdbg-owned MCP entries, permissions, and skill dirs;
   preserve sibling servers, settings, TOML tables, and user-authored content.
 - **`jdbg update` preserves prior targets.** Detect which targets already have jdbg configured before removal,
@@ -115,12 +117,12 @@ push does NOT trigger a release build. PRs trigger a plan-only dry-run (no publi
 
 **Release checklist:**
 1. `cargo test` passes (all unit + integration).
-2. **Check `skills/jdbg/SKILL.md`** — if any tool was added/removed/renamed, parameters changed, or
+2. **Check `skills/jdbg/mcp/SKILL.md` and `skills/jdbg/cli/SKILL.md`** — if any tool was added/removed/renamed, parameters changed, or
    behavior semantics changed (e.g. new fields in responses, new notes), update the skill file:
    `allowed-tools` list, tool reference table, "Reading results" section, "Common mistakes", etc.
-3. Bump `metadata.version` in `SKILL.md` when it changes.
+3. Bump `metadata.version` in changed `SKILL.md` files.
 4. Bump `version` in `Cargo.toml`.
-5. Commit all changes (SKILL.md + Cargo.toml + README can share one commit).
+5. Commit all changes (SKILL.md files + Cargo.toml + README can share one commit).
 6. **Tag and push** — this is the only action that triggers the CI release:
    ```
    git tag v<version>

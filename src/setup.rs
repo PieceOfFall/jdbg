@@ -3,6 +3,7 @@
 //! First-version targets:
 //! - Claude Code: `~/.claude.json`, `~/.claude/settings.json`, `~/.claude/skills/jdbg/`
 //! - Codex: `~/.codex/config.toml`, `~/.codex/skills/jdbg/`
+//! - Pi: `~/.pi/agent/skills/jdbg/`
 
 use std::fs;
 use std::io::{self, IsTerminal, Write};
@@ -15,12 +16,14 @@ const MCP_SERVER_KEY: &str = "jdbg";
 const PERMISSION_ENTRY: &str = "mcp__jdbg__*";
 const CODEX_TOML_HEADER: &str = "mcp_servers.jdbg";
 
-const SKILL_MD: &str = include_str!("../skills/jdbg/SKILL.md");
+const MCP_SKILL_MD: &str = include_str!("../skills/jdbg/mcp/SKILL.md");
+const CLI_SKILL_MD: &str = include_str!("../skills/jdbg/cli/SKILL.md");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TargetId {
     Claude,
     Codex,
+    Pi,
 }
 
 impl TargetId {
@@ -28,6 +31,7 @@ impl TargetId {
         match self {
             TargetId::Claude => "claude",
             TargetId::Codex => "codex",
+            TargetId::Pi => "pi",
         }
     }
 
@@ -35,11 +39,12 @@ impl TargetId {
         match self {
             TargetId::Claude => "Claude Code",
             TargetId::Codex => "Codex",
+            TargetId::Pi => "Pi",
         }
     }
 }
 
-const ALL_TARGETS: [TargetId; 2] = [TargetId::Claude, TargetId::Codex];
+const ALL_TARGETS: [TargetId; 3] = [TargetId::Claude, TargetId::Codex, TargetId::Pi];
 
 #[derive(Debug)]
 struct Paths {
@@ -78,6 +83,26 @@ impl Paths {
 
     fn codex_skill_dir(&self) -> PathBuf {
         self.codex_dir().join("skills").join("jdbg")
+    }
+
+    fn pi_dir(&self) -> PathBuf {
+        self.home.join(".pi").join("agent")
+    }
+
+    fn pi_settings(&self) -> PathBuf {
+        self.pi_dir().join("settings.json")
+    }
+
+    fn pi_skill_root(&self) -> PathBuf {
+        self.pi_dir().join("skills")
+    }
+
+    fn pi_skill_dir(&self) -> PathBuf {
+        self.pi_skill_root().join("jdbg")
+    }
+
+    fn agents_skill_root(&self) -> PathBuf {
+        self.home.join(".agents").join("skills")
     }
 }
 
@@ -135,10 +160,10 @@ fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
     Ok(())
 }
 
-fn install_skill(dir: &Path) -> Result<PathBuf> {
+fn install_skill(dir: &Path, content: &str) -> Result<PathBuf> {
     fs::create_dir_all(dir)?;
     let path = dir.join("SKILL.md");
-    fs::write(&path, SKILL_MD)?;
+    fs::write(&path, content)?;
     Ok(path)
 }
 
@@ -326,10 +351,20 @@ fn detect_codex_configured(paths: &Paths) -> bool {
         .unwrap_or(false)
 }
 
+fn detect_pi_configured(paths: &Paths) -> bool {
+    paths.pi_skill_dir().join("SKILL.md").exists()
+}
+
 fn detect_installed(target: TargetId, paths: &Paths) -> bool {
     match target {
         TargetId::Claude => paths.home.join(".claude").exists() || paths.claude_config().exists(),
         TargetId::Codex => paths.codex_dir().exists() || paths.codex_config().exists(),
+        TargetId::Pi => {
+            paths.pi_dir().exists()
+                || paths.pi_settings().exists()
+                || paths.pi_skill_root().exists()
+                || paths.agents_skill_root().exists()
+        }
     }
 }
 
@@ -337,6 +372,7 @@ fn detect_configured(target: TargetId, paths: &Paths) -> bool {
     match target {
         TargetId::Claude => detect_claude_configured(paths),
         TargetId::Codex => detect_codex_configured(paths),
+        TargetId::Pi => detect_pi_configured(paths),
     }
 }
 
@@ -386,6 +422,7 @@ fn target_by_id(id: &str) -> Option<TargetId> {
     match id {
         "claude" => Some(TargetId::Claude),
         "codex" => Some(TargetId::Codex),
+        "pi" => Some(TargetId::Pi),
         _ => None,
     }
 }
@@ -414,7 +451,7 @@ fn parse_target_flag(value: &str, paths: &Paths) -> Result<Vec<TargetId>> {
 
     if !unknown.is_empty() {
         bail!(
-            "unknown --target id(s): {}. Known: claude, codex, plus auto/all/none",
+            "unknown --target id(s): {}. Known: claude, codex, pi, plus auto/all/none",
             unknown.join(", ")
         );
     }
@@ -456,6 +493,7 @@ fn prompt_targets(defaults: &[TargetId]) -> Result<Vec<TargetId>> {
         let target = match item {
             "1" => Some(TargetId::Claude),
             "2" => Some(TargetId::Codex),
+            "3" => Some(TargetId::Pi),
             other => target_by_id(other),
         };
         match target {
@@ -506,7 +544,7 @@ fn install_claude(paths: &Paths) -> Result<Vec<PathBuf>> {
     apply_perm_install(&mut settings);
     write_json(&config_path, &config)?;
     write_json(&settings_path, &settings)?;
-    let skill_path = install_skill(&paths.claude_skill_dir())?;
+    let skill_path = install_skill(&paths.claude_skill_dir(), MCP_SKILL_MD)?;
 
     Ok(vec![config_path, settings_path, skill_path])
 }
@@ -542,7 +580,7 @@ fn install_codex(paths: &Paths) -> Result<Vec<PathBuf>> {
     if changed {
         atomic_write(&config_path, next.as_bytes())?;
     }
-    let skill_path = install_skill(&paths.codex_skill_dir())?;
+    let skill_path = install_skill(&paths.codex_skill_dir(), MCP_SKILL_MD)?;
     Ok(vec![config_path, skill_path])
 }
 
@@ -566,6 +604,19 @@ fn remove_codex(paths: &Paths) -> Result<Vec<PathBuf>> {
     Ok(changed)
 }
 
+fn install_pi(paths: &Paths) -> Result<Vec<PathBuf>> {
+    let skill_path = install_skill(&paths.pi_skill_dir(), CLI_SKILL_MD)?;
+    Ok(vec![skill_path])
+}
+
+fn remove_pi(paths: &Paths) -> Result<Vec<PathBuf>> {
+    let mut changed = Vec::new();
+    if remove_skill(&paths.pi_skill_dir())? {
+        changed.push(paths.pi_skill_dir());
+    }
+    Ok(changed)
+}
+
 fn print_target_config(target: TargetId, paths: &Paths) -> Result<()> {
     match target {
         TargetId::Claude => {
@@ -576,6 +627,14 @@ fn print_target_config(target: TargetId, paths: &Paths) -> Result<()> {
         TargetId::Codex => {
             println!("# Codex: add to {}", paths.codex_config().display());
             println!("{}", codex_mcp_block());
+        }
+        TargetId::Pi => {
+            println!(
+                "# Pi: install the CLI skill at {}",
+                paths.pi_skill_dir().join("SKILL.md").display()
+            );
+            println!("# Pi discovers skills under ~/.pi/agent/skills/ automatically.");
+            println!("# No MCP config is emitted because Pi has no official jdbg MCP setup.");
         }
     }
     Ok(())
@@ -613,6 +672,7 @@ pub fn run_setup(remove: bool, print: bool, target: Option<&str>, yes: bool) -> 
             let changed = match target {
                 TargetId::Claude => remove_claude(&paths)?,
                 TargetId::Codex => remove_codex(&paths)?,
+                TargetId::Pi => remove_pi(&paths)?,
             };
             if changed.is_empty() {
                 println!("{}: jdbg was not registered.", target.display_name());
@@ -632,13 +692,14 @@ pub fn run_setup(remove: bool, print: bool, target: Option<&str>, yes: bool) -> 
             let written = match target {
                 TargetId::Claude => install_claude(&paths)?,
                 TargetId::Codex => install_codex(&paths)?,
+                TargetId::Pi => install_pi(&paths)?,
             };
             println!("Registered jdbg for {}.", target.display_name());
             for path in written {
                 println!("  {}", path.display());
             }
         }
-        println!("Restart or reload the configured agent(s) to pick up the jdbg MCP server.");
+        println!("Restart or reload the configured agent(s) to pick up jdbg.");
     }
 
     Ok(())
@@ -766,8 +827,8 @@ mod tests {
             ALL_TARGETS.to_vec()
         );
         assert_eq!(
-            parse_target_flag("claude,codex,claude", &paths).unwrap(),
-            vec![TargetId::Claude, TargetId::Codex]
+            parse_target_flag("claude,codex,pi,claude", &paths).unwrap(),
+            vec![TargetId::Claude, TargetId::Codex, TargetId::Pi]
         );
         assert!(parse_target_flag("claude,bogus", &paths).is_err());
     }
@@ -781,6 +842,11 @@ mod tests {
         fs::create_dir_all(paths.codex_dir()).unwrap();
         assert_eq!(resolve_auto_targets(&paths), vec![TargetId::Codex]);
 
+        let _ = fs::remove_dir_all(paths.codex_dir());
+        fs::create_dir_all(paths.pi_dir()).unwrap();
+        assert_eq!(resolve_auto_targets(&paths), vec![TargetId::Pi]);
+
+        let _ = fs::remove_dir_all(paths.pi_dir());
         fs::create_dir_all(paths.claude_config().parent().unwrap()).unwrap();
         let mut config = json!({});
         apply_mcp_install(&mut config);
@@ -835,6 +901,12 @@ mod tests {
             vec![TargetId::Claude, TargetId::Codex]
         );
 
+        install_pi(&paths).unwrap();
+        assert_eq!(
+            detect_configured_targets(&paths),
+            vec![TargetId::Claude, TargetId::Codex, TargetId::Pi]
+        );
+
         let _ = fs::remove_dir_all(home);
     }
 
@@ -868,9 +940,32 @@ mod tests {
     }
 
     #[test]
-    fn skill_is_embedded() {
-        assert!(SKILL_MD.contains("name: jdbg"));
-        assert!(SKILL_MD.contains("interactive Java debugging"));
-        assert!(SKILL_MD.len() > 500);
+    fn install_and_remove_pi_writes_only_cli_skill() {
+        let home = temp_home("pi");
+        let paths = Paths::for_home(&home);
+
+        let written = install_pi(&paths).unwrap();
+        assert_eq!(written, vec![paths.pi_skill_dir().join("SKILL.md")]);
+        let installed = fs::read_to_string(paths.pi_skill_dir().join("SKILL.md")).unwrap();
+        assert!(installed.contains("name: jdbg"));
+        assert!(installed.contains("Use the jdbg CLI"));
+        assert!(!paths.pi_settings().exists());
+
+        let removed = remove_pi(&paths).unwrap();
+        assert_eq!(removed, vec![paths.pi_skill_dir()]);
+        assert!(!paths.pi_skill_dir().exists());
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn skills_are_embedded() {
+        assert!(MCP_SKILL_MD.contains("name: jdbg"));
+        assert!(MCP_SKILL_MD.contains("MCP server"));
+        assert!(MCP_SKILL_MD.len() > 500);
+        assert!(CLI_SKILL_MD.contains("name: jdbg"));
+        assert!(CLI_SKILL_MD.contains("Use the jdbg CLI"));
+        assert!(CLI_SKILL_MD.contains("Pi has no official jdbg MCP setup"));
+        assert!(CLI_SKILL_MD.len() > 500);
     }
 }
