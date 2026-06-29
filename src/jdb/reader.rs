@@ -341,10 +341,29 @@ impl PromptReader {
         }
 
         // Bare prompt in Blocking mode is usually ignored while waiting for a real thread-prompt/event banner.
-        // Special case: "Nothing suspended." + bare prompt means the VM was not actually suspended, e.g. cont
-        // after attach suspend=n. cont/resume is then a no-op and should return immediately instead of timing out.
         if is_bare_prompt && mode == ReadMode::Blocking {
             let before_prompt = &self.text[..self.text.len() - last_line.len()];
+
+            // SUSPEND_THREAD policy (JDK 9+, observed on macOS/JDK 21 with `stop thread at/in`): a
+            // breakpoint or step fires with a COMPLETE banner, but jdb returns to a bare prompt `> `
+            // instead of a thread prompt `worker[1] ` and leaves NO current thread selected — any
+            // following where/locals/print then fails with "No thread specified." Route this through
+            // the PartialStop path so the session layer selects the hit thread and backfills
+            // thread_id/frame/location via threads→thread<id>→where (same machinery as the JDK 8
+            // truncated-banner case).
+            if let Some(c) = RE_BREAKPOINT_OR_STEP.captures(before_prompt) {
+                let is_step = &c["kind"] == "Step completed";
+                let output = before_prompt.trim_end_matches('\n').to_string();
+                let _ = self.take_text();
+                return Some(ReadOutcome::Prompt {
+                    output,
+                    event: Some(DetectedEvent::PartialStop { is_step }),
+                });
+            }
+
+            // Special case: "Nothing suspended." + bare prompt means the VM was not actually suspended,
+            // e.g. cont after attach suspend=n. cont/resume is then a no-op and should return immediately
+            // instead of timing out.
             if before_prompt.contains("Nothing suspended") {
                 let output = before_prompt.trim_end_matches('\n').to_string();
                 let _ = self.take_text();
@@ -679,12 +698,13 @@ mod tests {
         );
     }
 
-    /// Bug D regression: in Blocking mode, "Nothing suspended." + bare prompt should return immediately
-    /// instead of waiting until timeout.
+    /// macOS/JDK 21 regression: SUSPEND_THREAD breakpoint produces a COMPLETE banner followed by a bare
+    /// prompt `> ` (not a thread prompt). The reader should route this through PartialStop so the session
+    /// layer selects the hit thread and enriches thread_id/frame/location.
     #[test]
-    fn nothing_suspended_in_blocking_mode_returns_immediately() {
-        // Simulate jdb's reply to cont when the VM is already running: "Nothing suspended.\n> "
-        let data = b"Nothing suspended.\n> ";
+    fn suspend_thread_full_banner_bare_prompt_emits_partial_stop() {
+        // Real output observed on macOS JDK 21 with `stop thread in ThreadTest.doWork`:
+        let data = b"VM Started: Set deferred breakpoint ThreadTest.doWork\n\nBreakpoint hit: \"thread=worker\", ThreadTest.doWork(), line=38 bci=0\n38            int x = 1;\n> ";
         let reader = StallingReader {
             data: data.to_vec(),
             sent: false,
@@ -695,18 +715,22 @@ mod tests {
         let outcome = pr.read_until_prompt(Duration::from_secs(30), ReadMode::Blocking);
         let elapsed = start.elapsed();
 
-        match &outcome {
-            ReadOutcome::Prompt { output, event } => {
-                assert!(output.contains("Nothing suspended"), "output: {output:?}");
-                assert!(event.is_none(), "should have no event, got: {event:?}");
+        match outcome {
+            ReadOutcome::Prompt {
+                event: Some(DetectedEvent::PartialStop { is_step }),
+                output,
+            } => {
+                assert!(!is_step, "should be a breakpoint, not a step");
+                assert!(
+                    output.contains("Breakpoint hit"),
+                    "output should retain the banner text, got: {output:?}"
+                );
             }
-            other => panic!("expected Prompt, got {other:?}"),
+            other => panic!("expected PartialStop from full banner + bare prompt, got {other:?}"),
         }
-
-        // Should return within milliseconds, far below the 30s timeout.
         assert!(
             elapsed < Duration::from_secs(2),
-            "should return immediately, not block; took {elapsed:?}"
+            "should resolve immediately, not wait for timeout; took {elapsed:?}"
         );
     }
 }

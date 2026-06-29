@@ -29,9 +29,19 @@ pub fn run_daemon() -> anyhow::Result<()> {
     let listener = match ListenerOptions::new().name(name).create_sync() {
         Ok(l) => l,
         Err(e) if e.kind() == io::ErrorKind::AddrInUse => {
-            // Idempotent bind failed: another daemon is already serving, so exit quietly.
-            eprintln!("[daemon] socket already in use, another daemon is serving. Exiting.");
-            return Ok(());
+            // On Unix (macOS, Linux without abstract namespace fallback), a stale socket file may
+            // linger after an unclean daemon exit. Probe: if we can connect, a live daemon owns
+            // it — exit quietly. If connect fails, the file is orphaned — remove and retry once.
+            if probe_socket_alive(&sock_name) {
+                eprintln!("[daemon] socket already in use, another daemon is serving. Exiting.");
+                return Ok(());
+            }
+            eprintln!("[daemon] stale socket detected, reclaiming...");
+            remove_stale_socket(&sock_name);
+            let name = sock_name
+                .clone()
+                .to_ns_name::<interprocess::local_socket::GenericNamespaced>()?;
+            ListenerOptions::new().name(name).create_sync()?
         }
         Err(e) => return Err(e.into()),
     };
@@ -112,4 +122,31 @@ pub fn stop_daemon() -> anyhow::Result<()> {
         eprintln!("Failed to stop daemon: {}", e.message);
     }
     Ok(())
+}
+
+/// Probe whether a live daemon is listening on the named socket.
+/// Returns true if a connection succeeds (another daemon is alive), false otherwise (stale file).
+fn probe_socket_alive(sock_name: &str) -> bool {
+    use interprocess::local_socket::{Stream as LocalStream, prelude::*};
+    let Ok(name) = sock_name
+        .to_ns_name::<interprocess::local_socket::GenericNamespaced>()
+    else {
+        return false;
+    };
+    LocalStream::connect(name).is_ok()
+}
+
+/// Remove the stale socket file on Unix. On macOS/non-Linux Unix, `GenericNamespaced` maps to
+/// `SpecialDirUdSocket` which places the socket at `/tmp/<name>`. On Linux with abstract namespace
+/// there is no file to remove, so this is a no-op there (bind would not have returned AddrInUse
+/// for a dead process in the first place).
+#[cfg(unix)]
+fn remove_stale_socket(sock_name: &str) {
+    let path = format!("/tmp/{sock_name}");
+    let _ = std::fs::remove_file(&path);
+}
+
+#[cfg(not(unix))]
+fn remove_stale_socket(_sock_name: &str) {
+    // Windows uses named pipes; stale socket files are not a concern.
 }
