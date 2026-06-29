@@ -1,97 +1,157 @@
-# jdbg
+<div align="center">
 
-**Agent-friendly Java debugger** CLI for Claude Code, Codex, OpenCode, Pi, and humans, wrapping JDK `jdb` with persistent sessions, structured output, and native MCP tools.
+<h1><code>jdbg</code></h1>
 
-## Highlights
+<p>
+  <strong>Agent-friendly Java debugging from a Rust CLI.</strong>
+</p>
 
-- **Prompt-aware, not sleep-based** — reads jdb output until the prompt returns; never guesses with timeouts.
-- **Stateful daemon** — a background process keeps debug sessions alive across CLI invocations.
-- **Windows-first, cross-platform** — pure Rust, no Bash/WSL/temp-file dependencies.
-- **Two access paths** — CLI (`jdbg <cmd>`) and MCP server (`jdbg __mcp`) for native tool calls from Claude Code, Codex, and OpenCode; Pi uses the CLI skill.
-- **Structured output** — human-readable text by default, `--json` for machine consumption.
-- **Auto-enriched stop results** — breakpoint/step hits include source context and top stack frame automatically.
-- **Conditional breakpoints** — filter high-traffic code with boolean expressions (e.g. `userId == 123`).
-- **Thread breakpoints** — `suspend: "thread"` only holds the hit thread; heartbeat/ZK/Dubbo threads keep running (like IDEA's thread breakpoint).
-- **Class/method search** — `classes` finds CGLIB proxies and runtime-generated classes; `methods` lists exact signatures for `break_in`.
-- **Field watchpoints** — `watch` breaks on field access or modification (find out *who* changed a field and *when*).
-- **Collection inspection** — `inspect` shows size + first N elements of any List/array/Map in one call.
-- **Self-update** — `jdbg update` downloads the latest release and re-registers in one step.
+<p>
+  Wraps the JDK <code>jdb</code> with prompt-aware control, persistent sessions,
+  structured output, and native MCP tools for Claude Code, Codex, OpenCode, Pi, and humans.
+</p>
 
-## Get Started
+<p>
+  <a href="https://github.com/PieceOfFall/jdbg/releases/latest">
+    <img alt="Latest release" src="https://img.shields.io/github/v/release/PieceOfFall/jdbg?style=for-the-badge&label=release&color=2f6f5e">
+  </a>
+  <a href="https://github.com/PieceOfFall/jdbg/blob/main/LICENSE">
+    <img alt="Apache 2.0 license" src="https://img.shields.io/github/license/PieceOfFall/jdbg?style=for-the-badge&color=2f6f5e">
+  </a>
+  <img alt="Rust 2024" src="https://img.shields.io/badge/rust-2024-2f6f5e?style=for-the-badge&logo=rust&logoColor=white">
+  <img alt="Native MCP tools" src="https://img.shields.io/badge/MCP-native_tools-2f6f5e?style=for-the-badge">
+</p>
 
-### 1. Install the CLI
+<p>
+  <a href="#quick-start">Quick Start</a>
+  &nbsp;&nbsp;
+  <a href="#why-jdbg">Why jdbg</a>
+  &nbsp;&nbsp;
+  <a href="#agent-setup">Agent Setup</a>
+  &nbsp;&nbsp;
+  <a href="#command-surface">Commands</a>
+  &nbsp;&nbsp;
+  <a href="#architecture">Architecture</a>
+</p>
 
-The installer fetches the right build for your OS/arch from the latest GitHub Release and adds `jdbg` to your `PATH`.
+</div>
 
-**Windows**
+<br>
 
-```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/PieceOfFall/jdbg/releases/latest/download/java-agent-debugger-installer.ps1 | iex"
-```
+<table>
+  <tr>
+    <td width="58%" valign="top">
+      <h3>Debug Java without Bash glue</h3>
+      <p>
+        <code>jdbg</code> gives coding agents a stable debugging surface for Java:
+        no sleeps, no temp files, no shell command injection surface, and no one-shot
+        process that forgets the session.
+      </p>
+      <ul>
+        <li><strong>Prompt-aware</strong>: reads <code>jdb</code> until the prompt or stop event is complete.</li>
+        <li><strong>Stateful</strong>: one background daemon keeps sessions alive across calls.</li>
+        <li><strong>Agent-native</strong>: exposes the same debugger through CLI and MCP tools.</li>
+      </ul>
+    </td>
+    <td width="42%" valign="top">
+      <h3>Built for agent workflows</h3>
+      <table>
+        <tr>
+          <td><strong>Claude Code</strong></td>
+          <td>MCP tools plus skill</td>
+        </tr>
+        <tr>
+          <td><strong>Codex</strong></td>
+          <td>MCP server config plus skill</td>
+        </tr>
+        <tr>
+          <td><strong>OpenCode</strong></td>
+          <td>Local MCP config plus skill</td>
+        </tr>
+        <tr>
+          <td><strong>Pi</strong></td>
+          <td>CLI skill</td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+</table>
 
-**macOS / Linux**
+## Quick Start
 
-```sh
-curl --proto '=https' --tlsv1.2 -LsSf https://github.com/PieceOfFall/jdbg/releases/latest/download/java-agent-debugger-installer.sh | sh
-```
+### Install
 
-> The installer edits your **user-level** `PATH` (no admin needed). **Open a new terminal** afterwards so `jdbg` resolves.
+The installer downloads the right release artifact for your OS and adds `jdbg` to your user-level `PATH`.
+Open a new terminal afterwards so the command is visible.
+
+<table>
+  <tr>
+    <th align="left">Platform</th>
+    <th align="left">Command</th>
+  </tr>
+  <tr>
+    <td><strong>Windows</strong></td>
+    <td>
+      <pre lang="powershell">powershell -ExecutionPolicy Bypass -c "irm https://github.com/PieceOfFall/jdbg/releases/latest/download/java-agent-debugger-installer.ps1 | iex"</pre>
+    </td>
+  </tr>
+  <tr>
+    <td><strong>macOS / Linux</strong></td>
+    <td>
+      <pre lang="sh">curl --proto '=https' --tlsv1.2 -LsSf https://github.com/PieceOfFall/jdbg/releases/latest/download/java-agent-debugger-installer.sh | sh</pre>
+    </td>
+  </tr>
+</table>
 
 <details>
-<summary><b>Already have Rust?</b> Install via cargo or from source.</summary>
+<summary><strong>Already have Rust?</strong> Install with cargo or build from source.</summary>
 
 ```bash
-# via cargo (installs to ~/.cargo/bin/jdbg)
+# Install to ~/.cargo/bin/jdbg
 cargo install --git https://github.com/PieceOfFall/jdbg.git
 
-# from source
+# Build from source
 git clone https://github.com/PieceOfFall/jdbg.git
 cd jdbg
-cargo build --release   # binary at target/release/jdbg
+cargo build --release
 ```
 
 </details>
 
-### 2. Register with your coding agent
-
-One command wires `jdbg` into Claude Code, Codex, and/or OpenCode as an MCP server, or into Pi as a CLI skill:
+### Register With Your Agent
 
 ```bash
 jdbg setup
 ```
 
-When Claude Code is selected:
-
-This writes the MCP server entry to `~/.claude.json` and an auto-allow permission (`mcp__jdbg__*`) to `~/.claude/settings.json`. **Restart Claude Code** to pick up the new server — its tools then appear as `mcp__jdbg__<tool>`.
+Use non-interactive setup when provisioning machines:
 
 ```bash
 jdbg setup --target claude,codex,opencode,pi --yes
-jdbg setup --target codex --print    # preview the Codex config snippet without writing anything
-jdbg setup --target opencode --print # preview the OpenCode config snippet without writing anything
-jdbg setup --target pi --print       # preview the Pi CLI skill destination
+jdbg setup --target codex --print
+jdbg setup --target opencode --print
+jdbg setup --target pi --print
 ```
 
-With no flags, `jdbg setup` prompts for the agent targets to configure. Claude Code gets `~/.claude.json`, `~/.claude/settings.json`, and the MCP skill at `~/.claude/skills/jdbg/SKILL.md`; Codex gets `~/.codex/config.toml` and the MCP skill at `~/.codex/skills/jdbg/SKILL.md`; OpenCode gets `~/.config/opencode/opencode.json` and the MCP skill at `~/.config/opencode/skills/jdbg/SKILL.md`; Pi gets the CLI skill at `~/.pi/agent/skills/jdbg/SKILL.md`. Restart or reload the configured agent to pick up jdbg.
-
-### 3. Start debugging
+### Debug Something
 
 ```bash
-# Compile the target program with debug info
+# Compile with debug info for locals and line breakpoints
 javac -g Main.java
 
-# Launch a debug session (daemon auto-starts)
+# Launch a debug session. The daemon starts automatically.
 jdbg launch Main --classpath .
 
 # Set a breakpoint and run
 jdbg break-at Main 9
 jdbg run
 
-# Inspect state
+# Inspect the stopped program
 jdbg locals
 jdbg where
 jdbg print myVar
 
-# Step and continue
+# Move execution forward
 jdbg step
 jdbg cont
 
@@ -100,88 +160,133 @@ jdbg kill
 jdbg daemon stop
 ```
 
-In Claude Code, Codex, or OpenCode, just ask it to debug — it drives the same flow through the `mcp__jdbg__*` tools. In Pi, the installed skill teaches the agent to drive the same flow through the `jdbg` CLI.
+In Claude Code, Codex, or OpenCode, ask the agent to debug the Java program.
+It drives the same flow through `mcp__jdbg__*` tools. In Pi, the installed skill drives the `jdbg` CLI.
 
-### Update to latest version
+## Why jdbg
+
+<table>
+  <tr>
+    <th align="left">Capability</th>
+    <th align="left">What it changes</th>
+  </tr>
+  <tr>
+    <td><strong>Prompt-aware reader</strong></td>
+    <td>Commands finish when <code>jdb</code> is actually ready, not after a guessed sleep.</td>
+  </tr>
+  <tr>
+    <td><strong>Persistent daemon</strong></td>
+    <td>Every CLI or MCP call can reuse live debug sessions instead of restarting state.</td>
+  </tr>
+  <tr>
+    <td><strong>Native MCP surface</strong></td>
+    <td>Claude Code, Codex, and OpenCode get typed tool calls instead of shell-wrapped debugging.</td>
+  </tr>
+  <tr>
+    <td><strong>Thread-only breakpoints</strong></td>
+    <td><code>suspend: "thread"</code> stops the hit thread while heartbeat, ZK, Dubbo, and server threads keep running.</td>
+  </tr>
+  <tr>
+    <td><strong>Runtime discovery</strong></td>
+    <td><code>classes</code> and <code>methods</code> help agents find CGLIB proxies, generated classes, and exact signatures.</td>
+  </tr>
+  <tr>
+    <td><strong>Focused inspection</strong></td>
+    <td><code>locals</code>, <code>where</code>, <code>inspect</code>, <code>watch</code>, and <code>thread-locks</code> keep agent loops short.</td>
+  </tr>
+</table>
+
+## Agent Setup
+
+`jdbg setup` installs only the target-specific configuration that belongs to `jdbg`.
+Removal is surgical and preserves sibling servers, user settings, and unrelated skill directories.
+
+<table>
+  <tr>
+    <th align="left">Target</th>
+    <th align="left">What gets configured</th>
+    <th align="left">Installed skill</th>
+  </tr>
+  <tr>
+    <td><strong>Claude Code</strong></td>
+    <td><code>mcpServers.jdbg</code> in <code>~/.claude.json</code>, plus <code>mcp__jdbg__*</code> permission in <code>~/.claude/settings.json</code></td>
+    <td><code>~/.claude/skills/jdbg/SKILL.md</code></td>
+  </tr>
+  <tr>
+    <td><strong>Codex</strong></td>
+    <td><code>[mcp_servers.jdbg]</code> in <code>~/.codex/config.toml</code></td>
+    <td><code>~/.codex/skills/jdbg/SKILL.md</code></td>
+  </tr>
+  <tr>
+    <td><strong>OpenCode</strong></td>
+    <td><code>mcp.jdbg</code> in <code>~/.config/opencode/opencode.json</code></td>
+    <td><code>~/.config/opencode/skills/jdbg/SKILL.md</code></td>
+  </tr>
+  <tr>
+    <td><strong>Pi</strong></td>
+    <td>No MCP config</td>
+    <td><code>~/.pi/agent/skills/jdbg/SKILL.md</code></td>
+  </tr>
+</table>
 
 ```bash
+jdbg setup --remove
+jdbg setup --remove --target codex
 jdbg update
 ```
 
-This detects which agents already have jdbg configured, removes those registrations, downloads and installs the latest release from GitHub, then re-registers the same Claude/Codex/OpenCode/Pi targets. On Windows it handles the running-exe file lock automatically.
+`jdbg update` detects which agents already had `jdbg` configured, installs the latest release, then re-registers the same targets.
 
-### Uninstall
+## MCP Server
 
-```bash
-jdbg setup --remove                  # removes configured jdbg agent registrations; leaves the binary
-jdbg setup --remove --target codex   # remove only Codex registration
-jdbg setup --remove --target opencode # remove only OpenCode registration
-jdbg setup --remove --target pi      # remove only Pi's CLI skill
-```
+`jdbg __mcp` runs a stdio JSON-RPC 2.0 MCP server exposing the debugger as 36 native tools.
+The MCP layer is a thin daemon client: it maps tool calls to the same command protocol used by the CLI, then renders the same results.
 
-## Requirements
+<table>
+  <tr>
+    <th align="left">Category</th>
+    <th align="left">Tools</th>
+  </tr>
+  <tr>
+    <td><strong>Sessions</strong></td>
+    <td><code>launch</code>, <code>attach</code>, <code>status</code>, <code>list</code>, <code>kill</code></td>
+  </tr>
+  <tr>
+    <td><strong>Breakpoints</strong></td>
+    <td><code>break_at</code>, <code>break_in</code>, <code>catch</code>, <code>watch</code>, <code>unwatch</code>, <code>breakpoints</code>, <code>clear</code></td>
+  </tr>
+  <tr>
+    <td><strong>Execution</strong></td>
+    <td><code>run</code>, <code>cont</code>, <code>step</code>, <code>next</code>, <code>step_out</code>, <code>suspend</code>, <code>resume</code></td>
+  </tr>
+  <tr>
+    <td><strong>Inspection</strong></td>
+    <td><code>where</code>, <code>locals</code>, <code>print</code>, <code>dump</code>, <code>eval</code>, <code>inspect</code>, <code>threads</code>, <code>thread</code>, <code>frame</code>, <code>list_source</code>, <code>set</code>, <code>lock</code>, <code>threadlocks</code>, <code>raw</code></td>
+  </tr>
+  <tr>
+    <td><strong>Discovery</strong></td>
+    <td><code>classes</code>, <code>methods</code></td>
+  </tr>
+  <tr>
+    <td><strong>Exception control</strong></td>
+    <td><code>ignore</code></td>
+  </tr>
+</table>
 
-- JDK 8–21+ with `jdb` on PATH or discoverable via `JAVA_HOME`
-- Rust 1.85+ (edition 2024) — only for the `cargo`/from-source install methods
-- For debugging: compile your Java code with `javac -g` (debug info for locals/line breakpoints)
-
-## CLI Commands
-
-```
-# Session lifecycle
-jdbg launch <MainClass> [--classpath CP] [--sourcepath SP] [--name N] [-- app-args...]
-jdbg attach [--host H] [--port P] [--sourcepath SP] [--name N]
-jdbg status | list | kill [--session ID]
-jdbg daemon start | stop | status
-
-# Breakpoints & watchpoints
-jdbg break-at <Class> <line> [-c <condition>] [-s thread|all]
-jdbg break-in <Class> <method> [--args types] [-c <condition>] [-s thread|all]
-jdbg catch <Exception> [--mode caught|uncaught|all]
-jdbg watch <Class.field> [--mode access|modification|all]
-jdbg unwatch <Class.field>
-jdbg breakpoints | clear <spec>
-
-# Class/method search
-jdbg classes [pattern]
-jdbg methods <Class>
-
-# Execution control
-jdbg run | cont | step | next | step-out
-
-# Inspection
-jdbg where [--all] | locals | print <expr> | dump <obj> | eval <expr>
-jdbg inspect <expr> [--max-elements N]
-jdbg threads | thread <id> | frame <up|down> [n] | list-source [line]
-jdbg raw <jdb command...>
-
-# Setup & maintenance
-jdbg setup [--remove] [--print] [--target claude,codex,opencode,pi|auto|all|none] [--yes]
-jdbg update
---session <id>   target a specific session (defaults to the sole live one)
---json           machine-readable JSON output
---timeout <secs> override per-command timeout
---jdb-path <p>   explicit path to the jdb executable
-```
-
-## MCP Server (agent native tools)
-
-`jdbg __mcp` runs a stdio JSON-RPC 2.0 MCP server, exposing the CLI surface as **36 native tools**
-(`launch`, `break_at`, `run`, `locals`, `cont`, `inspect`, …) so Claude Code, Codex, and OpenCode can drive a debug session
-without going through Bash. In Claude Code, Codex, and OpenCode, tools appear as `mcp__jdbg__<tool>`.
-
-`jdbg setup` ([Get Started step 2](#2-register-with-your-coding-agent)) wires this up for you. To configure it
-manually instead — or to point at a **dev build** while hacking on jdbg itself:
+Manual Claude-style MCP config for a development build:
 
 ```json
 {
   "mcpServers": {
-    "jdbg": { "command": "target/debug/jdbg", "args": ["__mcp"] }
+    "jdbg": {
+      "command": "target/debug/jdbg",
+      "args": ["__mcp"]
+    }
   }
 }
 ```
 
-For Codex, add the equivalent TOML table to `~/.codex/config.toml`:
+Codex config:
 
 ```toml
 [mcp_servers.jdbg]
@@ -189,7 +294,7 @@ command = "target/debug/jdbg"
 args = ["__mcp"]
 ```
 
-For OpenCode, add the equivalent local MCP server to `~/.config/opencode/opencode.json`:
+OpenCode config:
 
 ```json
 {
@@ -204,44 +309,107 @@ For OpenCode, add the equivalent local MCP server to `~/.config/opencode/opencod
 }
 ```
 
-The repo ships `.mcp.json` (dev) and `.claude-plugin/plugin.json` (distribution) wiring this up.
+## Command Surface
+
+<details open>
+<summary><strong>Core commands</strong></summary>
+
+```text
+# Session lifecycle
+jdbg launch <MainClass> [--classpath CP] [--sourcepath SP] [--name N] [-- app-args...]
+jdbg attach [--host H] [--port P] [--sourcepath SP] [--name N]
+jdbg status | list | kill [--session ID]
+jdbg daemon start | stop | status
+
+# Breakpoints and watchpoints
+jdbg break-at <Class> <line> [-c <condition>] [-s thread|all]
+jdbg break-in <Class> <method> [--args types] [-c <condition>] [-s thread|all]
+jdbg catch <Exception> [--mode caught|uncaught|all]
+jdbg watch <Class.field> [--mode access|modification|all]
+jdbg unwatch <Class.field>
+jdbg breakpoints | clear <spec>
+jdbg ignore <Exception> [--mode caught|uncaught|all]
+
+# Runtime discovery
+jdbg classes [pattern]
+jdbg methods <Class>
+
+# Execution control
+jdbg run | cont | step | next | step-out
+
+# Inspection
+jdbg where [--all] | locals | print <expr> | dump <obj> | eval <expr>
+jdbg inspect <expr> [--max-elements N]
+jdbg threads | thread <id> | frame <up|down> [n] | list-source [line]
+jdbg suspend [thread-id] | resume [thread-id]
+jdbg set <lvalue> <value>
+jdbg lock <expr> | thread-locks [thread-id]
+jdbg raw <jdb command...>
+
+# Setup and maintenance
+jdbg setup [--remove] [--print] [--target claude,codex,opencode,pi|auto|all|none] [--yes]
+jdbg update
+```
+
+</details>
+
+Global flags:
+
+| Flag | Purpose |
+|---|---|
+| `--session <id>` | Target a specific debug session. Defaults to the sole live session when unambiguous. |
+| `--json` | Emit machine-readable JSON instead of human-readable text. |
+| `--timeout <secs>` | Override per-command timeout. |
+| `--jdb-path <path>` | Use an explicit `jdb` executable. |
 
 ## Architecture
 
-Two clients → one daemon → N × jdb child processes:
+Two clients feed one daemon. The daemon owns all live `jdb` children and the in-memory session map.
 
-```
-     CLI (jdbg)  ─┐                           ┌─ jdb child A → JVM A
-                  ├─► Daemon (SessionManager) ┤
-  MCP (jdbg __mcp)┘    named pipe / socket    └─ jdb child B → JVM B
-```
+```mermaid
+flowchart LR
+    CLI["CLI: jdbg <cmd>"]
+    MCP["MCP: jdbg __mcp"]
+    Daemon["Daemon: session manager"]
+    JdbA["jdb child A"]
+    JdbB["jdb child B"]
+    JvmA["JVM A"]
+    JvmB["JVM B"]
 
-- **CLI / MCP server** — two peer clients; each turns its input into a `Request` and sends it to the daemon
-  via `client::send_request`.
-- **Daemon** (`jdbg __daemon`, auto-spawned) — owns the IPC listener and a `HashMap<SessionId, Session>`,
-  multiplexing N concurrent sessions.
-- **jdb engine** (`src/jdb/`) — spawns `jdb` with forced English locale and piped stdio, reads byte-wise
-  until the prompt, and parses output into structured results with regex (validated against captured jdb
-  transcripts).
-
-Layered, dependency flows downward only:
-
-```
-  bin (main.rs) → cli / output → client / daemon → session → jdb / jdkpath → error / protocol / registry
+    CLI --> Daemon
+    MCP --> Daemon
+    Daemon --> JdbA --> JvmA
+    Daemon --> JdbB --> JvmB
 ```
 
-See [`DESIGN.md`](DESIGN.md) for the full design reference (Chinese).
+The internal dependency direction stays simple:
 
-## Building & Testing
+```text
+bin -> cli / output -> client / daemon -> session -> jdb / jdkpath -> error / protocol / registry
+```
+
+See [`DESIGN.md`](DESIGN.md) for the full design reference.
+
+## Requirements
+
+| Requirement | Notes |
+|---|---|
+| JDK | JDK 8-21+ with `jdb` on `PATH` or discoverable via `JAVA_HOME`. |
+| Debug info | Compile Java with `javac -g` for locals and reliable line breakpoints. |
+| Rust | Rust 1.85+ only when installing through cargo or building from source. |
+
+For JDWP attach on JDK 8, start the target with `address=5005` or `address=localhost:5005`.
+`address=*:5005` is JDK 9+ syntax.
+
+## Building And Testing
 
 ```bash
-cargo build          # debug build
+cargo build
 cargo build --release
-cargo test           # 84 unit + 18 integration tests (parser, reader, MCP tools, session, classes/methods, watch, e2e)
+cargo test
 ```
 
-The parser is validated against captured real-jdb transcripts under `tests/fixtures/jdb/`. Pure logic
-(parser, protocol mapping, JSON-RPC) follows TDD; platform side-effects are verified by end-to-end runs.
+Tests cover parser fixtures from real `jdb` transcripts, reader behavior, protocol mapping, MCP tools, sessions, watchpoints, and end-to-end flows where the environment has a JDK.
 
 ## License
 
