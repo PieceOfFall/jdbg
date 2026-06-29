@@ -23,16 +23,16 @@
 
 The installer fetches the right build for your OS/arch from the latest GitHub Release and adds `jdbg` to your `PATH`.
 
+**Windows**
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/PieceOfFall/jdbg/releases/latest/download/java-agent-debugger-installer.ps1 | iex"
+```
+
 **macOS / Linux**
 
 ```sh
 curl --proto '=https' --tlsv1.2 -LsSf https://github.com/PieceOfFall/jdbg/releases/latest/download/java-agent-debugger-installer.sh | sh
-```
-
-**Windows (PowerShell)**
-
-```powershell
-powershell -ExecutionPolicy Bypass -c "irm https://github.com/PieceOfFall/jdbg/releases/latest/download/java-agent-debugger-installer.ps1 | iex"
 ```
 
 > The installer edits your **user-level** `PATH` (no admin needed). **Open a new terminal** afterwards so `jdbg` resolves.
