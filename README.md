@@ -23,6 +23,8 @@
 </p>
 
 <p>
+  <a href="#demo">Demo</a>
+  &nbsp;&nbsp;
   <a href="#quick-start">Quick Start</a>
   &nbsp;&nbsp;
   <a href="#why-jdbg">Why jdbg</a>
@@ -77,6 +79,12 @@
   </tr>
 </table>
 
+## Demo
+
+<p align="center">
+  <img src="assets/demo.gif" alt="jdbg debugging a Java program from an agent workflow" width="990">
+</p>
+
 ## Quick Start
 
 ### Install
@@ -84,24 +92,17 @@
 The installer downloads the right release artifact for your OS and adds `jdbg` to your user-level `PATH`.
 Open a new terminal afterwards so the command is visible.
 
-<table>
-  <tr>
-    <th align="left">Platform</th>
-    <th align="left">Command</th>
-  </tr>
-  <tr>
-    <td><strong>Windows</strong></td>
-    <td>
-      <pre lang="powershell">powershell -ExecutionPolicy Bypass -c "irm https://github.com/PieceOfFall/jdbg/releases/latest/download/java-agent-debugger-installer.ps1 | iex"</pre>
-    </td>
-  </tr>
-  <tr>
-    <td><strong>macOS / Linux</strong></td>
-    <td>
-      <pre lang="sh">curl --proto '=https' --tlsv1.2 -LsSf https://github.com/PieceOfFall/jdbg/releases/latest/download/java-agent-debugger-installer.sh | sh</pre>
-    </td>
-  </tr>
-</table>
+Windows:
+
+```powershell
+powershell -ExecutionPolicy Bypass -c "irm https://github.com/PieceOfFall/jdbg/releases/latest/download/java-agent-debugger-installer.ps1 | iex"
+```
+
+macOS / Linux:
+
+```sh
+curl --proto '=https' --tlsv1.2 -LsSf https://github.com/PieceOfFall/jdbg/releases/latest/download/java-agent-debugger-installer.sh | sh
+```
 
 <details>
 <summary><strong>Already have Rust?</strong> Install with cargo or build from source.</summary>
