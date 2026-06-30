@@ -327,7 +327,7 @@ jdbg break-at <Class> <line> [-c <condition>] [-s thread|all]
 jdbg break-in <Class> <method> [--args types] [-c <condition>] [-s thread|all]
 jdbg catch <Exception> [--mode caught|uncaught|all]
 jdbg watch <Class.field> [--mode access|modification|all]
-jdbg unwatch <Class.field>
+jdbg unwatch <Class.field> [--mode access|modification|all]
 jdbg breakpoints | clear <spec>
 jdbg ignore <Exception> [--mode caught|uncaught|all]
 
@@ -401,6 +401,10 @@ See [`DESIGN.md`](DESIGN.md) for the full design reference.
 
 For JDWP attach on JDK 8, start the target with `address=5005` or `address=localhost:5005`.
 `address=*:5005` is JDK 9+ syntax.
+
+`classes` works without a pattern, but that lists every loaded class; pass a pattern in real application
+servers. `watch --mode all` creates separate access and modification watchpoints, so `unwatch --mode
+modification` removes only the write watchpoint and leaves access watchpoints active.
 
 ## Building And Testing
 

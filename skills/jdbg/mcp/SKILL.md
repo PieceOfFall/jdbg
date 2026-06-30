@@ -4,7 +4,7 @@ description: Use when you need a Java program's real runtime state instead of re
 compatibility: Requires a JDK 8+ (provides the `jdb` command). Debugging is driven through the `jdbg` MCP server (tools named `launch`, `break_at`, `run`, `locals`, …). Native on Windows, Linux, macOS.
 allowed-tools: mcp__jdbg__launch, mcp__jdbg__attach, mcp__jdbg__status, mcp__jdbg__list, mcp__jdbg__kill, mcp__jdbg__break_at, mcp__jdbg__break_in, mcp__jdbg__catch, mcp__jdbg__watch, mcp__jdbg__unwatch, mcp__jdbg__breakpoints, mcp__jdbg__clear, mcp__jdbg__run, mcp__jdbg__cont, mcp__jdbg__step, mcp__jdbg__next, mcp__jdbg__step_out, mcp__jdbg__where, mcp__jdbg__locals, mcp__jdbg__print, mcp__jdbg__dump, mcp__jdbg__eval, mcp__jdbg__threads, mcp__jdbg__classes, mcp__jdbg__methods, mcp__jdbg__thread, mcp__jdbg__frame, mcp__jdbg__list_source, mcp__jdbg__inspect, mcp__jdbg__raw, mcp__jdbg__suspend, mcp__jdbg__resume, mcp__jdbg__set, mcp__jdbg__ignore, mcp__jdbg__lock, mcp__jdbg__threadlocks, Bash(javac:*), Bash(java:*), Read
 metadata:
-  version: "2.9"
+  version: "2.10"
 ---
 
 # jdbg — interactive Java debugging for agents
@@ -94,7 +94,7 @@ found via `JAVA_HOME/bin` → PATH → common install dirs).
 | `break_in { class, method, args?, condition?, suspend? }` | break at method entry (`args` = comma-separated param types) |
 | `catch { exception, mode? }` | break when an exception is thrown (`mode`: caught \| uncaught \| all) |
 | `watch { field, mode? }` | break when a field is accessed or modified (`mode`: access \| modification \| all; default: modification) |
-| `unwatch { field, mode? }` | remove a field watchpoint (`mode`: access \| modification \| all; default: modification — must match how it was set) |
+| `unwatch { field, mode? }` | remove field watchpoint(s) (`mode`: access \| modification \| all; default: modification) |
 | `breakpoints` · `clear { spec }` | list / remove breakpoints |
 
 **Conditional breakpoints** — filter for a specific request in high-traffic code:
@@ -209,7 +209,10 @@ cont
 ```
 
 Modes: `modification` (default, catch writes), `access` (catch reads), `all` (both).
-Remove with `unwatch { "field": "com.example.Config.timeout", "mode": "access" }` — the `mode` must match how it was set.
+`watch` with `mode: "all"` creates separate access and modification watchpoints. You can remove them
+independently: `unwatch { "field": "com.example.Config.timeout", "mode": "modification" }` leaves the
+access watchpoint active, and `mode: "access"` removes the read watchpoint. Use `mode: "all"` when you want
+to remove both classes of watchpoint in one call.
 
 Field watchpoints fire during blocking commands (`run`/`cont`/`step`/`next`/`step_out`) — the response
 includes the location, thread, and enriched source context just like breakpoint hits.
