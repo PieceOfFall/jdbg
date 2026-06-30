@@ -1190,7 +1190,7 @@ mod tests {
         let written = install_pi(&paths).unwrap();
         assert_eq!(written, vec![paths.pi_skill_dir().join("SKILL.md")]);
         let installed = fs::read_to_string(paths.pi_skill_dir().join("SKILL.md")).unwrap();
-        assert!(installed.contains("name: jdbg"));
+        assert_skill_frontmatter_is_pi_yaml_safe(&installed);
         assert!(installed.contains("Use the jdbg CLI"));
         assert!(!paths.pi_settings().exists());
 
@@ -1203,12 +1203,35 @@ mod tests {
 
     #[test]
     fn skills_are_embedded() {
-        assert!(MCP_SKILL_MD.contains("name: jdbg"));
+        assert_skill_frontmatter_is_pi_yaml_safe(MCP_SKILL_MD);
         assert!(MCP_SKILL_MD.contains("MCP server"));
         assert!(MCP_SKILL_MD.len() > 500);
-        assert!(CLI_SKILL_MD.contains("name: jdbg"));
+        assert_skill_frontmatter_is_pi_yaml_safe(CLI_SKILL_MD);
         assert!(CLI_SKILL_MD.contains("Use the jdbg CLI"));
         assert!(CLI_SKILL_MD.contains("Pi has no official jdbg MCP setup"));
         assert!(CLI_SKILL_MD.len() > 500);
+    }
+
+    fn assert_skill_frontmatter_is_pi_yaml_safe(content: &str) {
+        assert!(content.starts_with("---\n"));
+        let frontmatter_end = content[4..]
+            .find("\n---")
+            .expect("skill should have closing frontmatter marker")
+            + 4;
+        let frontmatter = &content[4..frontmatter_end];
+
+        assert!(frontmatter.lines().any(|line| line == r#"name: "jdbg""#));
+        for field in ["description", "compatibility", "allowed-tools"] {
+            let prefix = format!("{field}: ");
+            let line = frontmatter
+                .lines()
+                .find(|line| line.starts_with(&prefix))
+                .unwrap_or_else(|| panic!("missing {field} frontmatter"));
+            let value = &line[prefix.len()..];
+            assert!(
+                value.starts_with('"') && value.ends_with('"'),
+                "{field} must be quoted so YAML parsers accept values containing ':'"
+            );
+        }
     }
 }
