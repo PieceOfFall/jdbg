@@ -376,6 +376,24 @@ impl Session {
             .map(|(_, c)| c.clone())
     }
 
+    /// Find a condition for a line breakpoint with tolerance for JVM line rounding.
+    /// Looks for stored specs matching "class:N" where N is within ±`tolerance` of `hit_line`.
+    pub fn find_condition_nearby(&self, class: &str, hit_line: u32, tolerance: u32) -> Option<String> {
+        let conds = self.conditions.lock().expect("conditions mutex poisoned");
+        for (spec, cond) in conds.iter() {
+            if let Some(rest) = spec.strip_prefix(class) {
+                if let Some(line_str) = rest.strip_prefix(':') {
+                    if let Ok(stored_line) = line_str.parse::<u32>() {
+                        if stored_line.abs_diff(hit_line) <= tolerance {
+                            return Some(cond.clone());
+                        }
+                    }
+                }
+            }
+        }
+        None
+    }
+
     // ── Semantic Convenience Methods (wrap jdb command strings, §7 CLI surface) ─
 
     /// `stop at Class:line`; when `suspend == Some("thread")`, use `stop thread at` instead.

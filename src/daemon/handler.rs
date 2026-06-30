@@ -338,11 +338,13 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
                 &cmd,
                 CommandKind::normal(CommandHint::Classes).with_timeout_secs(t),
             );
-            // The handler injects the class name into Methods results because the parser has no context.
-            if let Ok(ref mut resp) = r {
-                if let CommandResult::Methods { ref mut class, .. } = resp.result {
-                    if let Some(p) = pattern {
-                        *class = p.clone();
+            // Client-side filter: jdb may not filter classes server-side on some JDK versions.
+            // Apply case-insensitive substring filter to guarantee pattern works.
+            if let Some(p) = pattern {
+                if let Ok(ref mut resp) = r {
+                    if let CommandResult::Classes { ref mut classes } = resp.result {
+                        let needle = p.to_lowercase();
+                        classes.retain(|c| c.to_lowercase().contains(&needle));
                     }
                 }
             }
@@ -522,24 +524,33 @@ fn eval_condition_loop(
     timeout: Option<u64>,
 ) -> CommandResponse {
     for _ in 0..100 {
-        let (line_spec, method_class, method_name) = match &resp.result {
+        let (hit_class, hit_line, method_name) = match &resp.result {
             CommandResult::Stopped {
                 event: Event::Breakpoint { location, .. },
                 ..
             } => (
-                format!("{}:{}", location.class, location.line),
                 location.class.clone(),
+                location.line,
                 location.method.clone(),
             ),
             _ => return resp,
         };
 
-        // Look up condition: first try line-based spec (break_at), then method-based spec (break_in).
+        // Look up condition with multiple strategies to handle:
+        // 1. Exact line match (break_at, no JVM rounding)
+        // 2. Nearby line match (break_at with JVM rounding ±5 lines)
+        // 3. Method match (break_in, "Class.method")
+        // 4. Method with args prefix match (break_in with overload, "Class.method(")
+        let line_spec = format!("{}:{}", hit_class, hit_line);
         let condition = session
             .get_condition(&line_spec)
             .or_else(|| {
-                // Try "Class.method" exact match first
-                let method_spec = format!("{}.{}", method_class, method_name);
+                // JVM may round breakpoint lines; try nearby lines for the same class
+                session.find_condition_nearby(&hit_class, hit_line, 5)
+            })
+            .or_else(|| {
+                // Try "Class.method" exact match (break_in)
+                let method_spec = format!("{}.{}", hit_class, method_name);
                 session.get_condition(&method_spec).or_else(|| {
                     // Try any stored condition whose spec starts with "Class.method(" (overloaded)
                     let prefix = format!("{}(", method_spec);

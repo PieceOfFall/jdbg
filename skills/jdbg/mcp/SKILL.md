@@ -102,6 +102,9 @@ found via `JAVA_HOME/bin` → PATH → common install dirs).
 break_at { "class": "com.example.CartService", "line": 42, "condition": "userId == 1619458289" }
 ```
 The condition is evaluated each time the breakpoint fires; execution automatically continues if false.
+**Important:** after setting a conditional breakpoint, call `cont` to enter the blocking wait loop — the
+condition is evaluated inside `cont`/`run`/`step`/`next`/`step_out`. If the breakpoint fires asynchronously
+(before you call `cont`), call `cont` to resume — the next hit will be condition-checked.
 
 **Thread breakpoints** (`suspend: "thread"`) — like IDEA's "Suspend: Thread" option. Only the hit thread
 is suspended; all other threads (ZooKeeper heartbeat, Dubbo registry, other HTTP handlers) keep running.
