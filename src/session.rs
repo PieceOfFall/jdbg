@@ -356,6 +356,15 @@ impl Session {
         conds.push((spec.to_string(), condition.to_string()));
     }
 
+    /// Whether this session has any active conditional breakpoints.
+    pub fn has_conditions(&self) -> bool {
+        !self
+            .conditions
+            .lock()
+            .expect("conditions mutex poisoned")
+            .is_empty()
+    }
+
     /// Look up the condition expression for a spec.
     pub fn get_condition(&self, spec: &str) -> Option<String> {
         self.conditions
@@ -376,22 +385,22 @@ impl Session {
             .map(|(_, c)| c.clone())
     }
 
+    /// Find the condition for a hit breakpoint location.
+    pub fn condition_for_hit(&self, class: &str, line: u32, method: &str) -> Option<String> {
+        let conds = self.conditions.lock().expect("conditions mutex poisoned");
+        find_condition_for_hit(&conds, class, line, method)
+    }
+
     /// Find a condition for a line breakpoint with tolerance for JVM line rounding.
     /// Looks for stored specs matching "class:N" where N is within ±`tolerance` of `hit_line`.
-    pub fn find_condition_nearby(&self, class: &str, hit_line: u32, tolerance: u32) -> Option<String> {
+    pub fn find_condition_nearby(
+        &self,
+        class: &str,
+        hit_line: u32,
+        tolerance: u32,
+    ) -> Option<String> {
         let conds = self.conditions.lock().expect("conditions mutex poisoned");
-        for (spec, cond) in conds.iter() {
-            if let Some(rest) = spec.strip_prefix(class) {
-                if let Some(line_str) = rest.strip_prefix(':') {
-                    if let Ok(stored_line) = line_str.parse::<u32>() {
-                        if stored_line.abs_diff(hit_line) <= tolerance {
-                            return Some(cond.clone());
-                        }
-                    }
-                }
-            }
-        }
-        None
+        find_line_condition(&conds, class, hit_line, tolerance)
     }
 
     // ── Semantic Convenience Methods (wrap jdb command strings, §7 CLI surface) ─
@@ -540,6 +549,63 @@ impl Session {
             CommandKind::normal(CommandHint::Other).with_timeout_secs(timeout),
         )
     }
+}
+
+fn find_condition_for_hit(
+    conditions: &[(String, String)],
+    hit_class: &str,
+    hit_line: u32,
+    hit_method: &str,
+) -> Option<String> {
+    find_line_condition(conditions, hit_class, hit_line, 0)
+        .or_else(|| find_line_condition(conditions, hit_class, hit_line, 5))
+        .or_else(|| find_method_condition(conditions, hit_class, hit_method))
+}
+
+fn find_line_condition(
+    conditions: &[(String, String)],
+    hit_class: &str,
+    hit_line: u32,
+    tolerance: u32,
+) -> Option<String> {
+    conditions.iter().find_map(|(spec, condition)| {
+        let (stored_class, stored_line) = parse_line_condition_spec(spec)?;
+        (class_spec_matches(stored_class, hit_class) && stored_line.abs_diff(hit_line) <= tolerance)
+            .then(|| condition.clone())
+    })
+}
+
+fn find_method_condition(
+    conditions: &[(String, String)],
+    hit_class: &str,
+    hit_method: &str,
+) -> Option<String> {
+    conditions.iter().find_map(|(spec, condition)| {
+        let (stored_class, stored_method) = parse_method_condition_spec(spec)?;
+        (class_spec_matches(stored_class, hit_class) && stored_method == hit_method)
+            .then(|| condition.clone())
+    })
+}
+
+fn parse_line_condition_spec(spec: &str) -> Option<(&str, u32)> {
+    let (class, line) = spec.rsplit_once(':')?;
+    Some((class, line.parse().ok()?))
+}
+
+fn parse_method_condition_spec(spec: &str) -> Option<(&str, &str)> {
+    let prefix = spec.split_once('(').map_or(spec, |(prefix, _)| prefix);
+    let (class, method) = prefix.rsplit_once('.')?;
+    (!class.is_empty() && !method.is_empty()).then_some((class, method))
+}
+
+fn class_spec_matches(stored: &str, hit: &str) -> bool {
+    stored == hit
+        || hit
+            .strip_suffix(stored)
+            .is_some_and(|prefix| prefix.ends_with('.'))
+        || stored
+            .strip_suffix(hit)
+            .is_some_and(|prefix| prefix.ends_with('.'))
 }
 
 impl SessionInner {
@@ -957,7 +1023,7 @@ fn probe_tcp(host: &str, port: u16) -> Result<()> {
 #[cfg(test)]
 mod tests {
     //! Unit tests for session-layer mapping logic, focused on pure function `event_to_result`.
-    use super::{CommandKind, event_to_result};
+    use super::{CommandKind, class_spec_matches, event_to_result, find_condition_for_hit};
     use crate::jdb::reader::DetectedEvent;
     use crate::protocol::*;
 
@@ -1051,6 +1117,67 @@ mod tests {
 
         let custom = n.with_timeout(std::time::Duration::from_secs(5));
         assert_eq!(custom.timeout.as_secs(), 5);
+    }
+
+    #[test]
+    fn condition_hit_matches_short_class_against_fully_qualified_hit() {
+        let conditions = vec![(
+            "RequestFacade:3956".to_string(),
+            "name.equals(\"userToken\")".to_string(),
+        )];
+
+        assert_eq!(
+            find_condition_for_hit(
+                &conditions,
+                "org.apache.catalina.connector.RequestFacade",
+                3956,
+                "getHeader",
+            )
+            .as_deref(),
+            Some("name.equals(\"userToken\")")
+        );
+    }
+
+    #[test]
+    fn condition_hit_matches_fully_qualified_spec_against_short_hit() {
+        let conditions = vec![(
+            "org.apache.catalina.connector.RequestFacade:3956".to_string(),
+            "name.equals(\"userToken\")".to_string(),
+        )];
+
+        assert_eq!(
+            find_condition_for_hit(&conditions, "RequestFacade", 3956, "getHeader").as_deref(),
+            Some("name.equals(\"userToken\")")
+        );
+    }
+
+    #[test]
+    fn condition_hit_allows_nearby_line_rounding() {
+        let conditions = vec![("CartService:42".to_string(), "userId == 123".to_string())];
+
+        assert_eq!(
+            find_condition_for_hit(&conditions, "com.example.CartService", 45, "add").as_deref(),
+            Some("userId == 123")
+        );
+    }
+
+    #[test]
+    fn condition_hit_matches_method_with_overload_args() {
+        let conditions = vec![(
+            "com.example.CartService.add(java.lang.String,int)".to_string(),
+            "qty > 1".to_string(),
+        )];
+
+        assert_eq!(
+            find_condition_for_hit(&conditions, "CartService", 0, "add").as_deref(),
+            Some("qty > 1")
+        );
+    }
+
+    #[test]
+    fn condition_hit_does_not_match_partial_class_name() {
+        assert!(!class_spec_matches("Facade", "RequestFacade"));
+        assert!(!class_spec_matches("RequestFacade", "OtherRequestFacade"));
     }
 
     // ─── execute behavior tests would require a real jdb process (see integration tests) ───

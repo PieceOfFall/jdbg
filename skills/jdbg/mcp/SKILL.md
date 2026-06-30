@@ -4,7 +4,7 @@ description: Use when you need a Java program's real runtime state instead of re
 compatibility: Requires a JDK 8+ (provides the `jdb` command). Debugging is driven through the `jdbg` MCP server (tools named `launch`, `break_at`, `run`, `locals`, …). Native on Windows, Linux, macOS.
 allowed-tools: mcp__jdbg__launch, mcp__jdbg__attach, mcp__jdbg__status, mcp__jdbg__list, mcp__jdbg__kill, mcp__jdbg__break_at, mcp__jdbg__break_in, mcp__jdbg__catch, mcp__jdbg__watch, mcp__jdbg__unwatch, mcp__jdbg__breakpoints, mcp__jdbg__clear, mcp__jdbg__run, mcp__jdbg__cont, mcp__jdbg__step, mcp__jdbg__next, mcp__jdbg__step_out, mcp__jdbg__where, mcp__jdbg__locals, mcp__jdbg__print, mcp__jdbg__dump, mcp__jdbg__eval, mcp__jdbg__threads, mcp__jdbg__classes, mcp__jdbg__methods, mcp__jdbg__thread, mcp__jdbg__frame, mcp__jdbg__list_source, mcp__jdbg__inspect, mcp__jdbg__raw, mcp__jdbg__suspend, mcp__jdbg__resume, mcp__jdbg__set, mcp__jdbg__ignore, mcp__jdbg__lock, mcp__jdbg__threadlocks, Bash(javac:*), Bash(java:*), Read
 metadata:
-  version: "2.8"
+  version: "2.9"
 ---
 
 # jdbg — interactive Java debugging for agents
@@ -102,9 +102,9 @@ found via `JAVA_HOME/bin` → PATH → common install dirs).
 break_at { "class": "com.example.CartService", "line": 42, "condition": "userId == 1619458289" }
 ```
 The condition is evaluated each time the breakpoint fires; execution automatically continues if false.
-**Important:** after setting a conditional breakpoint, call `cont` to enter the blocking wait loop — the
-condition is evaluated inside `cont`/`run`/`step`/`next`/`step_out`. If the breakpoint fires asynchronously
-(before you call `cont`), call `cont` to resume — the next hit will be condition-checked.
+For an already-running attached JVM, if the breakpoint fires before your next blocking command, the next
+inspection command (`threads`, `where`, `print`, `locals`, etc.) first resolves any false conditional hit and
+continues automatically.
 
 **Thread breakpoints** (`suspend: "thread"`) — like IDEA's "Suspend: Thread" option. Only the hit thread
 is suspended; all other threads (ZooKeeper heartbeat, Dubbo registry, other HTTP handlers) keep running.

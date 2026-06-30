@@ -217,6 +217,10 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
 
     // Timeout override for this request (CLI `--timeout`); None means each command's default.
     let t = req.timeout;
+    let precondition_note = match settle_async_condition_breakpoint(&session, &req.cmd, t) {
+        AsyncConditionResolution::Continue { note } => note,
+        AsyncConditionResolution::Return(resp) => return Response::ok(id, resp),
+    };
 
     let result = match &req.cmd {
         // Breakpoints
@@ -268,22 +272,14 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
             )
         }
         Command::Watch { field, mode } => {
-            let cmd = match mode.as_str() {
-                "access" => format!("watch access {field}"),
-                "all" => format!("watch all {field}"),
-                _ => format!("watch {field}"),
-            };
+            let cmd = watch_command(field, mode);
             session.execute(
                 &cmd,
                 CommandKind::normal(CommandHint::WatchSet).with_timeout_secs(t),
             )
         }
         Command::Unwatch { field, mode } => {
-            let cmd = match mode.as_str() {
-                "access" => format!("unwatch access {field}"),
-                "all" => format!("unwatch all {field}"),
-                _ => format!("unwatch {field}"),
-            };
+            let cmd = unwatch_command(field, mode);
             session.execute(
                 &cmd,
                 CommandKind::normal(CommandHint::Other).with_timeout_secs(t),
@@ -323,7 +319,10 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
         // Inspection — inspect (composite, multi-command)
         Command::Inspect { expr, max_elements } => {
             match handle_inspect(&session, expr, *max_elements, t) {
-                Ok(resp) => return Response::ok(id, resp),
+                Ok(mut resp) => {
+                    append_note_if_present(&mut resp, precondition_note.as_deref());
+                    return Response::ok(id, resp);
+                }
                 Err(e) => return Response::err(id, e.exit_code(), e.to_string()),
             }
         }
@@ -449,15 +448,16 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
                 if let Ok(ref resp) = first_try {
                     if let CommandResult::Raw { text } = &resp.result {
                         if text.contains("Name unknown") || text.contains("ParseException") {
-                            let quoted = format!(
-                                "\"{}\"",
-                                value.replace('\\', "\\\\").replace('"', "\\\"")
-                            );
+                            let quoted =
+                                format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""));
                             return match session.execute(
                                 &format!("set {lvalue} = {quoted}"),
                                 CommandKind::normal(CommandHint::Other).with_timeout_secs(t),
                             ) {
-                                Ok(resp) => Response::ok(id, resp),
+                                Ok(mut resp) => {
+                                    append_note_if_present(&mut resp, precondition_note.as_deref());
+                                    Response::ok(id, resp)
+                                }
                                 Err(e) => Response::err(id, e.exit_code(), e.to_string()),
                             };
                         }
@@ -498,7 +498,10 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
     };
 
     match result {
-        Ok(resp) => Response::ok(id, resp),
+        Ok(mut resp) => {
+            append_note_if_present(&mut resp, precondition_note.as_deref());
+            Response::ok(id, resp)
+        }
         Err(e) => Response::err(id, e.exit_code(), e.to_string()),
     }
 }
@@ -514,6 +517,122 @@ fn append_note(resp: &mut CommandResponse, msg: &str) {
         }
         None => resp.note = Some(msg.to_string()),
     }
+}
+
+fn append_note_if_present(resp: &mut CommandResponse, note: Option<&str>) {
+    if let Some(note) = note {
+        append_note(resp, note);
+    }
+}
+
+fn watch_command(field: &str, mode: &str) -> String {
+    match mode {
+        "access" => format!("watch access {field}"),
+        "all" => format!("watch all {field}"),
+        _ => format!("watch {field}"),
+    }
+}
+
+fn unwatch_command(field: &str, mode: &str) -> String {
+    match mode {
+        "access" => format!("unwatch access {field}"),
+        "all" => format!("unwatch all {field}"),
+        _ => format!("unwatch {field}"),
+    }
+}
+
+enum AsyncConditionResolution {
+    Continue { note: Option<String> },
+    Return(CommandResponse),
+}
+
+fn settle_async_condition_breakpoint(
+    session: &Session,
+    cmd: &Command,
+    timeout: Option<u64>,
+) -> AsyncConditionResolution {
+    if !should_settle_async_conditions(cmd) || !session.has_conditions() {
+        return AsyncConditionResolution::Continue { note: None };
+    }
+
+    let stack = match session.stack(Some(5)) {
+        Ok(resp) => resp,
+        Err(_) => return AsyncConditionResolution::Continue { note: None },
+    };
+    let resp = match &stack.result {
+        CommandResult::StackTrace { frames } => {
+            let Some(top) = frames.first() else {
+                return AsyncConditionResolution::Continue { note: None };
+            };
+            let Some(_) = session.condition_for_hit(
+                &top.location.class,
+                top.location.line,
+                &top.location.method,
+            ) else {
+                return AsyncConditionResolution::Continue { note: stack.note };
+            };
+
+            let location = top.location.clone();
+            let thread = String::new();
+            CommandResponse {
+                result: CommandResult::Stopped {
+                    event: Event::Breakpoint {
+                        location: location.clone(),
+                        thread: thread.clone(),
+                    },
+                    location,
+                    thread,
+                    thread_id: None,
+                    frame: Some(top.clone()),
+                    source_context: None,
+                },
+                stderr: None,
+                note: stack.note,
+            }
+        }
+        CommandResult::Stopped {
+            event: Event::Breakpoint { .. },
+            location,
+            ..
+        } => {
+            let Some(_) =
+                session.condition_for_hit(&location.class, location.line, &location.method)
+            else {
+                return AsyncConditionResolution::Continue { note: stack.note };
+            };
+            stack
+        }
+        _ => return AsyncConditionResolution::Continue { note: None },
+    };
+
+    let resolved = eval_condition_loop(session, resp, timeout);
+    match resolved.result {
+        CommandResult::Stopped { .. } => AsyncConditionResolution::Continue {
+            note: resolved.note,
+        },
+        _ => AsyncConditionResolution::Return(resolved),
+    }
+}
+
+fn should_settle_async_conditions(cmd: &Command) -> bool {
+    matches!(
+        cmd,
+        Command::Where { .. }
+            | Command::Locals
+            | Command::Print { .. }
+            | Command::Dump { .. }
+            | Command::Eval { .. }
+            | Command::Classes { .. }
+            | Command::Methods { .. }
+            | Command::Threads { .. }
+            | Command::Thread { .. }
+            | Command::Frame { .. }
+            | Command::ListSource { .. }
+            | Command::Inspect { .. }
+            | Command::Set { .. }
+            | Command::Lock { .. }
+            | Command::ThreadLocks { .. }
+    )
 }
 
 /// Conditional-breakpoint loop: if a hit breakpoint has a condition and the condition is false, auto-cont.
@@ -536,29 +655,7 @@ fn eval_condition_loop(
             _ => return resp,
         };
 
-        // Look up condition with multiple strategies to handle:
-        // 1. Exact line match (break_at, no JVM rounding)
-        // 2. Nearby line match (break_at with JVM rounding ±5 lines)
-        // 3. Method match (break_in, "Class.method")
-        // 4. Method with args prefix match (break_in with overload, "Class.method(")
-        let line_spec = format!("{}:{}", hit_class, hit_line);
-        let condition = session
-            .get_condition(&line_spec)
-            .or_else(|| {
-                // JVM may round breakpoint lines; try nearby lines for the same class
-                session.find_condition_nearby(&hit_class, hit_line, 5)
-            })
-            .or_else(|| {
-                // Try "Class.method" exact match (break_in)
-                let method_spec = format!("{}.{}", hit_class, method_name);
-                session.get_condition(&method_spec).or_else(|| {
-                    // Try any stored condition whose spec starts with "Class.method(" (overloaded)
-                    let prefix = format!("{}(", method_spec);
-                    session.find_condition_by_prefix(&prefix)
-                })
-            });
-
-        let condition = match condition {
+        let condition = match session.condition_for_hit(&hit_class, hit_line, &method_name) {
             Some(c) => c,
             None => return resp,
         };
@@ -984,6 +1081,48 @@ mod tests {
             group: None,
             state: state.into(),
         }
+    }
+
+    #[test]
+    fn watch_command_uses_jdb_mode_syntax() {
+        assert_eq!(watch_command("Main.x", "modification"), "watch Main.x");
+        assert_eq!(watch_command("Main.x", "access"), "watch access Main.x");
+        assert_eq!(watch_command("Main.x", "all"), "watch all Main.x");
+    }
+
+    #[test]
+    fn unwatch_command_uses_jdb_mode_syntax() {
+        assert_eq!(unwatch_command("Main.x", "modification"), "unwatch Main.x");
+        assert_eq!(unwatch_command("Main.x", "access"), "unwatch access Main.x");
+        assert_eq!(unwatch_command("Main.x", "all"), "unwatch all Main.x");
+    }
+
+    #[test]
+    fn async_condition_settle_runs_before_inspection_commands() {
+        assert!(should_settle_async_conditions(&Command::Threads {
+            filter: None
+        }));
+        assert!(should_settle_async_conditions(&Command::Print {
+            expr: "name".into()
+        }));
+        assert!(should_settle_async_conditions(&Command::Set {
+            lvalue: "name".into(),
+            value: "userToken".into()
+        }));
+    }
+
+    #[test]
+    fn async_condition_settle_skips_breakpoint_management() {
+        assert!(!should_settle_async_conditions(&Command::BreakAt {
+            class: "Main".into(),
+            line: 42,
+            condition: Some("x > 1".into()),
+            suspend: None,
+        }));
+        assert!(!should_settle_async_conditions(&Command::Clear {
+            spec: "Main:42".into()
+        }));
+        assert!(!should_settle_async_conditions(&Command::Cont));
     }
 
     #[test]

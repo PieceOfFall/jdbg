@@ -4,7 +4,7 @@ description: Use the jdbg CLI to debug Java programs interactively from Pi when 
 compatibility: Requires a JDK 8+ with jdb available through JAVA_HOME, PATH, or --jdb-path. Requires the jdbg CLI on PATH. Native on Windows, Linux, and macOS.
 allowed-tools: Bash(jdbg:*), Bash(javac:*), Bash(java:*), Read
 metadata:
-  version: "1.1"
+  version: "1.2"
 ---
 
 # jdbg CLI - interactive Java debugging for Pi
@@ -156,6 +156,10 @@ Conditional breakpoint:
 ```bash
 jdbg break-at com.example.Service 87 --condition "userId == 123"
 ```
+
+False conditional hits auto-continue. In an already-running attached JVM, if a conditional breakpoint fires
+before your next blocking command, the next inspection command (`threads`, `where`, `print`, `locals`, etc.)
+first resolves the condition.
 
 Thread-only breakpoint, useful in servers:
 
