@@ -1,8 +1,8 @@
 ---
-name: jdbg
-description: Use the jdbg CLI to debug Java programs interactively from Pi when real runtime state is needed: variables, fields, expressions, exceptions, breakpoints, stepping, threads, locks, or JDWP attach. Pi should use the CLI because jdbg does not install an official Pi MCP server.
-compatibility: Requires a JDK 8+ with jdb available through JAVA_HOME, PATH, or --jdb-path. Requires the jdbg CLI on PATH. Native on Windows, Linux, and macOS.
-allowed-tools: Bash(jdbg:*), Bash(javac:*), Bash(java:*), Read
+name: "jdbg"
+description: "Use the jdbg CLI to debug Java programs interactively from Pi when real runtime state is needed: variables, fields, expressions, exceptions, breakpoints, stepping, threads, locks, or JDWP attach. Pi should use the CLI because jdbg does not install an official Pi MCP server."
+compatibility: "Requires a JDK 8+ with jdb available through JAVA_HOME, PATH, or --jdb-path. Requires the jdbg CLI on PATH. Native on Windows, Linux, and macOS."
+allowed-tools: "Bash(jdbg:*), Bash(javac:*), Bash(java:*), Read"
 metadata:
   version: "1.3"
 ---
