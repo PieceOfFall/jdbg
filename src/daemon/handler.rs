@@ -429,18 +429,40 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
             )
         }
         Command::Set { lvalue, value } => {
-            // Auto-quote string literals: if the value is not already a valid Java expression
-            // (quoted string, number, null, true/false, or identifier/field chain), wrap in double quotes.
-            // This helps LLMs that pass bare string values like "TestHeader" instead of "\"TestHeader\"".
+            // Strategy: if the value is obviously not a Java expression (contains hyphens, slashes, etc.),
+            // wrap it in quotes upfront. Otherwise, try as-is first; if jdb returns "Name unknown" (meaning
+            // it tried to resolve the value as a variable and failed), retry with double quotes — this
+            // transparently handles LLMs that pass bare string literals like "TestHeader".
             let effective_value = if needs_string_quoting(value) {
                 format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
             } else {
                 value.clone()
             };
-            session.execute(
+            let first_try = session.execute(
                 &format!("set {lvalue} = {effective_value}"),
                 CommandKind::normal(CommandHint::Other).with_timeout_secs(t),
-            )
+            );
+            // If the value was NOT pre-quoted and jdb failed with "Name unknown", retry with quotes.
+            if effective_value == *value {
+                if let Ok(ref resp) = first_try {
+                    if let CommandResult::Raw { text } = &resp.result {
+                        if text.contains("Name unknown") || text.contains("ParseException") {
+                            let quoted = format!(
+                                "\"{}\"",
+                                value.replace('\\', "\\\\").replace('"', "\\\"")
+                            );
+                            return match session.execute(
+                                &format!("set {lvalue} = {quoted}"),
+                                CommandKind::normal(CommandHint::Other).with_timeout_secs(t),
+                            ) {
+                                Ok(resp) => Response::ok(id, resp),
+                                Err(e) => Response::err(id, e.exit_code(), e.to_string()),
+                            };
+                        }
+                    }
+                }
+            }
+            first_try
         }
         Command::Ignore { exception, mode } => {
             // Mirror Catch's mode dispatch for symmetric exception breakpoint removal.
