@@ -62,9 +62,11 @@ static RE_VM_EXIT: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?m)^The application (?:exited|has been disconnected)").unwrap());
 
 /// Fatal connection/launch error.
+/// NOTE: `java.io.IOException` must require a trailing colon to avoid false-positives when jdb lists
+/// loaded classes (e.g. `classes` output includes `java.io.IOException` as a class name).
 static RE_FATAL: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r"(?m)^(?:Unable to attach to target VM|java\.io\.IOException|Input stream closed|Connection refused)",
+        r"(?m)^(?:Unable to attach to target VM|java\.io\.IOException:|Input stream closed|Connection refused)",
     )
     .unwrap()
 });
@@ -732,5 +734,27 @@ mod tests {
             elapsed < Duration::from_secs(2),
             "should resolve immediately, not wait for timeout; took {elapsed:?}"
         );
+    }
+
+    #[test]
+    fn fatal_regex_does_not_match_class_name_in_listing() {
+        // When jdb lists loaded classes, `java.io.IOException` appears as a class name (no colon).
+        // This must NOT trigger a fatal error detection.
+        assert!(!RE_FATAL.is_match("java.io.IOException"));
+        assert!(!RE_FATAL.is_match("java.io.IOException\njava.io.FileNotFoundException"));
+    }
+
+    #[test]
+    fn fatal_regex_matches_real_io_exception_with_message() {
+        // Real fatal errors always have a colon + message after the exception class.
+        assert!(RE_FATAL.is_match("java.io.IOException: Connection reset"));
+        assert!(RE_FATAL.is_match("java.io.IOException: Stream closed"));
+    }
+
+    #[test]
+    fn fatal_regex_still_matches_other_patterns() {
+        assert!(RE_FATAL.is_match("Unable to attach to target VM"));
+        assert!(RE_FATAL.is_match("Input stream closed"));
+        assert!(RE_FATAL.is_match("Connection refused"));
     }
 }

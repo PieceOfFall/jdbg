@@ -115,6 +115,8 @@ pub enum Command {
     },
     Unwatch {
         field: String,
+        #[serde(default = "default_watch_mode")]
+        mode: String,
     },
     Breakpoints,
     Clear {

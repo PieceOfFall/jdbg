@@ -141,9 +141,12 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         tool(
             "unwatch",
-            "Remove a field watchpoint.",
+            "Remove a field watchpoint. The mode must match how it was set: \
+             'modification' (default) removes a write watchpoint, 'access' removes a read watchpoint, \
+             'all' removes a combined watchpoint.",
             json!({
-                "field": {"type": "string", "description": "Field spec to unwatch, e.g. com.example.Service.name."}
+                "field": {"type": "string", "description": "Field spec to unwatch, e.g. com.example.Service.name."},
+                "mode": {"type": "string", "enum": ["access", "modification", "all"], "description": "Watch mode to remove (default: modification). Must match the mode used when setting the watchpoint."}
             }),
             &["field"],
             true,
@@ -444,6 +447,7 @@ pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> 
         },
         "unwatch" => Command::Unwatch {
             field: require_str(args, "field")?,
+            mode: optional_str(args, "mode").unwrap_or_else(|| "modification".to_string()),
         },
         "breakpoints" => Command::Breakpoints,
         "clear" => Command::Clear {
@@ -856,7 +860,22 @@ mod tests {
     fn unwatch_maps_field() {
         let req = dispatch_tool("unwatch", &json!({"field": "Main.x"})).unwrap();
         match req.cmd {
-            Command::Unwatch { field } => assert_eq!(field, "Main.x"),
+            Command::Unwatch { field, mode } => {
+                assert_eq!(field, "Main.x");
+                assert_eq!(mode, "modification");
+            }
+            other => panic!("expected Unwatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unwatch_maps_mode_access() {
+        let req = dispatch_tool("unwatch", &json!({"field": "Main.x", "mode": "access"})).unwrap();
+        match req.cmd {
+            Command::Unwatch { field, mode } => {
+                assert_eq!(field, "Main.x");
+                assert_eq!(mode, "access");
+            }
             other => panic!("expected Unwatch, got {other:?}"),
         }
     }

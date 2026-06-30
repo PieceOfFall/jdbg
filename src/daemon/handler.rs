@@ -278,10 +278,17 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
                 CommandKind::normal(CommandHint::WatchSet).with_timeout_secs(t),
             )
         }
-        Command::Unwatch { field } => session.execute(
-            &format!("unwatch {field}"),
-            CommandKind::normal(CommandHint::Other).with_timeout_secs(t),
-        ),
+        Command::Unwatch { field, mode } => {
+            let cmd = match mode.as_str() {
+                "access" => format!("unwatch access {field}"),
+                "all" => format!("unwatch all {field}"),
+                _ => format!("unwatch {field}"),
+            };
+            session.execute(
+                &cmd,
+                CommandKind::normal(CommandHint::Other).with_timeout_secs(t),
+            )
+        }
         Command::Breakpoints => session.execute(
             "clear",
             CommandKind::normal(CommandHint::Breakpoints).with_timeout_secs(t),
@@ -421,10 +428,20 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
                 CommandKind::normal(CommandHint::Other).with_timeout_secs(t),
             )
         }
-        Command::Set { lvalue, value } => session.execute(
-            &format!("set {lvalue} = {value}"),
-            CommandKind::normal(CommandHint::Other).with_timeout_secs(t),
-        ),
+        Command::Set { lvalue, value } => {
+            // Auto-quote string literals: if the value is not already a valid Java expression
+            // (quoted string, number, null, true/false, or identifier/field chain), wrap in double quotes.
+            // This helps LLMs that pass bare string values like "TestHeader" instead of "\"TestHeader\"".
+            let effective_value = if needs_string_quoting(value) {
+                format!("\"{}\"", value.replace('\\', "\\\\").replace('"', "\\\""))
+            } else {
+                value.clone()
+            };
+            session.execute(
+                &format!("set {lvalue} = {effective_value}"),
+                CommandKind::normal(CommandHint::Other).with_timeout_secs(t),
+            )
+        }
         Command::Ignore { exception, mode } => {
             // Mirror Catch's mode dispatch for symmetric exception breakpoint removal.
             let cmd = match mode.as_str() {
@@ -483,17 +500,32 @@ fn eval_condition_loop(
     timeout: Option<u64>,
 ) -> CommandResponse {
     for _ in 0..100 {
-        let spec = match &resp.result {
+        let (line_spec, method_class, method_name) = match &resp.result {
             CommandResult::Stopped {
                 event: Event::Breakpoint { location, .. },
                 ..
-            } => {
-                format!("{}:{}", location.class, location.line)
-            }
+            } => (
+                format!("{}:{}", location.class, location.line),
+                location.class.clone(),
+                location.method.clone(),
+            ),
             _ => return resp,
         };
 
-        let condition = match session.get_condition(&spec) {
+        // Look up condition: first try line-based spec (break_at), then method-based spec (break_in).
+        let condition = session
+            .get_condition(&line_spec)
+            .or_else(|| {
+                // Try "Class.method" exact match first
+                let method_spec = format!("{}.{}", method_class, method_name);
+                session.get_condition(&method_spec).or_else(|| {
+                    // Try any stored condition whose spec starts with "Class.method(" (overloaded)
+                    let prefix = format!("{}(", method_spec);
+                    session.find_condition_by_prefix(&prefix)
+                })
+            });
+
+        let condition = match condition {
             Some(c) => c,
             None => return resp,
         };
@@ -836,6 +868,78 @@ fn filter_threads(threads: Vec<ThreadInfo>, filter: Option<&str>) -> Vec<ThreadI
     }
 }
 
+/// Determine whether a `set` value needs to be wrapped in double quotes for jdb.
+///
+/// Returns `true` if the value does not look like a valid Java expression that jdb can evaluate directly:
+/// - Already quoted (`"..."`) → no quoting needed
+/// - Numeric literal (integer/float, optionally negative) → no quoting needed
+/// - Boolean/null (`true`, `false`, `null`) → no quoting needed
+/// - Identifier or field/array chain (e.g. `x`, `this.count`, `arr[0]`, `obj.field`) → no quoting needed
+/// - `new ...` expression → no quoting needed
+/// - Anything else (contains hyphens, spaces, special chars) → likely intended as a string literal
+fn needs_string_quoting(value: &str) -> bool {
+    let v = value.trim();
+    if v.is_empty() {
+        return true;
+    }
+    // Already quoted string
+    if v.starts_with('"') && v.ends_with('"') && v.len() >= 2 {
+        return false;
+    }
+    // Already a char literal
+    if v.starts_with('\'') && v.ends_with('\'') && v.len() >= 3 {
+        return false;
+    }
+    // Boolean or null
+    if matches!(v, "true" | "false" | "null") {
+        return false;
+    }
+    // Numeric literal (integer or float, optionally negative, with optional L/F/D suffix)
+    let num_part = v.strip_suffix(|c: char| "lLfFdD".contains(c)).unwrap_or(v);
+    if num_part.parse::<f64>().is_ok() {
+        return false;
+    }
+    // Hex literal
+    if num_part.starts_with("0x") || num_part.starts_with("0X") {
+        if num_part[2..].chars().all(|c| c.is_ascii_hexdigit()) {
+            return false;
+        }
+    }
+    // `new` expression (e.g. `new String("x")`)
+    if v.starts_with("new ") {
+        return false;
+    }
+    // Cast expression (e.g. `(int)42`)
+    if v.starts_with('(') {
+        return false;
+    }
+    // Valid Java identifier/field/method/array chain: starts with letter/$/_, contains only
+    // alphanumeric/$/_/./[/]/(/)/,/space (for method calls and generics). This covers:
+    // `x`, `this.field`, `arr[0]`, `obj.method()`, `SomeClass.CONST`
+    let first = v.chars().next().unwrap();
+    if first.is_ascii_alphabetic() || first == '_' || first == '$' {
+        let valid_chain = v.chars().all(|c| {
+            c.is_ascii_alphanumeric()
+                || c == '_'
+                || c == '$'
+                || c == '.'
+                || c == '['
+                || c == ']'
+                || c == '('
+                || c == ')'
+                || c == ','
+                || c == ' '
+                || c == '"'
+                || c == '\''
+        });
+        if valid_chain {
+            return false;
+        }
+    }
+    // Anything else: likely a bare string that needs quoting
+    true
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -908,5 +1012,57 @@ mod tests {
         let threads = vec![ti("0x1", "main", "running"), ti("0x2", "worker", "running")];
         assert_eq!(filter_threads(threads.clone(), None).len(), 2);
         assert_eq!(filter_threads(threads, Some("")).len(), 2);
+    }
+
+    // ─── needs_string_quoting tests ────────────────────────────────────────────
+
+    #[test]
+    fn quoting_already_quoted_string() {
+        assert!(!needs_string_quoting("\"hello\""));
+    }
+
+    #[test]
+    fn quoting_number_literals() {
+        assert!(!needs_string_quoting("42"));
+        assert!(!needs_string_quoting("-3.14"));
+        assert!(!needs_string_quoting("0xFF"));
+        assert!(!needs_string_quoting("100L"));
+    }
+
+    #[test]
+    fn quoting_boolean_and_null() {
+        assert!(!needs_string_quoting("true"));
+        assert!(!needs_string_quoting("false"));
+        assert!(!needs_string_quoting("null"));
+    }
+
+    #[test]
+    fn quoting_identifier_chains() {
+        assert!(!needs_string_quoting("x"));
+        assert!(!needs_string_quoting("this.count"));
+        assert!(!needs_string_quoting("arr[0]"));
+        assert!(!needs_string_quoting("SomeClass.CONST"));
+        assert!(!needs_string_quoting("obj.method()"));
+    }
+
+    #[test]
+    fn quoting_new_and_cast_expressions() {
+        assert!(!needs_string_quoting("new String(\"x\")"));
+        assert!(!needs_string_quoting("(int)42"));
+    }
+
+    #[test]
+    fn quoting_bare_strings_that_need_quotes() {
+        // Contains hyphen — not a valid Java identifier
+        assert!(needs_string_quoting("X-Test-Header"));
+        assert!(needs_string_quoting("content-type"));
+        // Contains special characters
+        assert!(needs_string_quoting("hello world!"));
+        assert!(needs_string_quoting("/api/v1/users"));
+    }
+
+    #[test]
+    fn quoting_empty_value() {
+        assert!(needs_string_quoting(""));
     }
 }

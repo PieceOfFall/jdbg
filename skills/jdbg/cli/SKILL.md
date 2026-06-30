@@ -4,7 +4,7 @@ description: Use the jdbg CLI to debug Java programs interactively from Pi when 
 compatibility: Requires a JDK 8+ with jdb available through JAVA_HOME, PATH, or --jdb-path. Requires the jdbg CLI on PATH. Native on Windows, Linux, and macOS.
 allowed-tools: Bash(jdbg:*), Bash(javac:*), Bash(java:*), Read
 metadata:
-  version: "1.0"
+  version: "1.1"
 ---
 
 # jdbg CLI - interactive Java debugging for Pi
@@ -182,7 +182,8 @@ Field watchpoint:
 ```bash
 jdbg watch com.example.User.name --mode modification
 jdbg watch com.example.User.name --mode access
-jdbg unwatch com.example.User.name
+jdbg unwatch com.example.User.name --mode modification
+jdbg unwatch com.example.User.name --mode access
 ```
 
 Manage breakpoints:

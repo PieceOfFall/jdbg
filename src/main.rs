@@ -181,8 +181,9 @@ fn build_command(cli: &Cli) -> anyhow::Result<Command> {
             field: field.clone(),
             mode: mode.clone(),
         },
-        Commands::Unwatch { field } => Command::Unwatch {
+        Commands::Unwatch { field, mode } => Command::Unwatch {
             field: field.clone(),
+            mode: mode.clone(),
         },
         Commands::Breakpoints => Command::Breakpoints,
         Commands::Clear { spec } => Command::Clear { spec: spec.clone() },

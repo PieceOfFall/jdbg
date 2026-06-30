@@ -158,6 +158,9 @@ pub enum Commands {
     Unwatch {
         /// Field spec: Class.field.
         field: String,
+        /// Watch mode to remove: access, modification (default), or all. Must match the mode used when setting.
+        #[arg(long, default_value = "modification")]
+        mode: String,
     },
 
     /// Clear a breakpoint (Class:line or Class.method).

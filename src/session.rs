@@ -366,6 +366,16 @@ impl Session {
             .map(|(_, c)| c.clone())
     }
 
+    /// Find a condition whose spec starts with the given prefix (used for overloaded method breakpoints).
+    pub fn find_condition_by_prefix(&self, prefix: &str) -> Option<String> {
+        self.conditions
+            .lock()
+            .expect("conditions mutex poisoned")
+            .iter()
+            .find(|(s, _)| s.starts_with(prefix))
+            .map(|(_, c)| c.clone())
+    }
+
     // ── Semantic Convenience Methods (wrap jdb command strings, §7 CLI surface) ─
 
     /// `stop at Class:line`; when `suspend == Some("thread")`, use `stop thread at` instead.
