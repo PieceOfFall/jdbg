@@ -240,7 +240,7 @@ jdbg update
 
 ## MCP Server
 
-`jdbg __mcp` runs a stdio JSON-RPC 2.0 MCP server exposing the debugger as 36 native tools.
+`jdbg __mcp` runs a stdio MCP server exposing the debugger as 36 native tools.
 The MCP layer is a thin daemon client: it maps tool calls to the same command protocol used by the CLI, then renders the same results.
 
 <table>

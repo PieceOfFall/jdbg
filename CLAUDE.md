@@ -15,14 +15,16 @@ an **MCP server** (`jdbg __mcp`, native tool calls for Claude Code, Codex, and O
 
 These are settled decisions. Changing them needs explicit user sign-off.
 
-- **Threads, NOT tokio.** Concurrency is `std::thread` + channels + blocking IO. The concurrency is tiny and
-  bounded; an async runtime is unjustified. This applies to the MCP server too (hand-written stdio JSON-RPC).
+- **Keep blocking boundaries where they are settled.** The existing `jdb` engine, daemon registry, daemon IPC,
+  and per-session command locking remain `std::thread` + channels + blocking IO unless explicitly redesigned.
+  `tokio` is allowed for `rmcp` MCP serving and the JDI sidecar transport/lifecycle subsystem.
 - **No temp files, no shell, no sleeps.** Commands are written straight to `jdb`'s stdin. Readiness is detected
   by reading until the prompt, never by sleeping. There is no shell involved anywhere (no injection surface).
-- **Minimal dependencies.** Do not add a crate when `std` suffices. Deliberately excluded: `tokio`, `rmcp`
-  (pulls tokio), `once_cell`, `nix`, `daemonize`, `portable-pty`/`conpty`, any TCP/RPC framework, any
-  windows/winapi crate (use `std` raw FFI for the few Win32 calls). Use `std::sync::LazyLock` for one-time
-  regex compilation and `std::os::*` for platform bits.
+- **Minimal dependencies.** Do not add a crate when `std` suffices. `rmcp` is allowed only for MCP
+  protocol/tool serving, not daemon IPC or debugger backend RPC. Deliberately excluded: `once_cell`, `nix`,
+  `daemonize`, `portable-pty`/`conpty`, any broad TCP/RPC framework, any windows/winapi crate (use `std` raw
+  FFI for the few Win32 calls). Use `std::sync::LazyLock` for one-time regex compilation and `std::os::*`
+  for platform bits.
 - **One daemon per user; one in-flight command per session.** The per-session command `Mutex` is held across
   write+wait — `jdb` is line-oriented and cannot interleave commands. Different sessions run in parallel.
 - **The daemon is the single writer** of the on-disk registry (atomic temp-in-same-dir + rename). The CLI only
