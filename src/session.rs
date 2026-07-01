@@ -37,6 +37,7 @@ pub struct SessionMeta {
     pub id: String,
     pub name: Option<String>,
     pub mode: SessionMode,
+    pub backend: BackendKind,
     pub target: String,
     pub jdb_pid: u32,
     /// Creation timestamp. Later phases wire this to `jiff`; this phase leaves it as None.
@@ -136,6 +137,7 @@ impl Session {
             id,
             name,
             mode: SessionMode::Launch,
+            backend: BackendKind::Jdb,
             target: config.main_class.clone(),
             jdb_pid,
             created_at: Some(jiff::Zoned::now().to_string()),
@@ -221,6 +223,7 @@ impl Session {
             id,
             name,
             mode: SessionMode::Attach,
+            backend: BackendKind::Jdb,
             target: format!("{}:{}", config.host, config.port),
             jdb_pid,
             created_at: Some(jiff::Zoned::now().to_string()),
@@ -299,6 +302,7 @@ impl Session {
         let jdb_alive = inner.process.is_alive();
         CommandResult::Status {
             session: self.meta.id.clone(),
+            backend: self.meta.backend,
             state: inner.state,
             last_event: inner.last_event.clone(),
             jdb_alive,

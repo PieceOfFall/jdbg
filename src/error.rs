@@ -39,6 +39,10 @@ pub enum Error {
     )]
     DuplicateTarget { target: String, existing_id: String },
 
+    /// A backend was selected before its session creation path is available.
+    #[error("backend '{backend}' is not supported for {operation} yet")]
+    UnsupportedBackend { backend: String, operation: String },
+
     /// jdb reported a connection or launch error (§5: `Unable to attach`, `java.io.IOException`, `Input stream closed`).
     #[error("jdb connection/launch failed: {0}")]
     Connection(String),
@@ -61,6 +65,7 @@ impl Error {
             Error::SessionDead(_) => 5,
             Error::SessionNotFound(_) => 5,
             Error::DuplicateTarget { .. } => 5,
+            Error::UnsupportedBackend { .. } => 5,
             Error::Connection(_) => 6,
             Error::Timeout { .. } => 7,
             Error::Io(_) => 1,

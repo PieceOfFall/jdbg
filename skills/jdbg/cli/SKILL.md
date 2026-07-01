@@ -4,12 +4,12 @@ description: "Use the jdbg CLI to debug Java programs interactively from Pi when
 compatibility: "Requires a JDK 8+ with jdb available through JAVA_HOME, PATH, or --jdb-path. Requires the jdbg CLI on PATH. Native on Windows, Linux, and macOS."
 allowed-tools: "Bash(jdbg:*), Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "1.3"
+  version: "1.4"
 ---
 
 # jdbg CLI - interactive Java debugging for Pi
 
-`jdbg` is a cross-platform CLI wrapper around the JDK's `jdb`. It keeps a stateful background daemon alive, so a debug session survives across separate shell commands.
+`jdbg` is a cross-platform CLI wrapper around the JDK's `jdb`, with an optional attach-only JDI sidecar backend for structured runtime data. It keeps a stateful background daemon alive, so a debug session survives across separate shell commands.
 
 Pi has no official jdbg MCP setup. Use the `jdbg` CLI directly.
 
@@ -52,6 +52,16 @@ Attach to a running JVM with JDWP enabled:
 ```bash
 jdbg attach --host localhost --port 5005 --sourcepath src/main/java
 ```
+
+Use the JDI sidecar subset for structured attach debugging:
+
+```bash
+jdbg attach --backend jdi --host localhost --port 5005 --sourcepath src/main/java
+```
+
+The default backend is `jdb` and supports all commands. The current JDI backend supports attach, threads,
+line breakpoints, cont, next, where, locals, thread selection, and safe JSON inspect; unsupported commands
+fail explicitly instead of silently falling back.
 
 If the JDK is not the one you need, pass:
 
@@ -121,12 +131,17 @@ jdbg --session <id> locals
 jdbg --json status
 jdbg --timeout 60 cont
 jdbg --jdb-path C:\Users\you\.jdks\jdk8\bin\jdb.exe launch Main --classpath .
+jdbg attach --backend jdi --host localhost --port 5005
 ```
 
 - `--session <id>` selects a session when more than one is live. Omit it only when exactly one live session exists.
 - `--json` prints machine-readable results. Prefer it when parsing output programmatically.
 - `--timeout <secs>` overrides the per-command timeout, useful for long `run` or `cont`.
 - `--jdb-path <path>` forces a specific `jdb`.
+- `--backend jdb|jdi` is accepted only on `launch` and `attach`; omit it for the full `jdb` backend.
+
+Source builds create `jdbg-jdi-sidecar.jar` during `cargo build` when `javac` and `jar` are available.
+Override sidecar discovery with `JDBG_JDI_SIDECAR_JAR` or the Java runtime with `JDBG_JDI_JAVA` only when needed.
 
 List sessions and inspect state:
 

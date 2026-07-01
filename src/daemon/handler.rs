@@ -6,8 +6,10 @@ use std::sync::Arc;
 use interprocess::local_socket::Stream;
 
 use super::manager::SessionManager;
+use crate::backend::DebugSession;
 use crate::error::Result;
 use crate::jdb::parser::CommandHint;
+use crate::jdi::session::JdiSession;
 use crate::protocol::*;
 use crate::session::{CommandKind, Session};
 
@@ -42,6 +44,7 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
         // ── Session lifecycle ──
         Command::Launch {
             main_class,
+            backend,
             classpath,
             sourcepath,
             app_args,
@@ -51,6 +54,7 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
         } => {
             match mgr.create_launch(super::manager::LaunchParams {
                 main_class: main_class.clone(),
+                backend: *backend,
                 classpath: classpath.clone(),
                 sourcepath: sourcepath.clone(),
                 app_args: app_args.clone(),
@@ -60,9 +64,10 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
             }) {
                 Ok(session) => {
                     let result = CommandResult::SessionCreated {
-                        session: session.meta.id.clone(),
-                        mode: session.meta.mode,
-                        target: session.meta.target.clone(),
+                        session: session.id().to_string(),
+                        mode: session.mode(),
+                        backend: session.backend(),
+                        target: session.target().to_string(),
                         state: session.state(),
                     };
                     Response::ok(
@@ -78,6 +83,7 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
             }
         }
         Command::Attach {
+            backend,
             host,
             port,
             sourcepath,
@@ -85,6 +91,7 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
             jdb_path,
         } => {
             match mgr.create_attach(super::manager::AttachParams {
+                backend: *backend,
                 host: host.clone(),
                 port: *port,
                 sourcepath: sourcepath.clone(),
@@ -93,9 +100,10 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
             }) {
                 Ok(session) => {
                     let result = CommandResult::SessionCreated {
-                        session: session.meta.id.clone(),
-                        mode: session.meta.mode,
-                        target: session.meta.target.clone(),
+                        session: session.id().to_string(),
+                        mode: session.mode(),
+                        backend: session.backend(),
+                        target: session.target().to_string(),
                         state: session.state(),
                     };
                     // If the entry point normalized localhost to 127.0.0.1, say so explicitly.
@@ -134,7 +142,7 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
             // Resolve target session (None = unique live session), consistent with other commands' --session default.
             match mgr.get(req.session.as_deref()) {
                 Ok(session) => {
-                    let sid = session.meta.id.clone();
+                    let sid = session.id().to_string();
                     match mgr.kill(&sid) {
                         Ok(()) => Response::ok(
                             id,
@@ -214,7 +222,14 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
         Ok(s) => s,
         Err(e) => return Response::err(id, e.exit_code(), e.to_string()),
     };
+    match session {
+        DebugSession::Jdb(session) => dispatch_jdb_session_cmd(req, session),
+        DebugSession::Jdi(session) => dispatch_jdi_session_cmd(req, session),
+    }
+}
 
+fn dispatch_jdb_session_cmd(req: &Request, session: Arc<Session>) -> Response {
+    let id = &req.id;
     // Timeout override for this request (CLI `--timeout`); None means each command's default.
     let t = req.timeout;
     let precondition_note = match settle_async_condition_breakpoint(&session, &req.cmd, t) {
@@ -507,6 +522,60 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
 }
 
 // ─── Enrichment helpers ─────────────────────────────────────────────────────────
+
+fn dispatch_jdi_session_cmd(req: &Request, session: Arc<JdiSession>) -> Response {
+    let id = &req.id;
+    let result = match &req.cmd {
+        Command::BreakAt {
+            class,
+            line,
+            condition,
+            suspend,
+        } => {
+            if condition.is_some() {
+                Err(session.unsupported("conditional break_at"))
+            } else {
+                session.stop_at(class, *line, suspend.as_deref())
+            }
+        }
+        Command::Cont => session.cont(req.timeout),
+        Command::Next => session.next(req.timeout),
+        Command::Where { all } => session.stack(*all),
+        Command::Locals => session.locals(),
+        Command::Threads { filter } => session.threads(filter.as_deref()),
+        Command::Thread { id } => session.select_thread(id),
+        Command::Inspect { expr, max_elements } => session.inspect(expr, *max_elements),
+        Command::Print { expr } | Command::Eval { expr } | Command::Dump { expr } => {
+            session.inspect(expr, 10)
+        }
+        Command::Run => Err(session.unsupported("run")),
+        Command::Step => Err(session.unsupported("step")),
+        Command::StepOut => Err(session.unsupported("step_out")),
+        Command::BreakIn { .. } => Err(session.unsupported("break_in")),
+        Command::Catch { .. } => Err(session.unsupported("catch")),
+        Command::Watch { .. } => Err(session.unsupported("watch")),
+        Command::Unwatch { .. } => Err(session.unsupported("unwatch")),
+        Command::Breakpoints => Err(session.unsupported("breakpoints")),
+        Command::Clear { .. } => Err(session.unsupported("clear")),
+        Command::Classes { .. } => Err(session.unsupported("classes")),
+        Command::Methods { .. } => Err(session.unsupported("methods")),
+        Command::Frame { .. } => Err(session.unsupported("frame")),
+        Command::ListSource { .. } => Err(session.unsupported("list_source")),
+        Command::Raw { .. } => Err(session.unsupported("raw")),
+        Command::Suspend { .. } => Err(session.unsupported("suspend")),
+        Command::Resume { .. } => Err(session.unsupported("resume")),
+        Command::Set { .. } => Err(session.unsupported("set")),
+        Command::Ignore { .. } => Err(session.unsupported("ignore")),
+        Command::Lock { .. } => Err(session.unsupported("lock")),
+        Command::ThreadLocks { .. } => Err(session.unsupported("threadlocks")),
+        _ => return Response::err(id, 400, "unexpected command in JDI session dispatch"),
+    };
+
+    match result {
+        Ok(resp) => Response::ok(id, resp),
+        Err(e) => Response::err(id, e.exit_code(), e.to_string()),
+    }
+}
 
 /// Append one message to resp.note, separating multiple messages with newlines.
 fn append_note(resp: &mut CommandResponse, msg: &str) {

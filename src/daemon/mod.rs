@@ -128,9 +128,7 @@ pub fn stop_daemon() -> anyhow::Result<()> {
 /// Returns true if a connection succeeds (another daemon is alive), false otherwise (stale file).
 fn probe_socket_alive(sock_name: &str) -> bool {
     use interprocess::local_socket::{Stream as LocalStream, prelude::*};
-    let Ok(name) = sock_name
-        .to_ns_name::<interprocess::local_socket::GenericNamespaced>()
-    else {
+    let Ok(name) = sock_name.to_ns_name::<interprocess::local_socket::GenericNamespaced>() else {
         return false;
     };
     LocalStream::connect(name).is_ok()

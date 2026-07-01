@@ -33,6 +33,9 @@ pub enum Commands {
     Launch {
         /// Fully qualified main class name.
         main_class: String,
+        /// Debug backend to use: jdb (compatibility default) or jdi.
+        #[arg(long, value_parser = ["jdb", "jdi"], default_value = "jdb")]
+        backend: String,
         /// Classpath entries (semicolon-separated on Windows).
         #[arg(long)]
         classpath: Option<String>,
@@ -52,6 +55,9 @@ pub enum Commands {
 
     /// Attach to a running JVM via JDWP.
     Attach {
+        /// Debug backend to use: jdb (compatibility default) or jdi.
+        #[arg(long, value_parser = ["jdb", "jdi"], default_value = "jdb")]
+        backend: String,
         /// Target host.
         #[arg(long, default_value = "localhost")]
         host: String,
@@ -93,6 +99,9 @@ pub enum Commands {
         /// Agent targets: claude,codex,opencode,pi or auto/all/none.
         #[arg(long)]
         target: Option<String>,
+        /// Preferred backend guidance to install into agent skills.
+        #[arg(long, value_parser = ["jdb", "jdi"])]
+        backend: Option<String>,
         /// Use non-interactive defaults.
         #[arg(long)]
         yes: bool,

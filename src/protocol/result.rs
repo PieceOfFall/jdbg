@@ -113,6 +113,7 @@ pub enum CommandResult {
     SessionCreated {
         session: String,
         mode: SessionMode,
+        backend: BackendKind,
         target: String,
         state: RunState,
     },
@@ -121,6 +122,7 @@ pub enum CommandResult {
     },
     Status {
         session: String,
+        backend: BackendKind,
         state: RunState,
         last_event: Option<Event>,
         jdb_alive: bool,
@@ -242,6 +244,33 @@ pub enum SessionMode {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum BackendKind {
+    Jdb,
+    Jdi,
+}
+
+impl Default for BackendKind {
+    fn default() -> Self {
+        Self::Jdb
+    }
+}
+
+impl std::str::FromStr for BackendKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "jdb" => Ok(Self::Jdb),
+            "jdi" => Ok(Self::Jdi),
+            other => Err(format!(
+                "unsupported backend '{other}' (expected 'jdb' or 'jdi')"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum BreakpointKind {
     Line,
     Method,
@@ -255,6 +284,7 @@ pub struct SessionInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub mode: SessionMode,
+    pub backend: BackendKind,
     pub target: String,
     pub state: RunState,
     #[serde(skip_serializing_if = "Option::is_none")]

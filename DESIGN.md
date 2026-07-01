@@ -170,7 +170,7 @@ jdbg where [--all] | locals | print <expr> | dump <obj> | eval <expr>
 jdbg threads | thread <id> | frame <up|down> [n] | list-source [line]
 jdbg raw <jdb command...>
 
-jdbg setup [--remove] [--print] [--target claude,codex,opencode,pi|auto|all|none] [--yes]
+jdbg setup [--remove] [--print] [--target claude,codex,opencode,pi|auto|all|none] [--backend jdb|jdi] [--yes]
 jdbg update
 
 全局参数：--session <id> --json --timeout <secs> --jdb-path <path>
@@ -204,7 +204,7 @@ Loaded  ──run──►  Suspended  ──cont/step/next──►  Suspended
 | 5. cli.rs + output.rs | ✅ 完成 | clap 完整命令面 + 文本/JSON 渲染 |
 | 6. SKILL.md + plugin manifest | ✅ 完成 | native-first `skills/jdbg/mcp/SKILL.md` / `skills/jdbg/cli/SKILL.md` + `.claude-plugin/{plugin,marketplace}.json`，subagent 应用场景验证通过 |
 | 7. MCP server | ✅ 完成 | `src/mcp/{mod,jsonrpc,tools}.rs`：手写 stdio JSON-RPC、36 工具 1:1 映射、`.mcp.json` + plugin 内联 mcpServers、SKILL.md 改写为 MCP 工具面；真实 jdb e2e 验证（launch→break→run→locals→cont） |
-| 8. Multi-agent setup | ✅ 完成 | `jdbg setup --target claude,codex,opencode,pi|auto|all|none --yes`；Claude + Codex + OpenCode MCP/skill 安装删除；Pi CLI skill 安装删除；`jdbg update` 保留并重注册已配置 targets；零新增依赖 |
+| 8. Multi-agent setup | ✅ 完成 | `jdbg setup --target claude,codex,opencode,pi|auto|all|none --backend jdb|jdi --yes`；Claude + Codex + OpenCode MCP/skill 安装删除；Pi CLI skill 安装删除；交互 setup 可选择安装 skill 的 backend 偏好；`jdbg update` 保留并重注册已配置 targets 与 backend 偏好；零新增依赖 |
 
 ## 7. 未实现 / TODO 项
 
@@ -276,7 +276,7 @@ cargo test
 以下流程在 Windows 11 + Zulu JDK 1.8.0_492 上验证通过：
 
 ```
-jdbg launch Main --classpath fixtures     → SessionCreated (loaded)
+jdbg launch Main --classpath tests/fixtures/java  → SessionCreated (loaded)
 jdbg break-at Main 9                      → BreakpointSet (deferred)
 jdbg run                                  → Stopped (breakpoint @ Main:9)
 jdbg locals                               → 4 vars (args, count, label, sum)
@@ -319,6 +319,7 @@ tools/call cont                           → The application exited
 jdbg setup --target codex --print               # prints [mcp_servers.jdbg] + Codex skill path, no writes
 jdbg setup --target opencode --print            # prints OpenCode mcp.jdbg JSON + skill path, no writes
 jdbg setup --target claude,codex,opencode,pi --yes  # installs all targets
+jdbg setup --target codex --backend jdi --yes   # installs Codex skill with JDI attach preference
 jdbg setup --remove --target codex --yes   # removes only Codex jdbg config + skill
 jdbg setup --remove --target pi --yes      # removes only Pi CLI skill
 ```
@@ -330,3 +331,14 @@ jdbg setup --remove --target pi --yes      # removes only Pi CLI skill
 | `README.md` | 英文门面：项目简介、安装、快速上手、CLI 命令面、MCP 工具面、架构概览、构建测试 |
 | `LICENSE` | Apache License 2.0 全文（`Cargo.toml` 的 `license` 字段已同步为 `"Apache-2.0"`） |
 | `.gitignore` | 排除 `/target`、`/out`、`*.class`、`.idea/`、`.codegraph/`、`.cursor/` |
+
+## Current Addendum: rmcp + JDI Sidecar Backend
+
+This branch now keeps the existing prompt-aware `jdb` backend as the compatibility default and adds a backend boundary for an attach-only JDI sidecar path.
+
+- `jdbg __mcp` is served through `rmcp` over stdio while preserving the same 36 tool names and routing every tool call through `client::send_request` plus `output::render`.
+- Session creation accepts `backend: jdb|jdi` on both CLI and MCP. `jdb` remains the default and supports the full command surface. `jdi` currently supports attach, threads, line breakpoints, cont, next, where, locals, thread selection, and safe JSON inspect. Unsupported JDI commands return explicit backend errors.
+- `SessionManager` stores backend-neutral `DebugSession` handles. The existing `Session` type still owns only the `jdb` process/reader state; JDI state lives under `src/jdi/`.
+- The JDI sidecar protocol is length-prefixed JSON over localhost TCP. Rust owns sidecar lifecycle, auth token, handshake, request/response correlation, event queueing, and no-window process launch on Windows.
+- The Java sidecar source lives under `sidecar/jdi/src/main/java/dev/jdbg/sidecar/` and uses only JDK/JDI APIs. `build.rs` compiles `jdbg-jdi-sidecar.jar` next to the `jdbg` binary when `javac` and `jar` are available.
+- Manual smoke verification on Windows + Zulu JDK 8 covered `attach --backend jdi`, `list`, `threads`, `break-at Loop 5`, `cont`, and `locals`.

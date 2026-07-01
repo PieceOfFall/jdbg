@@ -304,6 +304,75 @@ Acceptance:
 - skills teach agents when to choose JDI vs jdb;
 - release checklist remains accurate for cargo-dist.
 
+## Current Implementation Status
+
+This section tracks the current branch state against the roadmap above.
+
+### Implemented
+
+- Milestone 1, MCP rmcp migration: `jdbg __mcp` now uses `rmcp` over stdio,
+  preserves the 36-tool catalog, routes tool calls through `client::send_request`
+  and `output::render`, and keeps tool-level errors agent-visible.
+- Milestone 2, backend boundary: CLI and MCP session creation accept
+  `backend: jdb|jdi`; session creation, list, status, registry records, and output
+  include backend metadata; unsupported JDI commands fail explicitly.
+- Milestone 3, protocol foundation: Rust has length-prefixed JSON framing,
+  request/response/event/heartbeat protocol types, handshake validation, auth token
+  checks, request timeouts, response id matching, and interleaved event queuing.
+- Milestone 4, sidecar lifecycle: `build.rs` packages `jdbg-jdi-sidecar.jar`;
+  Rust launches the Java sidecar over localhost TCP with a per-process token,
+  keeps stdout out of protocol traffic, captures stderr separately, uses no-window
+  process launch on Windows, and shuts the sidecar down with the session.
+- Milestone 5, JDI attach MVP: `jdbg attach --backend jdi` can attach to a JDWP
+  target, detach, list threads, read stacks, and surface VM-disconnect events into
+  session state.
+- Milestone 6, breakpoint loop: JDI supports line breakpoints, deferred
+  class-prepare resolution, continue-with-timeout, step over, breakpoint/step
+  events, stack, locals, and startup-suspended targets without racing past deferred
+  breakpoints.
+- Milestone 7, structured inspect: JDI inspect renders primitives, strings,
+  objects, arrays, collections, maps, enums, null, unavailable values, cycle
+  references, and truncation metadata without invoking getters.
+- Milestone 8, CLI and MCP integration: default session creation remains `jdb`;
+  `attach --backend jdi` creates JDI sessions; follow-up commands route by session
+  backend; JDI supports `break-at`, `cont`, `next`, `where`, `locals`, `threads`,
+  `thread`, `inspect`, and print/eval/dump through safe inspect.
+- Milestone 9, release readiness: `README.md`, `DESIGN.md`, both installed skills,
+  and `Cargo.toml` metadata have been updated for the public JDI/rmcp behavior.
+- Setup integration beyond the original roadmap: `jdbg setup` can record an
+  installed-skill backend preference through interactive TUI selection or
+  `--backend jdb|jdi`; `jdbg update` preserves that preference when re-registering
+  agents.
+- JDK 8 sidecar compatibility: the sidecar source/build path is JDK 8 compatible
+  when `tools.jar` is available, while still working on newer JDKs.
+
+### Implemented With Remaining Hardening
+
+- `vmDisconnected` is handled by the sidecar and Rust session state, but still
+  needs dedicated fixture-based public CLI/MCP coverage for target VM exit.
+- JDI step-over is implemented, but should get a dedicated fixture-based
+  integration test alongside the existing breakpoint/inspect coverage.
+- MCP schemas and tool routing cover JDI backend selection, but a full JDI
+  MCP end-to-end attach -> break_at -> cont -> locals/inspect smoke should be
+  added before release.
+- Java sidecar behavior is covered through Rust-driven integration tests; small
+  Java-side unit tests for JSON parsing, RPC error mapping, and value-rendering
+  limits are still useful hardening.
+- Structured inspect covers common `ArrayList`, `HashMap`, and `LinkedHashMap`
+  layouts without getter invocation; specialized presentation for more collection
+  families can be added incrementally.
+
+### Pending MVP Follow-Ups
+
+- Add fixture coverage for target VM disconnect and detach through the public
+  command surface.
+- Add fixture coverage for JDI step-over and stack/locals at the step stop site.
+- Add MCP end-to-end JDI smoke coverage.
+- Add focused Java sidecar tests for protocol parsing, token validation, stable
+  RPC error codes, and value serialization limits.
+- Audit and document exact behavior when a sidecar process exits unexpectedly
+  while the Rust daemon still has a session handle.
+
 ## Test Strategy
 
 Keep `cargo test` green throughout and preserve all existing parser, reader, MCP,
@@ -371,7 +440,6 @@ The following are intentionally out of MVP scope:
 - protobuf;
 - gRPC;
 - direct Rust JDWP;
-- JDK 8 sidecar runtime support.
 
 ## Guiding Principle
 

@@ -20,24 +20,26 @@ fn render_result(result: &CommandResult) -> String {
         CommandResult::SessionCreated {
             session,
             mode,
+            backend,
             target,
             state,
         } => {
-            format!("Session {session} created ({mode:?} {target}), state: {state:?}")
+            format!("Session {session} created ({backend:?} {mode:?} {target}), state: {state:?}")
         }
         CommandResult::SessionList { sessions } => {
             if sessions.is_empty() {
                 return "No active sessions.".into();
             }
             let mut lines = vec![format!(
-                "{:<10} {:<8} {:<20} {:<10} {}",
-                "ID", "MODE", "TARGET", "STATE", "PID"
+                "{:<10} {:<8} {:<8} {:<20} {:<10} {}",
+                "ID", "MODE", "BACKEND", "TARGET", "STATE", "PID"
             )];
             for s in sessions {
                 lines.push(format!(
-                    "{:<10} {:<8} {:<20} {:<10} {}",
+                    "{:<10} {:<8} {:<8} {:<20} {:<10} {}",
                     s.id,
                     format!("{:?}", s.mode).to_lowercase(),
+                    format!("{:?}", s.backend).to_lowercase(),
                     s.target,
                     format!("{:?}", s.state).to_lowercase(),
                     s.jdb_pid.map(|p| p.to_string()).unwrap_or_default(),
@@ -47,6 +49,7 @@ fn render_result(result: &CommandResult) -> String {
         }
         CommandResult::Status {
             session,
+            backend,
             state,
             last_event,
             jdb_alive,
@@ -55,7 +58,9 @@ fn render_result(result: &CommandResult) -> String {
                 .as_ref()
                 .map(|e| format!("{e:?}"))
                 .unwrap_or_else(|| "none".into());
-            format!("Session {session}: state={state:?} jdb_alive={jdb_alive} last_event={evt}")
+            format!(
+                "Session {session}: backend={backend:?} state={state:?} jdb_alive={jdb_alive} last_event={evt}"
+            )
         }
         CommandResult::BreakpointSet {
             spec,
@@ -439,5 +444,30 @@ mod tests {
         };
         let out = render(&resp, false);
         assert!(out.contains("emptyList (size=0): (empty or inaccessible)"));
+    }
+
+    #[test]
+    fn session_list_renders_backend_column() {
+        let resp = CommandResponse {
+            result: CommandResult::SessionList {
+                sessions: vec![SessionInfo {
+                    id: "abc123".into(),
+                    name: None,
+                    mode: SessionMode::Attach,
+                    backend: BackendKind::Jdb,
+                    target: "127.0.0.1:5005".into(),
+                    state: RunState::Suspended,
+                    jdb_pid: Some(42),
+                    created_at: None,
+                }],
+            },
+            stderr: None,
+            note: None,
+        };
+
+        let out = render(&resp, false);
+
+        assert!(out.contains("BACKEND"));
+        assert!(out.contains("jdb"));
     }
 }

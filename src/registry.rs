@@ -30,12 +30,18 @@ pub struct SessionRecord {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     pub mode: String,
+    #[serde(default = "default_backend")]
+    pub backend: String,
     pub target: String,
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jdb_pid: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub created_at: Option<String>,
+}
+
+fn default_backend() -> String {
+    "jdb".into()
 }
 
 /// Registry path bundle.

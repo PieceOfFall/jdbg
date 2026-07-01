@@ -8,7 +8,8 @@
 
 <p>
   Wraps the JDK <code>jdb</code> with prompt-aware control, persistent sessions,
-  structured output, and native MCP tools for Claude Code, Codex, OpenCode, Pi, and humans.
+  an optional JDI sidecar backend, structured output, and native MCP tools for Claude Code,
+  Codex, OpenCode, Pi, and humans.
 </p>
 
 <p>
@@ -129,6 +130,7 @@ Use non-interactive setup when provisioning machines:
 
 ```bash
 jdbg setup --target claude,codex,opencode,pi --yes
+jdbg setup --backend jdi --target codex --yes
 jdbg setup --target codex --print
 jdbg setup --target opencode --print
 jdbg setup --target pi --print
@@ -201,6 +203,9 @@ It drives the same flow through `mcp__jdbg__*` tools. In Pi, the installed skill
 
 `jdbg setup` installs only the target-specific configuration that belongs to `jdbg`.
 Removal is surgical and preserves sibling servers, user settings, and unrelated skill directories.
+Interactive setup also asks which backend the installed skills should prefer. Use `--backend jdb|jdi`
+for non-interactive provisioning; the preference is written into the skill guidance, while `jdb`
+remains the CLI/MCP runtime default when no backend is passed on session creation.
 
 <table>
   <tr>
@@ -240,7 +245,7 @@ jdbg update
 
 ## MCP Server
 
-`jdbg __mcp` runs a stdio MCP server exposing the debugger as 36 native tools.
+`jdbg __mcp` runs an rmcp-based stdio MCP server exposing the debugger as 36 native tools.
 The MCP layer is a thin daemon client: it maps tool calls to the same command protocol used by the CLI, then renders the same results.
 
 <table>
@@ -317,8 +322,8 @@ OpenCode config:
 
 ```text
 # Session lifecycle
-jdbg launch <MainClass> [--classpath CP] [--sourcepath SP] [--name N] [-- app-args...]
-jdbg attach [--host H] [--port P] [--sourcepath SP] [--name N]
+jdbg launch <MainClass> [--backend jdb|jdi] [--classpath CP] [--sourcepath SP] [--name N] [-- app-args...]
+jdbg attach [--backend jdb|jdi] [--host H] [--port P] [--sourcepath SP] [--name N]
 jdbg status | list | kill [--session ID]
 jdbg daemon start | stop | status
 
@@ -348,7 +353,7 @@ jdbg lock <expr> | thread-locks [thread-id]
 jdbg raw <jdb command...>
 
 # Setup and maintenance
-jdbg setup [--remove] [--print] [--target claude,codex,opencode,pi|auto|all|none] [--yes]
+jdbg setup [--remove] [--print] [--target claude,codex,opencode,pi|auto|all|none] [--backend jdb|jdi] [--yes]
 jdbg update
 ```
 
@@ -363,9 +368,14 @@ Global flags:
 | `--timeout <secs>` | Override per-command timeout. |
 | `--jdb-path <path>` | Use an explicit `jdb` executable. |
 
+Backend selection is made only when creating a session. The default `jdb` backend is the compatibility path
+and supports the full command surface. The `jdi` backend is currently attach-only and uses a local Java sidecar
+for structured runtime data; it supports `attach`, `threads`, line `break-at`, `cont`, `next`, `where`, `locals`,
+`thread`, and safe JSON `inspect`. Unsupported JDI commands fail explicitly instead of falling back to `jdb`.
+
 ## Architecture
 
-Two clients feed one daemon. The daemon owns all live `jdb` children and the in-memory session map.
+Two clients feed one daemon. The daemon owns live backend sessions and the in-memory session map.
 
 ```mermaid
 flowchart LR
@@ -373,20 +383,20 @@ flowchart LR
     MCP["MCP: jdbg __mcp"]
     Daemon["Daemon: session manager"]
     JdbA["jdb child A"]
-    JdbB["jdb child B"]
+    Jdi["JDI sidecar"]
     JvmA["JVM A"]
     JvmB["JVM B"]
 
     CLI --> Daemon
     MCP --> Daemon
     Daemon --> JdbA --> JvmA
-    Daemon --> JdbB --> JvmB
+    Daemon --> Jdi --> JvmB
 ```
 
 The internal dependency direction stays simple:
 
 ```text
-bin -> cli / output -> client / daemon -> session -> jdb / jdkpath -> error / protocol / registry
+bin -> cli / output -> client / daemon -> backend -> session / jdi -> jdb / jdkpath -> error / protocol / registry
 ```
 
 See [`DESIGN.md`](DESIGN.md) for the full design reference.
@@ -401,6 +411,10 @@ See [`DESIGN.md`](DESIGN.md) for the full design reference.
 
 For JDWP attach on JDK 8, start the target with `address=5005` or `address=localhost:5005`.
 `address=*:5005` is JDK 9+ syntax.
+
+When building from source, `cargo build` also builds `jdbg-jdi-sidecar.jar` next to the `jdbg` binary when
+`javac` and `jar` are available. Override sidecar discovery with `JDBG_JDI_SIDECAR_JAR` or the Java runtime
+with `JDBG_JDI_JAVA`.
 
 `classes` works without a pattern, but that lists every loaded class; pass a pattern in real application
 servers. `watch --mode all` creates separate access and modification watchpoints, so `unwatch --mode

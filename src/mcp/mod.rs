@@ -14,6 +14,7 @@
 //! (`eprintln!`), otherwise they corrupt the protocol stream.
 
 pub mod jsonrpc;
+pub mod rmcp_server;
 pub mod tools;
 
 use std::io::{BufRead, BufReader, Write};
@@ -26,6 +27,9 @@ use crate::protocol::Response;
 use jsonrpc::{
     INVALID_PARAMS, JsonRpcError, JsonRpcRequest, JsonRpcResponse, METHOD_NOT_FOUND, PARSE_ERROR,
 };
+use rmcp::ServiceExt;
+use rmcp::transport::stdio;
+use rmcp_server::JdbgRmcpServer;
 
 /// Default MCP protocol version we announce. If the client supplies a version during initialize, echo it.
 const PROTOCOL_VERSION: &str = "2025-06-18";
@@ -38,6 +42,19 @@ pub fn run_mcp() -> anyhow::Result<()> {
     #[cfg(windows)]
     detach_std_handles_from_children();
 
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    runtime.block_on(async {
+        let service = JdbgRmcpServer::new().serve(stdio()).await?;
+        service.waiting().await?;
+        anyhow::Ok(())
+    })
+}
+
+/// Legacy handwritten JSON-RPC loop retained for unit-test coverage and as a reference for protocol mapping.
+#[allow(dead_code)]
+fn run_legacy_mcp_loop() -> anyhow::Result<()> {
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let stdout = std::io::stdout();

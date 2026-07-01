@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::jsonrpc::{INVALID_PARAMS, JsonRpcError, METHOD_NOT_FOUND};
-use crate::protocol::{Command, Request};
+use crate::protocol::{BackendKind, Command, Request};
 
 /// Public description of a tool, serialized into `tools/list`.
 #[derive(Debug, Clone, Serialize)]
@@ -30,6 +30,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
              (JVM not started yet) — set breakpoints, then call `run`.",
             json!({
                 "main_class": {"type": "string", "description": "Fully-qualified main class, e.g. com.example.Main."},
+                "backend": {"type": "string", "enum": ["jdb", "jdi"], "description": "Debug backend (default jdb). JDI support is selected only at session creation."},
                 "classpath": {"type": "string", "description": "Classpath (OS-separated entries)."},
                 "sourcepath": {"type": "string", "description": "Source path; enables `list_source`/`locals` line info."},
                 "app_args": {"type": "array", "items": {"type": "string"}, "description": "Arguments passed to the program's main()."},
@@ -48,6 +49,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             json!({
                 "host": {"type": "string", "description": "Target host (default localhost). 'localhost' is auto-normalized to 127.0.0.1 (IPv4 loopback) because on dual-stack hosts it may resolve to IPv6 [::1] while JDWP listens only on IPv4; pass '::1' to force IPv6."},
                 "port": {"type": "integer", "description": "Target JDWP port (default 5005)."},
+                "backend": {"type": "string", "enum": ["jdb", "jdi"], "description": "Debug backend (default jdb). JDI support is selected only at session creation."},
                 "sourcepath": {"type": "string", "description": "Source path for line info."},
                 "name": {"type": "string", "description": "Optional session display name."},
                 "jdb_path": {"type": "string", "description": "Override path to the jdb executable."}
@@ -407,6 +409,7 @@ pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> 
     let cmd = match name {
         "launch" => Command::Launch {
             main_class: require_str(args, "main_class")?,
+            backend: optional_backend(args)?,
             classpath: str_to_vec(optional_str(args, "classpath")),
             sourcepath: str_to_vec(optional_str(args, "sourcepath")),
             app_args: optional_str_array(args, "app_args"),
@@ -415,6 +418,7 @@ pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> 
             jdb_path: optional_str(args, "jdb_path"),
         },
         "attach" => Command::Attach {
+            backend: optional_backend(args)?,
             host: optional_str(args, "host").unwrap_or_else(|| "localhost".to_string()),
             port: optional_u16(args, "port").unwrap_or(5005),
             sourcepath: str_to_vec(optional_str(args, "sourcepath")),
@@ -616,6 +620,15 @@ fn optional_bool(args: &Value, key: &str) -> bool {
     args.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
+fn optional_backend(args: &Value) -> Result<BackendKind, JsonRpcError> {
+    match optional_str(args, "backend") {
+        Some(raw) => raw.parse().map_err(|e: String| {
+            JsonRpcError::new(INVALID_PARAMS, format!("invalid backend: {e}"))
+        }),
+        None => Ok(BackendKind::Jdb),
+    }
+}
+
 fn optional_str_array(args: &Value, key: &str) -> Vec<String> {
     args.get(key)
         .and_then(Value::as_array)
@@ -636,7 +649,7 @@ fn str_to_vec(opt: Option<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::Command;
+    use crate::protocol::{BackendKind, Command};
     use serde_json::json;
 
     #[test]
@@ -688,6 +701,25 @@ mod tests {
                 assert_eq!(app_args, vec!["a".to_string(), "b".to_string()])
             }
             other => panic!("expected Launch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn launch_backend_maps_to_command() {
+        let req =
+            dispatch_tool("launch", &json!({"main_class": "Main", "backend": "jdi"})).unwrap();
+        match req.cmd {
+            Command::Launch { backend, .. } => assert_eq!(backend, BackendKind::Jdi),
+            other => panic!("expected Launch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_backend_defaults_to_jdb() {
+        let req = dispatch_tool("attach", &json!({})).unwrap();
+        match req.cmd {
+            Command::Attach { backend, .. } => assert_eq!(backend, BackendKind::Jdb),
+            other => panic!("expected Attach, got {other:?}"),
         }
     }
 
@@ -1031,7 +1063,10 @@ mod tests {
             Command::Thread { id } => assert_eq!(id, "582"),
             other => panic!("expected Thread, got {other:?}"),
         }
-        match dispatch_tool("thread", &json!({"id": "0x37f2"})).unwrap().cmd {
+        match dispatch_tool("thread", &json!({"id": "0x37f2"}))
+            .unwrap()
+            .cmd
+        {
             Command::Thread { id } => assert_eq!(id, "0x37f2"),
             other => panic!("expected Thread, got {other:?}"),
         }

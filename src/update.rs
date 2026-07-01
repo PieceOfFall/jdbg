@@ -78,12 +78,14 @@ fn cleanup_old(old_path: Option<std::path::PathBuf>) {
 
 pub fn run_update() -> Result<()> {
     let targets = setup::configured_targets_or_default()?;
+    let backend = setup::configured_backend_or_default()?;
     let target_arg = setup::targets_to_arg(&targets);
+    let backend_arg = backend.id();
 
     stop_daemon_if_running();
 
     println!("[1/3] Removing old jdbg registration for configured agents ({target_arg})...");
-    setup::run_setup(true, false, Some(&target_arg), true)?;
+    setup::run_setup(true, false, Some(&target_arg), true, None)?;
 
     println!("[2/3] Installing latest jdbg from GitHub releases...");
     let old_path = move_self_aside()?;
@@ -106,13 +108,15 @@ pub fn run_update() -> Result<()> {
         .arg("setup")
         .arg("--target")
         .arg(&target_arg)
+        .arg("--backend")
+        .arg(backend_arg)
         .arg("--yes")
         .status();
 
     match setup_status {
         Ok(s) if s.success() => {}
         _ => {
-            setup::run_setup(false, false, Some(&target_arg), true)?;
+            setup::run_setup(false, false, Some(&target_arg), true, Some(backend_arg))?;
         }
     }
 

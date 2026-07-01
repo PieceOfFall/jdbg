@@ -3,8 +3,11 @@
 //! These tests require a JDK (jdb available through JAVA_HOME or PATH) and compiled Java fixtures.
 //! Before running, ensure: javac -g tests/fixtures/java/CollectionTest.java
 
+use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, mpsc};
+use std::time::{Duration, Instant};
 
 use java_agent_debugger::protocol::*;
 use java_agent_debugger::session::Session;
@@ -20,6 +23,147 @@ fn fixture_dir() -> PathBuf {
         .join("tests")
         .join("fixtures")
         .join("java")
+}
+
+fn javac_path() -> PathBuf {
+    let exe = if cfg!(windows) { "javac.exe" } else { "javac" };
+    jdb_path()
+        .parent()
+        .map(|bin| bin.join(exe))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from(exe))
+}
+
+fn java_path(prefer_windowless: bool) -> PathBuf {
+    let exe = if cfg!(windows) && prefer_windowless {
+        "javaw.exe"
+    } else if cfg!(windows) {
+        "java.exe"
+    } else {
+        "java"
+    };
+    jdb_path()
+        .parent()
+        .map(|bin| bin.join(exe))
+        .filter(|path| path.is_file())
+        .unwrap_or_else(|| PathBuf::from(exe))
+}
+
+fn hide_console(command: &mut Command) {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command.creation_flags(CREATE_NO_WINDOW);
+    }
+}
+
+fn compile_java_fixture(source_name: &str) {
+    let dir = fixture_dir();
+    let mut command = Command::new(javac_path());
+    command
+        .arg("-g")
+        .arg("-d")
+        .arg(&dir)
+        .arg(dir.join(source_name));
+    hide_console(&mut command);
+    let status = command.status().expect("failed to spawn javac");
+    assert!(status.success(), "javac failed with status {status}");
+}
+
+fn free_loopback_port() -> u16 {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind free port");
+    listener.local_addr().unwrap().port()
+}
+
+struct TargetJvm {
+    child: Child,
+    port: u16,
+    _output: mpsc::Receiver<String>,
+}
+
+impl Drop for TargetJvm {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+fn start_jdwp_fixture(main_class: &str) -> TargetJvm {
+    let port = free_loopback_port();
+    let mut command = Command::new(java_path(false));
+    command
+        .arg(format!(
+            "-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address={port}"
+        ))
+        .arg("-cp")
+        .arg(fixture_dir())
+        .arg(main_class)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    hide_console(&mut command);
+    let mut child = command.spawn().expect("failed to spawn JDWP fixture JVM");
+    let (tx, rx) = mpsc::channel();
+    if let Some(stdout) = child.stdout.take() {
+        spawn_output_reader(stdout, tx.clone());
+    }
+    if let Some(stderr) = child.stderr.take() {
+        spawn_output_reader(stderr, tx);
+    }
+    wait_for_jdwp_banner(&mut child, &rx, port);
+    TargetJvm {
+        child,
+        port,
+        _output: rx,
+    }
+}
+
+fn spawn_output_reader<R>(reader: R, tx: mpsc::Sender<String>)
+where
+    R: Read + Send + 'static,
+{
+    std::thread::spawn(move || {
+        let mut reader = BufReader::new(reader);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            match reader.read_line(&mut line) {
+                Ok(0) => return,
+                Ok(_) => {
+                    let _ = tx.send(line.trim_end().to_string());
+                }
+                Err(_) => return,
+            }
+        }
+    });
+}
+
+fn wait_for_jdwp_banner(child: &mut Child, rx: &mpsc::Receiver<String>, port: u16) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let expected = format!("address: {port}");
+    let mut output = Vec::new();
+    loop {
+        match rx.recv_timeout(Duration::from_millis(25)) {
+            Ok(line) => {
+                if line.contains("Listening for transport") && line.contains(&expected) {
+                    return;
+                }
+                output.push(line);
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                panic!("target JVM output closed before JDWP banner; output={output:?}");
+            }
+        }
+        if let Some(status) = child.try_wait().expect("check target JVM") {
+            panic!("target JVM exited before JDWP banner: {status}; output={output:?}");
+        }
+        assert!(
+            Instant::now() < deadline,
+            "timed out waiting for JDWP fixture banner containing {expected}; output={output:?}"
+        );
+    }
 }
 
 /// Helper: launch one fixture session.
@@ -272,6 +416,57 @@ fn inspect_empty_returns_size_zero() {
 }
 
 // ─── Phase: conditional breakpoint ───
+
+#[test]
+fn jdi_inspect_renders_structured_value_kinds() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    compile_java_fixture("StructuredInspectTest.java");
+    let target = start_jdwp_fixture("StructuredInspectTest");
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::attach(
+        "127.0.0.1",
+        target.port,
+        &sourcepath,
+        "jdi-structured-inspect".into(),
+        None,
+    )
+    .expect("JDI attach failed");
+
+    let breakpoint = session
+        .stop_at("StructuredInspectTest", 35, None)
+        .expect("JDI breakpoint failed");
+    assert!(
+        matches!(
+            breakpoint.result,
+            CommandResult::BreakpointSet { deferred: true, .. }
+        ),
+        "expected deferred JDI breakpoint, got {:?}",
+        breakpoint.result
+    );
+    let stop = session.cont(Some(10)).expect("JDI cont failed");
+    assert!(
+        matches!(stop.result, CommandResult::Stopped { .. }),
+        "expected JDI breakpoint stop, got {:?}",
+        stop.result
+    );
+
+    let inspect = session.inspect("root", 2).expect("JDI inspect failed");
+    let text = match inspect.result {
+        CommandResult::Raw { text } => text,
+        other => panic!("expected raw JSON inspect result, got {other:?}"),
+    };
+
+    assert!(text.contains(r#""kind": "object""#), "{text}");
+    assert!(text.contains(r#""kind": "collection""#), "{text}");
+    assert!(text.contains(r#""kind": "map""#), "{text}");
+    assert!(text.contains(r#""kind": "enum""#), "{text}");
+    assert!(text.contains(r#""kind": "cycle""#), "{text}");
+    assert!(text.contains(r#""truncated": true"#), "{text}");
+    assert!(text.contains(r#""name": "ACTIVE""#), "{text}");
+
+    let _ = session.kill();
+}
 
 #[test]
 fn conditional_breakpoint_set_accepted() {

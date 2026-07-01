@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::result::CommandResponse;
+use super::result::{BackendKind, CommandResponse};
 
 // ─── Request ────────────────────────────────────────────────────────────────────
 
@@ -56,6 +56,8 @@ pub enum Command {
     Launch {
         main_class: String,
         #[serde(default)]
+        backend: BackendKind,
+        #[serde(default)]
         classpath: Vec<String>,
         #[serde(default)]
         sourcepath: Vec<String>,
@@ -69,6 +71,8 @@ pub enum Command {
         jdb_path: Option<String>,
     },
     Attach {
+        #[serde(default)]
+        backend: BackendKind,
         #[serde(default = "default_host")]
         host: String,
         #[serde(default = "default_port")]

@@ -22,6 +22,69 @@ const MCP_SKILL_MD: &str = include_str!("../skills/jdbg/mcp/SKILL.md");
 const CLI_SKILL_MD: &str = include_str!("../skills/jdbg/cli/SKILL.md");
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SetupBackend {
+    Jdb,
+    Jdi,
+}
+
+impl SetupBackend {
+    pub fn id(self) -> &'static str {
+        match self {
+            SetupBackend::Jdb => "jdb",
+            SetupBackend::Jdi => "jdi",
+        }
+    }
+
+    fn display_name(self) -> &'static str {
+        match self {
+            SetupBackend::Jdb => "JDB",
+            SetupBackend::Jdi => "JDI",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            SetupBackend::Jdb => "JDB - full command surface, compatibility default",
+            SetupBackend::Jdi => "JDI - attach-only structured inspect/events subset",
+        }
+    }
+
+    fn setup_block(self, mcp_skill: bool) -> String {
+        match (self, mcp_skill) {
+            (SetupBackend::Jdb, true) => concat!(
+                "> Setup preference: Preferred backend: JDB. Omit `backend` or pass ",
+                r#""backend": "jdb""#,
+                " on `launch`/`attach` for the full command surface. Use ",
+                r#""backend": "jdi""#,
+                " only for attach workflows that need structured JDI inspect."
+            )
+            .into(),
+            (SetupBackend::Jdb, false) => concat!(
+                "> Setup preference: Preferred backend: JDB. Omit `--backend` or pass ",
+                "`--backend jdb` on `launch`/`attach` for the full command surface. Use ",
+                "`--backend jdi` only for attach workflows that need structured JDI inspect."
+            )
+            .into(),
+            (SetupBackend::Jdi, true) => concat!(
+                "> Setup preference: Preferred backend: JDI. For JDWP attach workflows, pass ",
+                r#""backend": "jdi""#,
+                " to `attach` unless you need an unsupported JDI command. ",
+                "JDI launch is not supported; use `launch` with the default JDB backend."
+            )
+            .into(),
+            (SetupBackend::Jdi, false) => concat!(
+                "> Setup preference: Preferred backend: JDI. For JDWP attach workflows, run ",
+                "`jdbg attach --backend jdi ...` unless you need an unsupported JDI command. ",
+                "JDI launch is not supported; use `jdbg launch` with the default JDB backend."
+            )
+            .into(),
+        }
+    }
+}
+
+const SETUP_BACKENDS: [SetupBackend; 2] = [SetupBackend::Jdb, SetupBackend::Jdi];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TargetId {
     Claude,
     Codex,
@@ -204,6 +267,25 @@ fn install_skill(dir: &Path, content: &str) -> Result<PathBuf> {
     let path = dir.join("SKILL.md");
     fs::write(&path, content)?;
     Ok(path)
+}
+
+fn render_skill(template: &str, backend: SetupBackend) -> String {
+    let mcp_skill = template.contains("MCP server") || template.contains("mcp__jdbg__");
+    let block = backend.setup_block(mcp_skill);
+    let Some(heading_start) = template.find("\n# ") else {
+        return format!("{}\n\n{}\n", template.trim_end(), block);
+    };
+    let heading_start = heading_start + 1;
+    let insert_at = template[heading_start..]
+        .find('\n')
+        .map(|offset| heading_start + offset + 1)
+        .unwrap_or(template.len());
+    format!(
+        "{}\n{}\n{}",
+        &template[..insert_at],
+        block,
+        &template[insert_at..]
+    )
 }
 
 fn remove_skill(dir: &Path) -> Result<bool> {
@@ -471,6 +553,26 @@ fn detect_configured_targets(paths: &Paths) -> Vec<TargetId> {
         .collect()
 }
 
+fn detect_backend_preference(paths: &Paths) -> Option<SetupBackend> {
+    [
+        paths.claude_skill_dir().join("SKILL.md"),
+        paths.codex_skill_dir().join("SKILL.md"),
+        paths.opencode_skill_dir().join("SKILL.md"),
+        paths.pi_skill_dir().join("SKILL.md"),
+    ]
+    .iter()
+    .filter_map(|path| fs::read_to_string(path).ok())
+    .find_map(|content| {
+        if content.contains("Preferred backend: JDI") {
+            Some(SetupBackend::Jdi)
+        } else if content.contains("Preferred backend: JDB") {
+            Some(SetupBackend::Jdb)
+        } else {
+            None
+        }
+    })
+}
+
 pub fn configured_targets_or_default() -> Result<Vec<TargetId>> {
     let paths = Paths::new()?;
     let configured = detect_configured_targets(&paths);
@@ -479,6 +581,11 @@ pub fn configured_targets_or_default() -> Result<Vec<TargetId>> {
     } else {
         Ok(configured)
     }
+}
+
+pub fn configured_backend_or_default() -> Result<SetupBackend> {
+    let paths = Paths::new()?;
+    Ok(detect_backend_preference(&paths).unwrap_or(SetupBackend::Jdb))
 }
 
 pub fn targets_to_arg(targets: &[TargetId]) -> String {
@@ -544,6 +651,66 @@ fn parse_target_flag(value: &str, paths: &Paths) -> Result<Vec<TargetId>> {
         );
     }
     Ok(targets)
+}
+
+fn setup_backend_by_id(id: &str) -> Option<SetupBackend> {
+    match id {
+        "jdb" => Some(SetupBackend::Jdb),
+        "jdi" => Some(SetupBackend::Jdi),
+        _ => None,
+    }
+}
+
+fn parse_setup_backend_flag(value: &str) -> Result<SetupBackend> {
+    let id = value.trim().to_ascii_lowercase();
+    setup_backend_by_id(&id)
+        .ok_or_else(|| anyhow::anyhow!("unknown --backend '{value}'. Known: jdb, jdi"))
+}
+
+fn prompt_backend(default: SetupBackend) -> Result<SetupBackend> {
+    let labels: Vec<String> = SETUP_BACKENDS
+        .iter()
+        .map(|backend| backend.label().to_string())
+        .collect();
+    let default_idx = SETUP_BACKENDS
+        .iter()
+        .position(|backend| *backend == default)
+        .unwrap_or(0);
+
+    match crate::tui::single_select(
+        "Which backend should installed skills prefer?",
+        &labels,
+        default_idx,
+    ) {
+        Ok(Some(idx)) => Ok(SETUP_BACKENDS[idx]),
+        Ok(None) => bail!("setup cancelled"),
+        Err(_) => prompt_backend_text(default),
+    }
+}
+
+fn prompt_backend_text(default: SetupBackend) -> Result<SetupBackend> {
+    println!("Which backend should installed skills prefer?");
+    for (idx, backend) in SETUP_BACKENDS.iter().enumerate() {
+        let checked = if *backend == default { "*" } else { " " };
+        println!("  {}. ({}) {}", idx + 1, checked, backend.label());
+    }
+    print!(
+        "Select backend by number or id [default: {}]: ",
+        default.id()
+    );
+    io::stdout().flush()?;
+
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    let input = input.trim();
+    if input.is_empty() {
+        return Ok(default);
+    }
+    match input {
+        "1" => Ok(SetupBackend::Jdb),
+        "2" => Ok(SetupBackend::Jdi),
+        other => parse_setup_backend_flag(other),
+    }
 }
 
 fn prompt_targets(defaults: &[TargetId]) -> Result<Vec<TargetId>> {
@@ -643,7 +810,24 @@ fn select_targets(
     prompt_targets(&defaults)
 }
 
-fn install_claude(paths: &Paths) -> Result<Vec<PathBuf>> {
+fn select_backend(
+    remove: bool,
+    print: bool,
+    backend: Option<&str>,
+    yes: bool,
+    targets_empty: bool,
+) -> Result<SetupBackend> {
+    let default = SetupBackend::Jdb;
+    if let Some(value) = backend {
+        return parse_setup_backend_flag(value);
+    }
+    if remove || print || targets_empty || yes || !io::stdin().is_terminal() {
+        return Ok(default);
+    }
+    prompt_backend(default)
+}
+
+fn install_claude(paths: &Paths, backend: SetupBackend) -> Result<Vec<PathBuf>> {
     let config_path = paths.claude_config();
     let settings_path = paths.claude_settings();
 
@@ -653,7 +837,8 @@ fn install_claude(paths: &Paths) -> Result<Vec<PathBuf>> {
     apply_perm_install(&mut settings);
     write_json(&config_path, &config)?;
     write_json(&settings_path, &settings)?;
-    let skill_path = install_skill(&paths.claude_skill_dir(), MCP_SKILL_MD)?;
+    let skill = render_skill(MCP_SKILL_MD, backend);
+    let skill_path = install_skill(&paths.claude_skill_dir(), &skill)?;
 
     Ok(vec![config_path, settings_path, skill_path])
 }
@@ -682,14 +867,15 @@ fn remove_claude(paths: &Paths) -> Result<Vec<PathBuf>> {
     Ok(changed)
 }
 
-fn install_codex(paths: &Paths) -> Result<Vec<PathBuf>> {
+fn install_codex(paths: &Paths, backend: SetupBackend) -> Result<Vec<PathBuf>> {
     let config_path = paths.codex_config();
     let existing = fs::read_to_string(&config_path).unwrap_or_default();
     let (next, changed) = upsert_toml_table(&existing, CODEX_TOML_HEADER, &codex_mcp_block());
     if changed {
         atomic_write(&config_path, next.as_bytes())?;
     }
-    let skill_path = install_skill(&paths.codex_skill_dir(), MCP_SKILL_MD)?;
+    let skill = render_skill(MCP_SKILL_MD, backend);
+    let skill_path = install_skill(&paths.codex_skill_dir(), &skill)?;
     Ok(vec![config_path, skill_path])
 }
 
@@ -713,12 +899,13 @@ fn remove_codex(paths: &Paths) -> Result<Vec<PathBuf>> {
     Ok(changed)
 }
 
-fn install_opencode(paths: &Paths) -> Result<Vec<PathBuf>> {
+fn install_opencode(paths: &Paths, backend: SetupBackend) -> Result<Vec<PathBuf>> {
     let config_path = paths.opencode_config();
     let mut config = read_json_strict(&config_path)?;
     apply_opencode_mcp_install(&mut config);
     write_json(&config_path, &config)?;
-    let skill_path = install_skill(&paths.opencode_skill_dir(), MCP_SKILL_MD)?;
+    let skill = render_skill(MCP_SKILL_MD, backend);
+    let skill_path = install_skill(&paths.opencode_skill_dir(), &skill)?;
     Ok(vec![config_path, skill_path])
 }
 
@@ -744,8 +931,9 @@ fn remove_opencode(paths: &Paths) -> Result<Vec<PathBuf>> {
     Ok(changed)
 }
 
-fn install_pi(paths: &Paths) -> Result<Vec<PathBuf>> {
-    let skill_path = install_skill(&paths.pi_skill_dir(), CLI_SKILL_MD)?;
+fn install_pi(paths: &Paths, backend: SetupBackend) -> Result<Vec<PathBuf>> {
+    let skill = render_skill(CLI_SKILL_MD, backend);
+    let skill_path = install_skill(&paths.pi_skill_dir(), &skill)?;
     Ok(vec![skill_path])
 }
 
@@ -757,16 +945,18 @@ fn remove_pi(paths: &Paths) -> Result<Vec<PathBuf>> {
     Ok(changed)
 }
 
-fn print_target_config(target: TargetId, paths: &Paths) -> Result<()> {
+fn print_target_config(target: TargetId, paths: &Paths, backend: SetupBackend) -> Result<()> {
     match target {
         TargetId::Claude => {
             let snippet = json!({ "mcpServers": { MCP_SERVER_KEY: mcp_server_value() } });
             println!("# Claude Code: add to {}", paths.claude_config().display());
             println!("{}", serde_json::to_string_pretty(&snippet)?);
+            println!("# Installed skill preference: backend={}", backend.id());
         }
         TargetId::Codex => {
             println!("# Codex: add to {}", paths.codex_config().display());
             println!("{}", codex_mcp_block());
+            println!("# Installed skill preference: backend={}", backend.id());
         }
         TargetId::Opencode => {
             let snippet = json!({
@@ -779,6 +969,7 @@ fn print_target_config(target: TargetId, paths: &Paths) -> Result<()> {
                 "# OpenCode discovers skills under {}.",
                 paths.opencode_dir().join("skills").display()
             );
+            println!("# Installed skill preference: backend={}", backend.id());
         }
         TargetId::Pi => {
             println!(
@@ -787,12 +978,19 @@ fn print_target_config(target: TargetId, paths: &Paths) -> Result<()> {
             );
             println!("# Pi discovers skills under ~/.pi/agent/skills/ automatically.");
             println!("# No MCP config is emitted because Pi has no official jdbg MCP setup.");
+            println!("# Installed skill preference: backend={}", backend.id());
         }
     }
     Ok(())
 }
 
-pub fn run_setup(remove: bool, print: bool, target: Option<&str>, yes: bool) -> Result<()> {
+pub fn run_setup(
+    remove: bool,
+    print: bool,
+    target: Option<&str>,
+    yes: bool,
+    backend: Option<&str>,
+) -> Result<()> {
     let paths = Paths::new()?;
     let targets = if print {
         match target {
@@ -802,13 +1000,14 @@ pub fn run_setup(remove: bool, print: bool, target: Option<&str>, yes: bool) -> 
     } else {
         select_targets(remove, target, yes, &paths)?
     };
+    let backend = select_backend(remove, print, backend, yes, targets.is_empty())?;
 
     if print {
         for (idx, target) in targets.iter().enumerate() {
             if idx > 0 {
                 println!();
             }
-            print_target_config(*target, &paths)?;
+            print_target_config(*target, &paths, backend)?;
         }
         return Ok(());
     }
@@ -843,16 +1042,20 @@ pub fn run_setup(remove: bool, print: bool, target: Option<&str>, yes: bool) -> 
     } else {
         for target in targets {
             let written = match target {
-                TargetId::Claude => install_claude(&paths)?,
-                TargetId::Codex => install_codex(&paths)?,
-                TargetId::Opencode => install_opencode(&paths)?,
-                TargetId::Pi => install_pi(&paths)?,
+                TargetId::Claude => install_claude(&paths, backend)?,
+                TargetId::Codex => install_codex(&paths, backend)?,
+                TargetId::Opencode => install_opencode(&paths, backend)?,
+                TargetId::Pi => install_pi(&paths, backend)?,
             };
             println!("Registered jdbg for {}.", target.display_name());
             for path in written {
                 println!("  {}", path.display());
             }
         }
+        println!(
+            "Preferred backend recorded in installed skills: {}.",
+            backend.display_name()
+        );
         println!("Restart or reload the configured agent(s) to pick up jdbg.");
     }
 
@@ -1091,13 +1294,13 @@ mod tests {
             vec![TargetId::Claude, TargetId::Codex]
         );
 
-        install_opencode(&paths).unwrap();
+        install_opencode(&paths, SetupBackend::Jdb).unwrap();
         assert_eq!(
             detect_configured_targets(&paths),
             vec![TargetId::Claude, TargetId::Codex, TargetId::Opencode]
         );
 
-        install_pi(&paths).unwrap();
+        install_pi(&paths, SetupBackend::Jdb).unwrap();
         assert_eq!(
             detect_configured_targets(&paths),
             vec![
@@ -1121,7 +1324,7 @@ mod tests {
         )
         .unwrap();
 
-        let written = install_codex(&paths).unwrap();
+        let written = install_codex(&paths, SetupBackend::Jdb).unwrap();
         assert_eq!(written.len(), 2);
         let after_install = fs::read_to_string(paths.codex_config()).unwrap();
         assert!(after_install.contains("[other]"));
@@ -1155,7 +1358,7 @@ mod tests {
         )
         .unwrap();
 
-        let written = install_opencode(&paths).unwrap();
+        let written = install_opencode(&paths, SetupBackend::Jdb).unwrap();
         assert_eq!(written.len(), 2);
         let after_install = read_json_strict(&paths.opencode_config()).unwrap();
         assert_eq!(
@@ -1187,7 +1390,7 @@ mod tests {
         let home = temp_home("pi");
         let paths = Paths::for_home(&home);
 
-        let written = install_pi(&paths).unwrap();
+        let written = install_pi(&paths, SetupBackend::Jdb).unwrap();
         assert_eq!(written, vec![paths.pi_skill_dir().join("SKILL.md")]);
         let installed = fs::read_to_string(paths.pi_skill_dir().join("SKILL.md")).unwrap();
         assert_skill_frontmatter_is_pi_yaml_safe(&installed);
@@ -1212,7 +1415,31 @@ mod tests {
         assert!(CLI_SKILL_MD.len() > 500);
     }
 
+    #[test]
+    fn rendered_mcp_skill_records_jdi_backend_preference() {
+        let rendered = render_skill(MCP_SKILL_MD, SetupBackend::Jdi);
+
+        assert!(rendered.contains("Preferred backend: JDI"));
+        assert!(rendered.contains(r#""backend": "jdi""#));
+        assert!(rendered.contains("JDI launch is not supported"));
+    }
+
+    #[test]
+    fn install_codex_writes_selected_backend_preference_to_skill() {
+        let home = temp_home("codex-backend");
+        let paths = Paths::for_home(&home);
+
+        install_codex(&paths, SetupBackend::Jdi).unwrap();
+
+        let installed = fs::read_to_string(paths.codex_skill_dir().join("SKILL.md")).unwrap();
+        assert!(installed.contains("Preferred backend: JDI"));
+        assert!(installed.contains(r#""backend": "jdi""#));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
     fn assert_skill_frontmatter_is_pi_yaml_safe(content: &str) {
+        let content = content.replace("\r\n", "\n");
         assert!(content.starts_with("---\n"));
         let frontmatter_end = content[4..]
             .find("\n---")
