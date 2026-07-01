@@ -346,32 +346,30 @@ This section tracks the current branch state against the roadmap above.
 - JDK 8 sidecar compatibility: the sidecar source/build path is JDK 8 compatible
   when `tools.jar` is available, while still working on newer JDKs.
 
-### Implemented With Remaining Hardening
+### Implemented Hardening
 
-- `vmDisconnected` is handled by the sidecar and Rust session state, but still
-  needs dedicated fixture-based public CLI/MCP coverage for target VM exit.
-- JDI step-over is implemented, but should get a dedicated fixture-based
-  integration test alongside the existing breakpoint/inspect coverage.
-- MCP schemas and tool routing cover JDI backend selection, but a full JDI
-  MCP end-to-end attach -> break_at -> cont -> locals/inspect smoke should be
-  added before release.
-- Java sidecar behavior is covered through Rust-driven integration tests; small
-  Java-side unit tests for JSON parsing, RPC error mapping, and value-rendering
-  limits are still useful hardening.
+- Dedicated fixture coverage now verifies JDI `vmDisconnected` target exit,
+  detach/kill, sidecar-process death, and status transitions through the public
+  session surface.
+- JDI step-over now has fixture-based integration coverage for the returned step
+  stop site, top stack frame, and locals at the stopped frame.
+- MCP now has a JDI end-to-end smoke covering `attach -> break_at -> cont ->
+  locals -> inspect -> kill` through `jdbg __mcp`, the daemon, and the JDI
+  sidecar.
+- Java sidecar self-tests cover JSON protocol parsing/serialization, sidecar
+  token/config validation, stable unknown-method RPC errors, and value-rendering
+  string limits.
+- Unexpected sidecar process exit while the Rust daemon still holds a JDI session
+  now marks the session `Dead`; `status` reports `jdb_alive=false` and follow-up
+  operations fail explicitly instead of falling back to `jdb`.
 - Structured inspect covers common `ArrayList`, `HashMap`, and `LinkedHashMap`
   layouts without getter invocation; specialized presentation for more collection
   families can be added incrementally.
 
 ### Pending MVP Follow-Ups
 
-- Add fixture coverage for target VM disconnect and detach through the public
-  command surface.
-- Add fixture coverage for JDI step-over and stack/locals at the step stop site.
-- Add MCP end-to-end JDI smoke coverage.
-- Add focused Java sidecar tests for protocol parsing, token validation, stable
-  RPC error codes, and value serialization limits.
-- Audit and document exact behavior when a sidecar process exits unexpectedly
-  while the Rust daemon still has a session handle.
+No pending MVP follow-ups remain in this roadmap. Future work is tracked under
+Deferred Work below.
 
 ## Test Strategy
 

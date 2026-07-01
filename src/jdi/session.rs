@@ -380,7 +380,8 @@ impl JdiSession {
 
     fn drain_events(&self) {
         let events = self.sidecar.transport().drain_events();
-        if events.is_empty() {
+        let sidecar_alive = self.sidecar.is_alive();
+        if events.is_empty() && sidecar_alive {
             return;
         }
         let mut inner = self.inner.lock().expect("jdi session mutex poisoned");
@@ -389,6 +390,9 @@ impl JdiSession {
                 inner.state = RunState::Exited;
                 inner.last_event = Some(Event::VmExit);
             }
+        }
+        if !sidecar_alive && !matches!(inner.state, RunState::Dead | RunState::Exited) {
+            inner.state = RunState::Dead;
         }
     }
 }

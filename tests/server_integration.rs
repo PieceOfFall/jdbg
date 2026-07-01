@@ -3,14 +3,23 @@
 //! These tests require a JDK (jdb available through JAVA_HOME or PATH) and compiled Java fixtures.
 //! Before running, ensure: javac -g tests/fixtures/java/CollectionTest.java
 
-use std::io::{BufRead, BufReader, Read};
-use std::path::PathBuf;
+use std::fs;
+use std::io::{BufRead, BufReader, Read, Write};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, LazyLock, Mutex, mpsc};
 use std::time::{Duration, Instant};
 
 use java_agent_debugger::protocol::*;
 use java_agent_debugger::session::Session;
+use serde_json::{Value, json};
+
+static JAVAC_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static JDI_E2E_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+fn jdi_e2e_guard() -> std::sync::MutexGuard<'static, ()> {
+    JDI_E2E_LOCK.lock().expect("JDI e2e lock poisoned")
+}
 
 /// Helper: get the jdb path.
 fn jdb_path() -> PathBuf {
@@ -59,6 +68,7 @@ fn hide_console(command: &mut Command) {
 }
 
 fn compile_java_fixture(source_name: &str) {
+    let _guard = JAVAC_LOCK.lock().expect("javac fixture lock poisoned");
     let dir = fixture_dir();
     let mut command = Command::new(javac_path());
     command
@@ -69,6 +79,118 @@ fn compile_java_fixture(source_name: &str) {
     hide_console(&mut command);
     let status = command.status().expect("failed to spawn javac");
     assert!(status.success(), "javac failed with status {status}");
+}
+
+fn sidecar_java_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("sidecar")
+        .join("jdi")
+        .join("src")
+        .join("main")
+        .join("java")
+}
+
+fn sidecar_java_test_dir() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("sidecar")
+        .join("jdi")
+        .join("src")
+        .join("test")
+        .join("java")
+}
+
+fn collect_java_sources(root: &Path, out: &mut Vec<PathBuf>) {
+    let entries = fs::read_dir(root)
+        .unwrap_or_else(|e| panic!("failed to read Java source dir {}: {e}", root.display()));
+    for entry in entries {
+        let path = entry.expect("read Java source entry").path();
+        if path.is_dir() {
+            collect_java_sources(&path, out);
+        } else if path.extension().is_some_and(|ext| ext == "java") {
+            out.push(path);
+        }
+    }
+}
+
+fn tools_jar_path() -> Option<PathBuf> {
+    std::env::var_os("JAVA_HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join("lib").join("tools.jar"))
+        .filter(|path| path.is_file())
+}
+
+fn classpath_join(paths: &[PathBuf]) -> String {
+    let sep = if cfg!(windows) { ";" } else { ":" };
+    paths
+        .iter()
+        .map(|path| path.display().to_string())
+        .collect::<Vec<_>>()
+        .join(sep)
+}
+
+fn run_java_sidecar_self_tests() {
+    let mut sources = Vec::new();
+    collect_java_sources(&sidecar_java_dir(), &mut sources);
+    collect_java_sources(&sidecar_java_test_dir(), &mut sources);
+
+    let classes_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join("sidecar-self-test-classes");
+    let _ = fs::remove_dir_all(&classes_dir);
+    fs::create_dir_all(&classes_dir).expect("create sidecar self-test classes dir");
+
+    let mut javac = Command::new(javac_path());
+    javac.arg("-encoding").arg("UTF-8");
+    if let Some(tools_jar) = tools_jar_path() {
+        javac.arg("-cp").arg(tools_jar);
+    }
+    javac.arg("-d").arg(&classes_dir).args(&sources);
+    hide_console(&mut javac);
+    let output = javac.output().expect("spawn javac for sidecar tests");
+    assert!(
+        output.status.success(),
+        "javac sidecar tests failed with {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let mut classpath = vec![classes_dir.clone()];
+    if let Some(tools_jar) = tools_jar_path() {
+        classpath.push(tools_jar);
+    }
+    let mut java = Command::new(java_path(false));
+    java.arg("-cp")
+        .arg(classpath_join(&classpath))
+        .arg("dev.jdbg.sidecar.SidecarSelfTest");
+    hide_console(&mut java);
+    let output = java.output().expect("spawn sidecar self-test runner");
+    assert!(
+        output.status.success(),
+        "sidecar self-tests failed with {}\nstdout:\n{}\nstderr:\n{}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn terminate_process(pid: u32) {
+    let mut command = if cfg!(windows) {
+        let mut command = Command::new("taskkill");
+        command.arg("/PID").arg(pid.to_string()).arg("/F");
+        command
+    } else {
+        let mut command = Command::new("kill");
+        command.arg("-9").arg(pid.to_string());
+        command
+    };
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    hide_console(&mut command);
+    let status = command.status().expect("spawn process terminator");
+    assert!(
+        status.success(),
+        "failed to terminate process {pid}; status={status}"
+    );
 }
 
 fn free_loopback_port() -> u16 {
@@ -117,6 +239,126 @@ fn start_jdwp_fixture(main_class: &str) -> TargetJvm {
         port,
         _output: rx,
     }
+}
+
+struct TestDaemonGuard {
+    username: String,
+    data_dir: PathBuf,
+}
+
+impl TestDaemonGuard {
+    fn new(label: &str) -> Self {
+        let unique = format!(
+            "jdbg-test-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_millis()
+        );
+        let data_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("target")
+            .join(format!("jdbg-test-data-{label}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&data_dir);
+        fs::create_dir_all(&data_dir).expect("create isolated jdbg test data dir");
+        Self {
+            username: unique,
+            data_dir,
+        }
+    }
+}
+
+impl Drop for TestDaemonGuard {
+    fn drop(&mut self) {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_jdbg"));
+        command
+            .arg("daemon")
+            .arg("stop")
+            .env("USERNAME", &self.username)
+            .env("USER", &self.username)
+            .env("JDBG_DATA_DIR", &self.data_dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        hide_console(&mut command);
+        let _ = command.status();
+        let _ = fs::remove_dir_all(&self.data_dir);
+    }
+}
+
+fn run_mcp_jsonrpc(messages: &[Value], guard: &TestDaemonGuard) -> Vec<Value> {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_jdbg"));
+    command
+        .arg("__mcp")
+        .env("USERNAME", &guard.username)
+        .env("USER", &guard.username)
+        .env("JDBG_DATA_DIR", &guard.data_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    hide_console(&mut command);
+    let mut child = command.spawn().expect("failed to spawn jdbg __mcp");
+
+    let mut stdin = child.stdin.take().expect("mcp stdin");
+    let stdout = child.stdout.take().expect("mcp stdout");
+    let mut stdout = BufReader::new(stdout);
+    let stderr = child.stderr.take().expect("mcp stderr");
+    let stderr_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let mut reader = BufReader::new(stderr);
+        let _ = reader.read_to_string(&mut text);
+        text
+    });
+
+    let mut responses = Vec::new();
+    for msg in messages {
+        writeln!(stdin, "{}", serde_json::to_string(msg).unwrap()).expect("write mcp request");
+        stdin.flush().expect("flush mcp request");
+        if msg.get("id").is_some() {
+            let mut line = String::new();
+            stdout.read_line(&mut line).expect("read mcp response");
+            assert!(!line.trim().is_empty(), "MCP closed stdout before response");
+            responses.push(
+                serde_json::from_str(&line)
+                    .unwrap_or_else(|e| panic!("invalid MCP JSON line {line:?}: {e}")),
+            );
+        }
+    }
+    drop(stdin);
+
+    let status = child.wait().expect("wait for mcp process");
+    let stderr = stderr_reader.join().expect("join stderr reader");
+    assert!(
+        status.success(),
+        "MCP process failed: status={status}; responses={responses:#?}; stderr={stderr}"
+    );
+
+    responses
+}
+
+fn mcp_response<'a>(responses: &'a [Value], id: i64) -> &'a Value {
+    responses
+        .iter()
+        .find(|resp| resp.get("id").and_then(Value::as_i64) == Some(id))
+        .unwrap_or_else(|| panic!("missing MCP response id {id}; responses={responses:#?}"))
+}
+
+fn mcp_text(resp: &Value) -> &str {
+    resp.pointer("/result/content/0/text")
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("missing MCP text content in {resp:#?}"))
+}
+
+fn assert_mcp_success(resp: &Value) {
+    assert!(
+        resp.get("error").is_none(),
+        "MCP protocol error response: {resp:#?}"
+    );
+    assert_eq!(
+        resp.pointer("/result/isError").and_then(Value::as_bool),
+        Some(false),
+        "MCP tool returned error: {resp:#?}"
+    );
 }
 
 fn spawn_output_reader<R>(reader: R, tx: mpsc::Sender<String>)
@@ -421,6 +663,7 @@ fn inspect_empty_returns_size_zero() {
 fn jdi_inspect_renders_structured_value_kinds() {
     use java_agent_debugger::jdi::session::JdiSession;
 
+    let _guard = jdi_e2e_guard();
     compile_java_fixture("StructuredInspectTest.java");
     let target = start_jdwp_fixture("StructuredInspectTest");
     let sourcepath = vec![fixture_dir().display().to_string()];
@@ -444,7 +687,7 @@ fn jdi_inspect_renders_structured_value_kinds() {
         "expected deferred JDI breakpoint, got {:?}",
         breakpoint.result
     );
-    let stop = session.cont(Some(10)).expect("JDI cont failed");
+    let stop = session.cont(Some(30)).expect("JDI cont failed");
     assert!(
         matches!(stop.result, CommandResult::Stopped { .. }),
         "expected JDI breakpoint stop, got {:?}",
@@ -466,6 +709,291 @@ fn jdi_inspect_renders_structured_value_kinds() {
     assert!(text.contains(r#""name": "ACTIVE""#), "{text}");
 
     let _ = session.kill();
+}
+
+#[test]
+fn jdi_cont_surfaces_vm_disconnect_and_marks_session_exited() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("Main.java");
+    let target = start_jdwp_fixture("Main");
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::attach(
+        "127.0.0.1",
+        target.port,
+        &sourcepath,
+        "jdi-vm-disconnect".into(),
+        None,
+    )
+    .expect("JDI attach failed");
+
+    let response = session.cont(Some(10)).expect("JDI cont failed");
+
+    match &response.result {
+        CommandResult::VmExited { tail, .. } => {
+            assert!(
+                tail.as_deref()
+                    .unwrap_or_default()
+                    .contains("target VM disconnected"),
+                "vmDisconnected tail should explain the target exit, got {tail:?}"
+            );
+        }
+        other => panic!("expected VmExited from target disconnect, got {other:?}"),
+    }
+    match session.status() {
+        CommandResult::Status {
+            state,
+            last_event: Some(Event::VmExit),
+            ..
+        } => assert_eq!(state, RunState::Exited),
+        other => panic!("expected exited JDI status with VmExit last_event, got {other:?}"),
+    }
+
+    let _ = session.kill();
+}
+
+#[test]
+fn jdi_kill_detaches_and_marks_session_dead() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("Loop.java");
+    let target = start_jdwp_fixture("Loop");
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::attach(
+        "127.0.0.1",
+        target.port,
+        &sourcepath,
+        "jdi-detach".into(),
+        None,
+    )
+    .expect("JDI attach failed");
+
+    session.kill().expect("JDI kill/detach failed");
+
+    match session.status() {
+        CommandResult::Status {
+            state, jdb_alive, ..
+        } => {
+            assert_eq!(state, RunState::Dead);
+            assert!(!jdb_alive, "sidecar process should be stopped after kill");
+        }
+        other => panic!("expected dead JDI status after kill, got {other:?}"),
+    }
+}
+
+#[test]
+fn jdi_status_marks_dead_when_sidecar_process_exits_unexpectedly() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("Loop.java");
+    let target = start_jdwp_fixture("Loop");
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::attach(
+        "127.0.0.1",
+        target.port,
+        &sourcepath,
+        "jdi-sidecar-crash".into(),
+        None,
+    )
+    .expect("JDI attach failed");
+
+    terminate_process(session.meta.sidecar_pid);
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match session.status() {
+            CommandResult::Status {
+                state: RunState::Dead,
+                jdb_alive,
+                ..
+            } => {
+                assert!(!jdb_alive, "sidecar process should not be alive");
+                break;
+            }
+            other if Instant::now() < deadline => {
+                assert!(
+                    !matches!(
+                        other,
+                        CommandResult::Status {
+                            state: RunState::Exited,
+                            ..
+                        }
+                    ),
+                    "unexpected exited status after sidecar process death: {other:?}"
+                );
+                std::thread::yield_now();
+            }
+            other => panic!("expected dead JDI status after sidecar exit, got {other:?}"),
+        }
+    }
+}
+
+#[test]
+fn jdi_step_over_returns_step_event_with_stack_and_locals() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("StructuredInspectTest.java");
+    let target = start_jdwp_fixture("StructuredInspectTest");
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::attach(
+        "127.0.0.1",
+        target.port,
+        &sourcepath,
+        "jdi-step-over".into(),
+        None,
+    )
+    .expect("JDI attach failed");
+
+    session
+        .stop_at("StructuredInspectTest", 35, None)
+        .expect("JDI breakpoint failed");
+    let stop = session.cont(Some(30)).expect("JDI cont failed");
+    assert!(
+        matches!(stop.result, CommandResult::Stopped { .. }),
+        "expected breakpoint stop, got {:?}",
+        stop.result
+    );
+
+    let step = session.next(Some(30)).expect("JDI step-over failed");
+    match &step.result {
+        CommandResult::Stopped {
+            event: Event::Step { .. },
+            location,
+            frame: Some(frame),
+            ..
+        } => {
+            assert_eq!(location.class, "StructuredInspectTest");
+            assert!(
+                location.line >= 35,
+                "step-over should stop at or after the breakpoint line, got {location:?}"
+            );
+            assert_eq!(frame.location.class, "StructuredInspectTest");
+        }
+        other => panic!("expected JDI step Stopped with top frame, got {other:?}"),
+    }
+
+    let locals = session.locals().expect("JDI locals after step failed");
+    match &locals.result {
+        CommandResult::Locals { vars } => {
+            assert!(
+                vars.iter().any(|v| v.name == "root"),
+                "locals should include root after step-over, got {vars:?}"
+            );
+        }
+        other => panic!("expected locals after JDI step, got {other:?}"),
+    }
+
+    let _ = session.kill();
+}
+
+#[test]
+fn mcp_jdi_attach_breakpoint_locals_and_inspect_smoke() {
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("StructuredInspectTest.java");
+    let target = start_jdwp_fixture("StructuredInspectTest");
+    let guard = TestDaemonGuard::new("mcp-jdi-smoke");
+    let sourcepath = fixture_dir().display().to_string();
+    let messages = vec![
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "jdbg-test", "version": "0"}
+            }
+        }),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "attach",
+                "arguments": {
+                    "backend": "jdi",
+                    "host": "127.0.0.1",
+                    "port": target.port,
+                    "sourcepath": sourcepath
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "break_at",
+                "arguments": {"class": "StructuredInspectTest", "line": 35}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "cont",
+                "arguments": {"timeout": 10}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {"name": "locals", "arguments": {}}
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "inspect",
+                "arguments": {"expr": "root", "max_elements": 2}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {"name": "kill", "arguments": {}}
+        }),
+    ];
+
+    let responses = run_mcp_jsonrpc(&messages, &guard);
+    assert!(
+        mcp_response(&responses, 1)
+            .pointer("/result/capabilities/tools")
+            .is_some(),
+        "initialize should expose tools capability"
+    );
+    for id in 2..=7 {
+        assert_mcp_success(mcp_response(&responses, id));
+    }
+
+    let attach = mcp_text(mcp_response(&responses, 2));
+    assert!(attach.contains("Jdi Attach"), "{attach}");
+    let breakpoint = mcp_text(mcp_response(&responses, 3));
+    assert!(breakpoint.contains("Breakpoint set"), "{breakpoint}");
+    let stopped = mcp_text(mcp_response(&responses, 4));
+    assert!(stopped.contains("Breakpoint hit"), "{stopped}");
+    assert!(stopped.contains("StructuredInspectTest"), "{stopped}");
+    let locals = mcp_text(mcp_response(&responses, 5));
+    assert!(locals.contains("root"), "{locals}");
+    let inspect = mcp_text(mcp_response(&responses, 6));
+    assert!(inspect.contains("\"kind\": \"object\""), "{inspect}");
+    assert!(inspect.contains("\"kind\": \"collection\""), "{inspect}");
+    let kill = mcp_text(mcp_response(&responses, 7));
+    assert!(kill.contains("killed"), "{kill}");
+}
+
+#[test]
+fn java_sidecar_self_tests_cover_protocol_errors_and_value_limits() {
+    run_java_sidecar_self_tests();
 }
 
 #[test]

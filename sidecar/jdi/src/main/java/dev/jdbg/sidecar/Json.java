@@ -329,7 +329,10 @@ final class Json {
                 }
             }
             String raw = text.substring(start, pos);
-            return floating ? Double.parseDouble(raw) : Long.parseLong(raw);
+            if (floating) {
+                return Double.parseDouble(raw);
+            }
+            return Long.parseLong(raw);
         }
 
         private void expect(char expected) {

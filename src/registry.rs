@@ -104,6 +104,9 @@ impl Registry {
 
 /// Locate the data directory.
 fn data_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("JDBG_DATA_DIR") {
+        return PathBuf::from(dir);
+    }
     if let Some(proj) = directories::ProjectDirs::from("dev", "claude", "jdbg") {
         proj.data_local_dir().to_path_buf()
     } else {

@@ -77,7 +77,7 @@ public final class SidecarMain {
         }
     }
 
-    private static final class Config {
+    static final class Config {
         final int port;
         final String token;
         final int protocolVersion;

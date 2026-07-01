@@ -428,7 +428,7 @@ cargo build --release
 cargo test
 ```
 
-Tests cover parser fixtures from real `jdb` transcripts, reader behavior, protocol mapping, MCP tools, sessions, watchpoints, and end-to-end flows where the environment has a JDK.
+Tests cover parser fixtures from real `jdb` transcripts, reader behavior, protocol mapping, MCP tools, sessions, watchpoints, JDI fixture flows, MCP JDI smoke coverage, sidecar death handling, Java sidecar self-tests, and end-to-end flows where the environment has a JDK.
 
 ## License
 
