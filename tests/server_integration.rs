@@ -712,6 +712,54 @@ fn jdi_inspect_renders_structured_value_kinds() {
 }
 
 #[test]
+fn jdi_inspect_specializes_advanced_collections_and_maps() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("AdvancedCollectionsTest.java");
+    let target = start_jdwp_fixture("AdvancedCollectionsTest");
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::attach(
+        "127.0.0.1",
+        target.port,
+        &sourcepath,
+        "jdi-advanced-collections".into(),
+        None,
+    )
+    .expect("JDI attach failed");
+
+    session
+        .stop_at("AdvancedCollectionsTest", 38, None)
+        .expect("JDI breakpoint failed");
+    let stop = session.cont(Some(30)).expect("JDI cont failed");
+    assert!(
+        matches!(stop.result, CommandResult::Stopped { .. }),
+        "expected JDI breakpoint stop, got {:?}",
+        stop.result
+    );
+
+    let inspect = session
+        .inspect("holder", 10)
+        .expect("JDI advanced inspect failed");
+    let text = match inspect.result {
+        CommandResult::Raw { text } => text,
+        other => panic!("expected raw JSON inspect result, got {other:?}"),
+    };
+    let root: Value = serde_json::from_str(&text).expect("JDI inspect should be valid JSON");
+
+    assert_jdi_collection_field(&root, "linkedList", &["linked-a", "linked-b", "linked-c"]);
+    assert_jdi_collection_field(&root, "deque", &["deque-a", "deque-b", "deque-c"]);
+    assert_jdi_collection_field(&root, "hashSet", &["set-a", "set-b"]);
+    assert_jdi_collection_field(&root, "linkedSet", &["linked-set-a", "linked-set-b"]);
+    assert_jdi_map_field(&root, "treeMap", &["one", "two"]);
+    assert_jdi_collection_field(&root, "treeSet", &["tree-a", "tree-b"]);
+    assert_jdi_collection_field(&root, "unmodifiableList", &["linked-a", "linked-c"]);
+    assert_jdi_map_field(&root, "unmodifiableMap", &["one", "two"]);
+
+    let _ = session.kill();
+}
+
+#[test]
 fn jdi_cont_surfaces_vm_disconnect_and_marks_session_exited() {
     use java_agent_debugger::jdi::session::JdiSession;
 
@@ -891,6 +939,235 @@ fn jdi_step_over_returns_step_event_with_stack_and_locals() {
 }
 
 #[test]
+fn jdi_watchpoint_modification_hit() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("WatchTest.java");
+    let target = start_jdwp_fixture("WatchTest");
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::attach(
+        "127.0.0.1",
+        target.port,
+        &sourcepath,
+        "jdi-watch-modification".into(),
+        None,
+    )
+    .expect("JDI attach failed");
+
+    let watch = session
+        .watch("WatchTest.name", "modification")
+        .expect("JDI watch failed");
+    match &watch.result {
+        CommandResult::WatchSet {
+            spec,
+            mode,
+            deferred,
+        } => {
+            assert_eq!(spec, "WatchTest.name");
+            assert_eq!(mode, "modification");
+            assert!(deferred, "watchpoint should defer until WatchTest loads");
+        }
+        other => panic!("expected JDI WatchSet, got {other:?}"),
+    }
+
+    let stop = session.cont(Some(30)).expect("JDI cont failed");
+    match &stop.result {
+        CommandResult::Stopped {
+            event:
+                Event::FieldWatch {
+                    field,
+                    access_type,
+                    thread,
+                },
+            location,
+            thread_id,
+            frame: Some(frame),
+            ..
+        } => {
+            assert_eq!(field, "WatchTest.name");
+            assert_eq!(access_type, "modified");
+            assert!(!thread.is_empty(), "watchpoint thread should be named");
+            assert!(
+                thread_id.is_some(),
+                "JDI watchpoint stop should include thread id"
+            );
+            assert_eq!(location.class, "WatchTest");
+            assert_eq!(frame.location.class, "WatchTest");
+        }
+        other => panic!("expected JDI FieldWatch stop, got {other:?}"),
+    }
+
+    let _ = session.kill();
+}
+
+#[test]
+fn jdi_unwatch_removes_deferred_watchpoint_before_hit() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("WatchTest.java");
+    let target = start_jdwp_fixture("WatchTest");
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::attach(
+        "127.0.0.1",
+        target.port,
+        &sourcepath,
+        "jdi-unwatch-deferred".into(),
+        None,
+    )
+    .expect("JDI attach failed");
+
+    session
+        .watch("WatchTest.name", "modification")
+        .expect("JDI watch failed");
+    let removed = session
+        .unwatch("WatchTest.name", "modification")
+        .expect("JDI unwatch failed");
+    match &removed.result {
+        CommandResult::Raw { text } => {
+            assert!(text.contains("Watch removed"), "{text}");
+            assert!(text.contains("WatchTest.name"), "{text}");
+        }
+        other => panic!("expected raw unwatch result, got {other:?}"),
+    }
+
+    let response = session.cont(Some(10)).expect("JDI cont failed");
+    match &response.result {
+        CommandResult::VmExited { .. } => {}
+        other => panic!("expected VM exit after deferred unwatch, got {other:?}"),
+    }
+
+    let _ = session.kill();
+}
+
+#[test]
+fn jdi_unwatch_removes_active_watchpoint_after_first_hit() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("WatchTwiceTest.java");
+    let target = start_jdwp_fixture("WatchTwiceTest");
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::attach(
+        "127.0.0.1",
+        target.port,
+        &sourcepath,
+        "jdi-unwatch-active".into(),
+        None,
+    )
+    .expect("JDI attach failed");
+
+    session
+        .stop_at("WatchTwiceTest", 5, None)
+        .expect("JDI breakpoint failed");
+    let breakpoint = session
+        .cont(Some(30))
+        .expect("JDI cont to breakpoint failed");
+    assert!(
+        matches!(
+            breakpoint.result,
+            CommandResult::Stopped {
+                event: Event::Breakpoint { .. },
+                ..
+            }
+        ),
+        "expected breakpoint before active watchpoint setup, got {:?}",
+        breakpoint.result
+    );
+
+    let watch = session
+        .watch("WatchTwiceTest.name", "modification")
+        .expect("JDI active watch failed");
+    match &watch.result {
+        CommandResult::WatchSet {
+            deferred: false, ..
+        } => {}
+        other => panic!("expected active JDI WatchSet, got {other:?}"),
+    }
+
+    let first_hit = session.cont(Some(30)).expect("JDI cont to watch failed");
+    match &first_hit.result {
+        CommandResult::Stopped {
+            event: Event::FieldWatch {
+                field, access_type, ..
+            },
+            location,
+            ..
+        } => {
+            assert_eq!(field, "WatchTwiceTest.name");
+            assert_eq!(access_type, "modified");
+            assert_eq!(location.line, 6);
+        }
+        other => panic!("expected first active JDI watchpoint hit, got {other:?}"),
+    }
+
+    session
+        .unwatch("WatchTwiceTest.name", "modification")
+        .expect("JDI active unwatch failed");
+
+    let response = session
+        .cont(Some(10))
+        .expect("JDI cont after unwatch failed");
+    match &response.result {
+        CommandResult::VmExited { .. } => {}
+        other => panic!("expected VM exit after active unwatch, got {other:?}"),
+    }
+
+    let _ = session.kill();
+}
+
+#[test]
+fn jdi_unwatch_modification_from_deferred_all_leaves_access_watchpoint() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("WatchTest.java");
+    let target = start_jdwp_fixture("WatchTest");
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::attach(
+        "127.0.0.1",
+        target.port,
+        &sourcepath,
+        "jdi-unwatch-all-partial".into(),
+        None,
+    )
+    .expect("JDI attach failed");
+
+    let watch = session
+        .watch("WatchTest.name", "all")
+        .expect("JDI all watch failed");
+    match &watch.result {
+        CommandResult::WatchSet {
+            mode,
+            deferred: true,
+            ..
+        } => assert_eq!(mode, "all"),
+        other => panic!("expected deferred all WatchSet, got {other:?}"),
+    }
+
+    session
+        .unwatch("WatchTest.name", "modification")
+        .expect("JDI partial unwatch failed");
+
+    let stop = session.cont(Some(30)).expect("JDI cont failed");
+    match &stop.result {
+        CommandResult::Stopped {
+            event: Event::FieldWatch {
+                field, access_type, ..
+            },
+            ..
+        } => {
+            assert_eq!(field, "WatchTest.name");
+            assert_eq!(access_type, "accessed");
+        }
+        other => panic!("expected remaining access watchpoint hit, got {other:?}"),
+    }
+
+    let _ = session.kill();
+}
+
+#[test]
 fn mcp_jdi_attach_breakpoint_locals_and_inspect_smoke() {
     let _guard = jdi_e2e_guard();
     compile_java_fixture("StructuredInspectTest.java");
@@ -989,6 +1266,115 @@ fn mcp_jdi_attach_breakpoint_locals_and_inspect_smoke() {
     assert!(inspect.contains("\"kind\": \"collection\""), "{inspect}");
     let kill = mcp_text(mcp_response(&responses, 7));
     assert!(kill.contains("killed"), "{kill}");
+}
+
+#[test]
+fn mcp_jdi_watch_unwatch_smoke() {
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("WatchTwiceTest.java");
+    let target = start_jdwp_fixture("WatchTwiceTest");
+    let guard = TestDaemonGuard::new("mcp-jdi-watch-smoke");
+    let sourcepath = fixture_dir().display().to_string();
+    let messages = vec![
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "jdbg-test", "version": "0"}
+            }
+        }),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "attach",
+                "arguments": {
+                    "backend": "jdi",
+                    "host": "127.0.0.1",
+                    "port": target.port,
+                    "sourcepath": sourcepath
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "break_at",
+                "arguments": {"class": "WatchTwiceTest", "line": 5}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "cont",
+                "arguments": {"timeout": 10}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "watch",
+                "arguments": {"field": "WatchTwiceTest.name", "mode": "modification"}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "cont",
+                "arguments": {"timeout": 10}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "unwatch",
+                "arguments": {"field": "WatchTwiceTest.name", "mode": "modification"}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "cont",
+                "arguments": {"timeout": 10}
+            }
+        }),
+    ];
+
+    let responses = run_mcp_jsonrpc(&messages, &guard);
+    for id in 2..=8 {
+        assert_mcp_success(mcp_response(&responses, id));
+    }
+
+    let watch = mcp_text(mcp_response(&responses, 5));
+    assert!(watch.contains("Watch set (modification)"), "{watch}");
+    assert!(watch.contains("WatchTwiceTest.name"), "{watch}");
+    let stopped = mcp_text(mcp_response(&responses, 6));
+    assert!(
+        stopped.contains("Field watchpoint hit (modified)"),
+        "{stopped}"
+    );
+    assert!(stopped.contains("WatchTwiceTest.name"), "{stopped}");
+    let removed = mcp_text(mcp_response(&responses, 7));
+    assert!(removed.contains("Watch removed"), "{removed}");
+    let exited = mcp_text(mcp_response(&responses, 8));
+    assert!(exited.contains("The application exited"), "{exited}");
 }
 
 #[test]
@@ -1411,6 +1797,78 @@ fn watch_field_modification_hit() {
 }
 
 // ─── Test helpers that mirror handler.rs logic (can't import private fns) ───
+
+fn jdi_inspect_field<'a>(root: &'a Value, name: &str) -> &'a Value {
+    let fields = root
+        .pointer("/value/fields")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("missing inspect object fields in {root:#?}"));
+    fields
+        .iter()
+        .find(|field| field.get("name").and_then(Value::as_str) == Some(name))
+        .and_then(|field| field.get("value"))
+        .unwrap_or_else(|| panic!("missing inspect field {name} in {root:#?}"))
+}
+
+fn assert_jdi_collection_field(root: &Value, name: &str, expected_values: &[&str]) {
+    let field = jdi_inspect_field(root, name);
+    assert_eq!(
+        field.get("kind").and_then(Value::as_str),
+        Some("collection"),
+        "field {name} should render as collection: {field:#?}"
+    );
+    assert_ne!(
+        field.get("unavailable").and_then(Value::as_bool),
+        Some(true),
+        "field {name} should be available: {field:#?}"
+    );
+    let elements = field
+        .get("elements")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("field {name} missing collection elements: {field:#?}"));
+    assert!(
+        elements.len() >= expected_values.len(),
+        "field {name} should render at least {} elements: {field:#?}",
+        expected_values.len()
+    );
+    let rendered = field.to_string();
+    for expected in expected_values {
+        assert!(
+            rendered.contains(expected),
+            "field {name} should contain {expected}: {field:#?}"
+        );
+    }
+}
+
+fn assert_jdi_map_field(root: &Value, name: &str, expected_keys: &[&str]) {
+    let field = jdi_inspect_field(root, name);
+    assert_eq!(
+        field.get("kind").and_then(Value::as_str),
+        Some("map"),
+        "field {name} should render as map: {field:#?}"
+    );
+    assert_ne!(
+        field.get("unavailable").and_then(Value::as_bool),
+        Some(true),
+        "field {name} should be available: {field:#?}"
+    );
+    let entries = field
+        .get("entries")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("field {name} missing map entries: {field:#?}"));
+    assert!(
+        entries.len() >= expected_keys.len(),
+        "field {name} should render at least {} entries: {field:#?}",
+        expected_keys.len()
+    );
+    let rendered = field.to_string();
+    for expected in expected_keys {
+        assert!(
+            rendered.contains(expected),
+            "field {name} should contain {expected}: {field:#?}"
+        );
+    }
+}
 
 fn enrich_stopped_test_helper(session: &Session, resp: &mut CommandResponse) {
     let (location_line, frame_ref, source_ref) = match &mut resp.result {

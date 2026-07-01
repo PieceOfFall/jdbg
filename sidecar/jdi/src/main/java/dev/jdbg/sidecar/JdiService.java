@@ -16,18 +16,23 @@ import com.sun.jdi.Value;
 import com.sun.jdi.VirtualMachine;
 import com.sun.jdi.connect.AttachingConnector;
 import com.sun.jdi.connect.Connector;
+import com.sun.jdi.event.AccessWatchpointEvent;
 import com.sun.jdi.event.BreakpointEvent;
 import com.sun.jdi.event.ClassPrepareEvent;
 import com.sun.jdi.event.Event;
 import com.sun.jdi.event.EventIterator;
 import com.sun.jdi.event.EventSet;
+import com.sun.jdi.event.ModificationWatchpointEvent;
 import com.sun.jdi.event.StepEvent;
+import com.sun.jdi.event.WatchpointEvent;
 import com.sun.jdi.event.VMDeathEvent;
 import com.sun.jdi.event.VMDisconnectEvent;
 import com.sun.jdi.event.VMStartEvent;
+import com.sun.jdi.request.AccessWatchpointRequest;
 import com.sun.jdi.request.BreakpointRequest;
 import com.sun.jdi.request.ClassPrepareRequest;
 import com.sun.jdi.request.EventRequest;
+import com.sun.jdi.request.ModificationWatchpointRequest;
 import com.sun.jdi.request.StepRequest;
 
 import java.util.ArrayList;
@@ -68,6 +73,10 @@ final class JdiService {
                 return session(params).locals();
             case "setBreakpoint":
                 return session(params).setBreakpoint(params);
+            case "setWatchpoint":
+                return session(params).setWatchpoint(params);
+            case "clearWatchpoint":
+                return session(params).clearWatchpoint(params);
             case "continue":
                 return session(params).continueFor(Json.longValue(params, "timeoutMs", 30000));
             case "stepOver":
@@ -139,6 +148,8 @@ final class JdiService {
         final VirtualMachine vm;
         final BlockingQueue<Map<String, Object>> stops = new LinkedBlockingQueue<>();
         final List<PendingBreakpoint> pendingBreakpoints = new ArrayList<>();
+        final List<PendingWatchpoint> pendingWatchpoints = new ArrayList<>();
+        final List<ActiveWatchpoint> activeWatchpoints = new ArrayList<>();
         volatile String currentThreadId;
         volatile EventSet currentStopSet;
         volatile boolean disconnected;
@@ -234,6 +245,55 @@ final class JdiService {
             return Json.object("spec", className + ":" + line, "deferred", true);
         }
 
+        Object setWatchpoint(Map<String, Object> params) throws Exception {
+            String spec = Json.string(params, "field");
+            String mode = Json.optionalString(params, "mode", "modification");
+            FieldSpec fieldSpec = parseFieldSpec(spec);
+            validateWatchMode(mode);
+
+            List<ReferenceType> loaded = vm.classesByName(fieldSpec.className);
+            if (!loaded.isEmpty()) {
+                createWatchpoints(loaded.get(0), fieldSpec, mode);
+                return Json.object("spec", spec, "mode", mode, "deferred", false);
+            }
+
+            PendingWatchpoint pending = new PendingWatchpoint(fieldSpec, mode);
+            pendingWatchpoints.add(pending);
+            ClassPrepareRequest request = vm.eventRequestManager().createClassPrepareRequest();
+            request.addClassFilter(fieldSpec.className);
+            request.setSuspendPolicy(EventRequest.SUSPEND_ALL);
+            request.enable();
+            pending.prepareRequest = request;
+            return Json.object("spec", spec, "mode", mode, "deferred", true);
+        }
+
+        Object clearWatchpoint(Map<String, Object> params) throws Exception {
+            String spec = Json.string(params, "field");
+            String mode = Json.optionalString(params, "mode", "modification");
+            FieldSpec fieldSpec = parseFieldSpec(spec);
+            validateWatchMode(mode);
+
+            Iterator<PendingWatchpoint> it = pendingWatchpoints.iterator();
+            while (it.hasNext()) {
+                PendingWatchpoint pending = it.next();
+                if (pending.removeMode(fieldSpec, mode)) {
+                    if (pending.prepareRequest != null) {
+                        vm.eventRequestManager().deleteEventRequest(pending.prepareRequest);
+                    }
+                    it.remove();
+                }
+            }
+            Iterator<ActiveWatchpoint> activeIt = activeWatchpoints.iterator();
+            while (activeIt.hasNext()) {
+                ActiveWatchpoint active = activeIt.next();
+                if (active.matches(fieldSpec, mode)) {
+                    vm.eventRequestManager().deleteEventRequest(active.request);
+                    activeIt.remove();
+                }
+            }
+            return Json.object("ok", true);
+        }
+
         Object continueFor(long timeoutMs) throws RpcException, InterruptedException {
             long deadline = System.currentTimeMillis() + timeoutMs;
             stops.clear();
@@ -319,6 +379,12 @@ final class JdiService {
                             handleVmStart(eventSet);
                         } else if (event instanceof ClassPrepareEvent) {
                             resolvePending((ClassPrepareEvent) event);
+                        } else if (event instanceof ModificationWatchpointEvent) {
+                            shouldResume = false;
+                            handleWatchStop(eventSet, (WatchpointEvent) event, "modified");
+                        } else if (event instanceof AccessWatchpointEvent) {
+                            shouldResume = false;
+                            handleWatchStop(eventSet, (WatchpointEvent) event, "accessed");
                         } else if (event instanceof BreakpointEvent) {
                             shouldResume = false;
                             handleStop(eventSet, "breakpoint", ((BreakpointEvent) event).thread(), ((BreakpointEvent) event).location(), null);
@@ -348,6 +414,16 @@ final class JdiService {
             Map<String, Object> stop = stopPayload(kind, thread, location, note);
             stops.offer(stop);
             sendEvent(kind, stop);
+        }
+
+        private void handleWatchStop(EventSet eventSet, WatchpointEvent event, String accessType) {
+            currentStopSet = eventSet;
+            currentThreadId = Long.toString(event.thread().uniqueID());
+            Map<String, Object> stop = stopPayload("fieldWatch", event.thread(), event.location(), null);
+            stop.put("field", event.field().declaringType().name() + "." + event.field().name());
+            stop.put("accessType", accessType);
+            stops.offer(stop);
+            sendEvent("fieldWatch", stop);
         }
 
         private void handleVmStart(EventSet eventSet) {
@@ -431,6 +507,17 @@ final class JdiService {
                     it.remove();
                 }
             }
+            Iterator<PendingWatchpoint> watchIt = pendingWatchpoints.iterator();
+            while (watchIt.hasNext()) {
+                PendingWatchpoint pending = watchIt.next();
+                if (pending.field.className.equals(name)) {
+                    createWatchpoints(event.referenceType(), pending.field, pending.mode);
+                    if (pending.prepareRequest != null) {
+                        vm.eventRequestManager().deleteEventRequest(pending.prepareRequest);
+                    }
+                    watchIt.remove();
+                }
+            }
         }
 
         private void createBreakpoint(ReferenceType type, int line, int suspendPolicy) throws Exception {
@@ -441,6 +528,31 @@ final class JdiService {
             BreakpointRequest request = vm.eventRequestManager().createBreakpointRequest(locations.get(0));
             request.setSuspendPolicy(suspendPolicy);
             request.enable();
+        }
+
+        private void createWatchpoints(ReferenceType type, FieldSpec fieldSpec, String mode) throws RpcException {
+            Field field = findField(type, fieldSpec.fieldName);
+            if ("modification".equals(mode) || "all".equals(mode)) {
+                ModificationWatchpointRequest request = vm.eventRequestManager().createModificationWatchpointRequest(field);
+                request.setSuspendPolicy(EventRequest.SUSPEND_ALL);
+                request.enable();
+                activeWatchpoints.add(new ActiveWatchpoint(fieldSpec, "modification", request));
+            }
+            if ("access".equals(mode) || "all".equals(mode)) {
+                AccessWatchpointRequest request = vm.eventRequestManager().createAccessWatchpointRequest(field);
+                request.setSuspendPolicy(EventRequest.SUSPEND_ALL);
+                request.enable();
+                activeWatchpoints.add(new ActiveWatchpoint(fieldSpec, "access", request));
+            }
+        }
+
+        private Field findField(ReferenceType type, String name) throws RpcException {
+            for (Field field : type.allFields()) {
+                if (field.name().equals(name)) {
+                    return field;
+                }
+            }
+            throw new RpcException("field_not_found", "field not found: " + type.name() + "." + name);
         }
 
         private ThreadReference currentThread() throws RpcException {
@@ -598,6 +710,76 @@ final class JdiService {
             this.className = className;
             this.line = line;
             this.suspendPolicy = suspendPolicy;
+        }
+    }
+
+    private static final class PendingWatchpoint {
+        final FieldSpec field;
+        String mode;
+        ClassPrepareRequest prepareRequest;
+
+        PendingWatchpoint(FieldSpec field, String mode) {
+            this.field = field;
+            this.mode = mode;
+        }
+
+        boolean removeMode(FieldSpec other, String otherMode) {
+            if (!field.spec.equals(other.spec)) {
+                return false;
+            }
+            if ("all".equals(otherMode) || mode.equals(otherMode)) {
+                return true;
+            }
+            if ("all".equals(mode)) {
+                if ("modification".equals(otherMode)) {
+                    mode = "access";
+                } else if ("access".equals(otherMode)) {
+                    mode = "modification";
+                }
+            }
+            return false;
+        }
+    }
+
+    private static final class ActiveWatchpoint {
+        final FieldSpec field;
+        final String mode;
+        final EventRequest request;
+
+        ActiveWatchpoint(FieldSpec field, String mode, EventRequest request) {
+            this.field = field;
+            this.mode = mode;
+            this.request = request;
+        }
+
+        boolean matches(FieldSpec other, String otherMode) {
+            return field.spec.equals(other.spec) && (mode.equals(otherMode) || "all".equals(otherMode));
+        }
+    }
+
+    private static final class FieldSpec {
+        final String spec;
+        final String className;
+        final String fieldName;
+
+        FieldSpec(String spec, String className, String fieldName) {
+            this.spec = spec;
+            this.className = className;
+            this.fieldName = fieldName;
+        }
+    }
+
+    private static FieldSpec parseFieldSpec(String spec) throws RpcException {
+        int dot = spec.lastIndexOf('.');
+        if (dot <= 0 || dot == spec.length() - 1) {
+            throw new RpcException("bad_field_spec", "field spec must be Class.field: " + spec);
+        }
+        return new FieldSpec(spec, spec.substring(0, dot), spec.substring(dot + 1));
+    }
+
+    private static void validateWatchMode(String mode) throws RpcException {
+        if (!"access".equals(mode) && !"modification".equals(mode) && !"all".equals(mode)) {
+            throw new RpcException("bad_watch_mode", "watch mode must be access, modification, or all: " + mode);
         }
     }
 }

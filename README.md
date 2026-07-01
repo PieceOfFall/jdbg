@@ -371,7 +371,8 @@ Global flags:
 Backend selection is made only when creating a session. The default `jdb` backend is the compatibility path
 and supports the full command surface. The `jdi` backend is currently attach-only and uses a local Java sidecar
 for structured runtime data; it supports `attach`, `threads`, line `break-at`, `cont`, `next`, `where`, `locals`,
-`thread`, and safe JSON `inspect`. Unsupported JDI commands fail explicitly instead of falling back to `jdb`.
+`thread`, `watch`, `unwatch`, and safe JSON `inspect`. Unsupported JDI commands fail explicitly instead of
+falling back to `jdb`.
 
 ## Architecture
 
@@ -417,8 +418,9 @@ When building from source, `cargo build` also builds `jdbg-jdi-sidecar.jar` next
 with `JDBG_JDI_JAVA`.
 
 `classes` works without a pattern, but that lists every loaded class; pass a pattern in real application
-servers. `watch --mode all` creates separate access and modification watchpoints, so `unwatch --mode
-modification` removes only the write watchpoint and leaves access watchpoints active.
+servers. `watch --mode all` creates separate access and modification watchpoints on both backends, so
+`unwatch --mode modification` removes only the write watchpoint and leaves access watchpoints active. JDI
+structured inspect covers common list, deque, set, and map implementations without invoking getters.
 
 ## Building And Testing
 
@@ -428,7 +430,7 @@ cargo build --release
 cargo test
 ```
 
-Tests cover parser fixtures from real `jdb` transcripts, reader behavior, protocol mapping, MCP tools, sessions, watchpoints, JDI fixture flows, MCP JDI smoke coverage, sidecar death handling, Java sidecar self-tests, and end-to-end flows where the environment has a JDK.
+Tests cover parser fixtures from real `jdb` transcripts, reader behavior, protocol mapping, MCP tools, sessions, watchpoints, JDI fixture flows, JDI watchpoint flows, MCP JDI smoke coverage, sidecar death handling, Java sidecar self-tests, and end-to-end flows where the environment has a JDK.
 
 ## License
 

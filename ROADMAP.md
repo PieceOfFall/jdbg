@@ -335,8 +335,9 @@ This section tracks the current branch state against the roadmap above.
   references, and truncation metadata without invoking getters.
 - Milestone 8, CLI and MCP integration: default session creation remains `jdb`;
   `attach --backend jdi` creates JDI sessions; follow-up commands route by session
-  backend; JDI supports `break-at`, `cont`, `next`, `where`, `locals`, `threads`,
-  `thread`, `inspect`, and print/eval/dump through safe inspect.
+  backend; JDI supports `break-at`, `watch`, `unwatch`, `cont`, `next`, `where`,
+  `locals`, `threads`, `thread`, `inspect`, and print/eval/dump through safe
+  inspect.
 - Milestone 9, release readiness: `README.md`, `DESIGN.md`, both installed skills,
   and `Cargo.toml` metadata have been updated for the public JDI/rmcp behavior.
 - Setup integration beyond the original roadmap: `jdbg setup` can record an
@@ -356,15 +357,18 @@ This section tracks the current branch state against the roadmap above.
 - MCP now has a JDI end-to-end smoke covering `attach -> break_at -> cont ->
   locals -> inspect -> kill` through `jdbg __mcp`, the daemon, and the JDI
   sidecar.
+- JDI watchpoints now support access, modification, and all modes, including
+  partial `unwatch` semantics for deferred and active watchpoints; MCP has a
+  JDI watch/unwatch smoke through the public tool surface.
 - Java sidecar self-tests cover JSON protocol parsing/serialization, sidecar
   token/config validation, stable unknown-method RPC errors, and value-rendering
   string limits.
 - Unexpected sidecar process exit while the Rust daemon still holds a JDI session
   now marks the session `Dead`; `status` reports `jdb_alive=false` and follow-up
   operations fail explicitly instead of falling back to `jdb`.
-- Structured inspect covers common `ArrayList`, `HashMap`, and `LinkedHashMap`
-  layouts without getter invocation; specialized presentation for more collection
-  families can be added incrementally.
+- Structured inspect covers common `ArrayList`, `LinkedList`, `ArrayDeque`,
+  `HashSet`, `LinkedHashSet`, `TreeMap`, `TreeSet`, `HashMap`, `LinkedHashMap`,
+  and unmodifiable collection/map layouts without getter invocation.
 
 ### Pending MVP Follow-Ups
 
@@ -430,9 +434,7 @@ The following are intentionally out of MVP scope:
 - setValue;
 - method invocation;
 - force return;
-- watchpoints;
 - method entry/exit events;
-- advanced Map/List specialization;
 - UDS and Named Pipe transport;
 - multi-client sidecar support;
 - protobuf;

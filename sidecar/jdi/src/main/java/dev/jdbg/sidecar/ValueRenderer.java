@@ -10,6 +10,7 @@ import com.sun.jdi.ReferenceType;
 import com.sun.jdi.StringReference;
 import com.sun.jdi.Value;
 
+import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
@@ -130,17 +131,25 @@ final class ValueRenderer {
     }
 
     private static Map<String, Object> renderCollection(ObjectReference ref, int depth, RenderState state) {
+        ObjectReference delegate = collectionDelegate(ref);
+        if (delegate != null && delegate.uniqueID() != ref.uniqueID()) {
+            Map<String, Object> rendered = renderCollection(delegate, depth, state);
+            rendered.put("type", ref.referenceType().name());
+            rendered.put("objectId", ref.uniqueID());
+            return rendered;
+        }
+
+        List<Object> elements = Json.array();
+        Integer size = intField(ref, "size");
+
         ArrayReference backing = arrayField(ref, "elementData");
         if (backing == null) {
             backing = arrayField(ref, "a");
         }
-        Integer size = intField(ref, "size");
-        if (size == null && backing != null) {
-            size = backing.length();
-        }
-
-        List<Object> elements = Json.array();
-        if (backing != null && size != null) {
+        if (backing != null) {
+            if (size == null) {
+                size = backing.length();
+            }
             int count = Math.min(Math.min(size, backing.length()), state.limits.maxArrayLength);
             for (int i = 0; i < count; i++) {
                 elements.add(Json.object(
@@ -150,8 +159,60 @@ final class ValueRenderer {
             }
         }
 
-        boolean unavailable = backing == null;
+        if (elements.isEmpty()) {
+            ObjectReference first = objectField(ref, "first");
+            ObjectReference node = first;
+            Set<Long> seen = new HashSet<>();
+            while (node != null && elements.size() < state.limits.maxArrayLength && seen.add(node.uniqueID())) {
+                elements.add(Json.object(
+                        "index", elements.size(),
+                        "value", safeRender(fieldValue(node, "item"), depth - 1, state)
+                ));
+                node = objectField(node, "next");
+            }
+        }
+
+        if (elements.isEmpty()) {
+            ArrayReference deque = arrayField(ref, "elements");
+            Integer head = intField(ref, "head");
+            Integer tail = intField(ref, "tail");
+            if (deque != null && head != null && tail != null && deque.length() > 0) {
+                int computedSize = tail >= head ? tail - head : deque.length() - head + tail;
+                if (size == null) {
+                    size = computedSize;
+                }
+                int count = Math.min(computedSize, state.limits.maxArrayLength);
+                for (int i = 0; i < count; i++) {
+                    int index = (head + i) % deque.length();
+                    elements.add(Json.object(
+                            "index", i,
+                            "value", safeRender(deque.getValue(index), depth - 1, state)
+                    ));
+                }
+            }
+        }
+
+        if (elements.isEmpty()) {
+            ObjectReference map = objectField(ref, "map");
+            if (map == null) {
+                map = objectField(ref, "m");
+            }
+            if (map != null && isSubtypeOf(map.referenceType(), "java.util.Map")) {
+                if (size == null) {
+                    size = intField(map, "size");
+                }
+                List<ObjectReference> entries = mapEntryObjects(map, state.limits.maxArrayLength);
+                for (ObjectReference entry : entries) {
+                    elements.add(Json.object(
+                            "index", elements.size(),
+                            "value", safeRender(fieldValue(entry, "key"), depth - 1, state)
+                    ));
+                }
+            }
+        }
+
         int rendered = elements.size();
+        boolean unavailable = size != null && size > 0 && rendered == 0;
         return Json.object(
                 "kind", "collection",
                 "type", ref.referenceType().name(),
@@ -164,29 +225,18 @@ final class ValueRenderer {
     }
 
     private static Map<String, Object> renderMap(ObjectReference ref, int depth, RenderState state) {
-        Integer size = intField(ref, "size");
-        List<Object> entries = Json.array();
-        Set<Long> seenEntries = new HashSet<>();
-
-        ObjectReference head = objectField(ref, "head");
-        ObjectReference entry = head;
-        while (entry != null && entries.size() < state.limits.maxArrayLength && seenEntries.add(entry.uniqueID())) {
-            entries.add(renderMapEntry(entry, depth, state));
-            entry = objectField(entry, "after");
+        ObjectReference delegate = mapDelegate(ref);
+        if (delegate != null && delegate.uniqueID() != ref.uniqueID()) {
+            Map<String, Object> rendered = renderMap(delegate, depth, state);
+            rendered.put("type", ref.referenceType().name());
+            rendered.put("objectId", ref.uniqueID());
+            return rendered;
         }
 
-        if (entries.isEmpty()) {
-            ArrayReference table = arrayField(ref, "table");
-            if (table != null) {
-                for (int i = 0; i < table.length() && entries.size() < state.limits.maxArrayLength; i++) {
-                    Value bucket = table.getValue(i);
-                    entry = bucket instanceof ObjectReference ? (ObjectReference) bucket : null;
-                    while (entry != null && entries.size() < state.limits.maxArrayLength && seenEntries.add(entry.uniqueID())) {
-                        entries.add(renderMapEntry(entry, depth, state));
-                        entry = objectField(entry, "next");
-                    }
-                }
-            }
+        Integer size = intField(ref, "size");
+        List<Object> entries = Json.array();
+        for (ObjectReference entry : mapEntryObjects(ref, state.limits.maxArrayLength)) {
+            entries.add(renderMapEntry(entry, depth, state));
         }
 
         return Json.object(
@@ -196,8 +246,77 @@ final class ValueRenderer {
                 "size", size,
                 "entries", entries,
                 "truncated", size != null && size > entries.size(),
-                "unavailable", entries.isEmpty() && size != null && size > 0
+                "unavailable", size != null && size > 0 && entries.isEmpty()
         );
+    }
+
+    private static ObjectReference collectionDelegate(ObjectReference ref) {
+        String[] names = {"list", "c", "collection"};
+        for (String name : names) {
+            ObjectReference candidate = objectField(ref, name);
+            if (candidate != null && isSubtypeOf(candidate.referenceType(), "java.util.Collection")) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    private static ObjectReference mapDelegate(ObjectReference ref) {
+        String[] names = {"m", "map"};
+        for (String name : names) {
+            ObjectReference candidate = objectField(ref, name);
+            if (candidate != null && isSubtypeOf(candidate.referenceType(), "java.util.Map")) {
+                return candidate;
+            }
+        }
+        return null;
+    }
+
+    private static List<ObjectReference> mapEntryObjects(ObjectReference ref, int maxEntries) {
+        List<ObjectReference> entries = new ArrayList<>();
+        Set<Long> seenEntries = new HashSet<>();
+
+        ObjectReference entry = objectField(ref, "head");
+        while (entry != null && entries.size() < maxEntries && seenEntries.add(entry.uniqueID())) {
+            entries.add(entry);
+            entry = objectField(entry, "after");
+        }
+
+        if (entries.isEmpty()) {
+            ArrayReference table = arrayField(ref, "table");
+            if (table != null) {
+                for (int i = 0; i < table.length() && entries.size() < maxEntries; i++) {
+                    Value bucket = table.getValue(i);
+                    entry = bucket instanceof ObjectReference ? (ObjectReference) bucket : null;
+                    while (entry != null && entries.size() < maxEntries && seenEntries.add(entry.uniqueID())) {
+                        entries.add(entry);
+                        entry = objectField(entry, "next");
+                    }
+                }
+            }
+        }
+
+        if (entries.isEmpty()) {
+            collectTreeEntries(objectField(ref, "root"), entries, seenEntries, maxEntries);
+        }
+
+        return entries;
+    }
+
+    private static void collectTreeEntries(
+            ObjectReference node,
+            List<ObjectReference> entries,
+            Set<Long> seenEntries,
+            int maxEntries
+    ) {
+        if (node == null || entries.size() >= maxEntries || !seenEntries.add(node.uniqueID())) {
+            return;
+        }
+        collectTreeEntries(objectField(node, "left"), entries, seenEntries, maxEntries);
+        if (entries.size() < maxEntries) {
+            entries.add(node);
+        }
+        collectTreeEntries(objectField(node, "right"), entries, seenEntries, maxEntries);
     }
 
     private static Map<String, Object> renderMapEntry(ObjectReference entry, int depth, RenderState state) {

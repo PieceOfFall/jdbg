@@ -4,7 +4,7 @@ description: "Use when you need a Java program's real runtime state instead of r
 compatibility: "Requires a JDK 8+ (provides the `jdb` command). Debugging is driven through the `jdbg` MCP server (tools named `launch`, `break_at`, `run`, `locals`, …). Native on Windows, Linux, macOS."
 allowed-tools: "mcp__jdbg__launch, mcp__jdbg__attach, mcp__jdbg__status, mcp__jdbg__list, mcp__jdbg__kill, mcp__jdbg__break_at, mcp__jdbg__break_in, mcp__jdbg__catch, mcp__jdbg__watch, mcp__jdbg__unwatch, mcp__jdbg__breakpoints, mcp__jdbg__clear, mcp__jdbg__run, mcp__jdbg__cont, mcp__jdbg__step, mcp__jdbg__next, mcp__jdbg__step_out, mcp__jdbg__where, mcp__jdbg__locals, mcp__jdbg__print, mcp__jdbg__dump, mcp__jdbg__eval, mcp__jdbg__threads, mcp__jdbg__classes, mcp__jdbg__methods, mcp__jdbg__thread, mcp__jdbg__frame, mcp__jdbg__list_source, mcp__jdbg__inspect, mcp__jdbg__raw, mcp__jdbg__suspend, mcp__jdbg__resume, mcp__jdbg__set, mcp__jdbg__ignore, mcp__jdbg__lock, mcp__jdbg__threadlocks, Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "2.11"
+  version: "2.12"
 ---
 
 # jdbg — interactive Java debugging for agents
@@ -80,7 +80,7 @@ found via `JAVA_HOME/bin` → PATH → common install dirs).
 ### Backend guidance
 
 - Omit `backend` for the mature `jdb` backend. It supports the full tool surface and keeps `raw` as an escape hatch.
-- Use `backend: "jdi"` only when attaching to an already-running JDWP target and you want structured sidecar data. The current JDI subset supports `attach`, `threads`, line `break_at`, `cont`, `next`, `where`, `locals`, `thread`, and safe JSON `inspect`.
+- Use `backend: "jdi"` only when attaching to an already-running JDWP target and you want structured sidecar data. The current JDI subset supports `attach`, `threads`, line `break_at`, field `watch`/`unwatch`, `cont`, `next`, `where`, `locals`, `thread`, and safe JSON `inspect`.
 - JDI attach starts in state `running`; set a line breakpoint, then call `cont` to wait for the next stop.
 - Unsupported JDI tools return an explicit backend error. Start a `jdb` session if you need unsupported debugger commands.
 - JDI uses `jdbg-jdi-sidecar.jar` next to the `jdbg` binary. Source builds create it during `cargo build`; override with `JDBG_JDI_SIDECAR_JAR` or `JDBG_JDI_JAVA` only when necessary.
@@ -188,9 +188,11 @@ Use `inspect` instead of manually looping `print expr.get(0)`, `print expr.get(1
 inspect { "expr": "myList" }               → shows size + all elements (up to 10)
 inspect { "expr": "map.keySet()", "max_elements": 20 }  → first 20 keys
 ```
-Works with `ArrayList`, `HashMap.values()`, `HashMap.keySet()`, arrays, and any object with
-`.size()`/`.length` + `.get(i)`/`[i]` accessors. Returns structured output: size, elements list, and
-whether the result was truncated.
+On JDI sessions, safe JSON `inspect` reads fields directly and does not invoke getters; it covers common
+`ArrayList`, `LinkedList`, `ArrayDeque`, `HashSet`, `LinkedHashSet`, `TreeMap`, `TreeSet`, `HashMap`,
+`LinkedHashMap`, unmodifiable wrappers, arrays, and ordinary objects. On jdb sessions, `inspect` keeps the
+classic collection/array summary behavior. Results include size/entries/elements and truncation metadata
+where available.
 
 ## Finding classes and methods (Spring/CGLIB/Tomcat)
 
@@ -225,6 +227,8 @@ to remove both classes of watchpoint in one call.
 
 Field watchpoints fire during blocking commands (`run`/`cont`/`step`/`next`/`step_out`) — the response
 includes the location, thread, and enriched source context just like breakpoint hits.
+On JDI sessions, watchpoints are supported through `cont`/`next`; unsupported launch-only or jdb-only
+execution controls still return explicit backend errors.
 
 ## Common mistakes
 - **`locals` empty / "information not available"** → the class was compiled without debug info. Recompile

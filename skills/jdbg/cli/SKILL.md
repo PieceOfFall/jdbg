@@ -4,7 +4,7 @@ description: "Use the jdbg CLI to debug Java programs interactively from Pi when
 compatibility: "Requires a JDK 8+ with jdb available through JAVA_HOME, PATH, or --jdb-path. Requires the jdbg CLI on PATH. Native on Windows, Linux, and macOS."
 allowed-tools: "Bash(jdbg:*), Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "1.4"
+  version: "1.5"
 ---
 
 # jdbg CLI - interactive Java debugging for Pi
@@ -60,8 +60,8 @@ jdbg attach --backend jdi --host localhost --port 5005 --sourcepath src/main/jav
 ```
 
 The default backend is `jdb` and supports all commands. The current JDI backend supports attach, threads,
-line breakpoints, cont, next, where, locals, thread selection, and safe JSON inspect; unsupported commands
-fail explicitly instead of silently falling back.
+line breakpoints, field watchpoints, cont, next, where, locals, thread selection, and safe JSON inspect;
+unsupported commands fail explicitly instead of silently falling back.
 
 If the JDK is not the one you need, pass:
 
@@ -239,6 +239,10 @@ Collections and arrays:
 ```bash
 jdbg inspect "items" --max-elements 20
 ```
+
+On JDI sessions, safe JSON `inspect` reads fields directly and does not invoke getters. It covers common
+`ArrayList`, `LinkedList`, `ArrayDeque`, `HashSet`, `LinkedHashSet`, `TreeMap`, `TreeSet`, `HashMap`,
+`LinkedHashMap`, unmodifiable wrappers, arrays, and ordinary objects.
 
 Source context:
 

@@ -216,6 +216,52 @@ impl JdiSession {
         })
     }
 
+    pub fn watch(&self, field: &str, mode: &str) -> Result<CommandResponse> {
+        self.drain_events();
+        let value = request(
+            &self.sidecar,
+            "setWatchpoint",
+            json!({
+                "session": self.meta.id,
+                "field": field,
+                "mode": mode,
+            }),
+            SIDECAR_REQUEST_TIMEOUT,
+        )?;
+        let payload: WatchpointPayload = serde_json::from_value(value)
+            .map_err(|e| Error::Connection(format!("invalid JDI watchpoint response: {e}")))?;
+        Ok(CommandResponse {
+            result: CommandResult::WatchSet {
+                spec: payload.spec,
+                mode: payload.mode,
+                deferred: payload.deferred,
+            },
+            stderr: self.sidecar.take_stderr(),
+            note: payload.note,
+        })
+    }
+
+    pub fn unwatch(&self, field: &str, mode: &str) -> Result<CommandResponse> {
+        self.drain_events();
+        request(
+            &self.sidecar,
+            "clearWatchpoint",
+            json!({
+                "session": self.meta.id,
+                "field": field,
+                "mode": mode,
+            }),
+            SIDECAR_REQUEST_TIMEOUT,
+        )?;
+        Ok(CommandResponse {
+            result: CommandResult::Raw {
+                text: format!("Watch removed ({mode}): {field}"),
+            },
+            stderr: self.sidecar.take_stderr(),
+            note: None,
+        })
+    }
+
     pub fn cont(&self, timeout: Option<u64>) -> Result<CommandResponse> {
         self.resume_like("continue", timeout)
     }
@@ -342,6 +388,14 @@ impl JdiSession {
                 },
                 RunState::Suspended,
             ),
+            "fieldWatch" => (
+                Event::FieldWatch {
+                    field: payload.field.unwrap_or_default(),
+                    access_type: payload.access_type.unwrap_or_default(),
+                    thread: payload.thread.clone(),
+                },
+                RunState::Suspended,
+            ),
             "vmDisconnected" => (Event::VmExit, RunState::Exited),
             other => {
                 return Err(Error::Connection(format!(
@@ -386,7 +440,10 @@ impl JdiSession {
         }
         let mut inner = self.inner.lock().expect("jdi session mutex poisoned");
         for event in events {
-            if event.event == "vmDisconnected" && event.session == self.meta.id {
+            if event.event == "vmDisconnected"
+                && event.session == self.meta.id
+                && !matches!(inner.state, RunState::Dead)
+            {
                 inner.state = RunState::Exited;
                 inner.last_event = Some(Event::VmExit);
             }
@@ -432,6 +489,15 @@ struct BreakpointPayload {
 }
 
 #[derive(Debug, Deserialize)]
+struct WatchpointPayload {
+    spec: String,
+    mode: String,
+    deferred: bool,
+    #[serde(default)]
+    note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StopPayload {
     event: String,
@@ -441,6 +507,10 @@ struct StopPayload {
     thread_id: Option<String>,
     #[serde(default)]
     frame: Option<StackFrame>,
+    #[serde(default)]
+    field: Option<String>,
+    #[serde(default)]
+    access_type: Option<String>,
     #[serde(default)]
     message: Option<String>,
     #[serde(default)]
