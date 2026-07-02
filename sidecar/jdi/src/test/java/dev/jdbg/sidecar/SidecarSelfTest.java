@@ -3,7 +3,9 @@ package dev.jdbg.sidecar;
 import com.sun.jdi.StringReference;
 import com.sun.jdi.Type;
 
+import java.io.IOException;
 import java.lang.reflect.Proxy;
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.List;
@@ -26,6 +28,7 @@ public final class SidecarSelfTest {
         testMethodSpecMatchesExactNameAndArguments();
         testLaunchMainArgumentQuoting();
         testSourceCandidatesSearchMavenRoots();
+        testSourceCandidatesSearchOneLevelModuleRoots();
         System.out.println("SidecarSelfTest passed");
     }
 
@@ -210,6 +213,30 @@ public final class SidecarSelfTest {
         assertTrue(
                 candidates.contains(expected),
                 "source candidates should include Maven src/main/java package path"
+        );
+    }
+
+    private static void testSourceCandidatesSearchOneLevelModuleRoots() throws IOException {
+        Path root = Files.createTempDirectory("jdbg-mall-root");
+        Path module = root.resolve("mall-portal");
+        Path sourceRoot = module.resolve("src").resolve("main").resolve("java");
+        Files.createDirectories(sourceRoot);
+
+        List<Path> candidates = JdiService.sourceCandidates(
+                java.util.Arrays.asList(root.toString()),
+                java.util.Arrays.asList("HomeController.java"),
+                "com.macro.mall.portal.controller.HomeController"
+        );
+        Path expected = sourceRoot
+                .resolve("com")
+                .resolve("macro")
+                .resolve("mall")
+                .resolve("portal")
+                .resolve("controller")
+                .resolve("HomeController.java");
+        assertTrue(
+                candidates.contains(expected),
+                "source candidates should include one-level Maven module source root"
         );
     }
 

@@ -46,6 +46,7 @@ import com.sun.jdi.request.StepRequest;
 import java.io.IOException;
 import java.io.File;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -64,6 +65,14 @@ import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicLong;
 
 final class JdiService {
+    private static final long STOP_TIMEOUT_GRACE_MS = 500L;
+    private static final String[][] SOURCE_ROOT_SUFFIXES = new String[][] {
+            new String[] {"src", "main", "java"},
+            new String[] {"src", "test", "java"},
+            new String[] {"src", "main", "kotlin"},
+            new String[] {"src", "test", "kotlin"}
+    };
+
     private final FrameConnection connection;
     private final Map<String, DebugSession> sessions = new ConcurrentHashMap<>();
     private final AtomicLong eventSeq = new AtomicLong(1);
@@ -632,6 +641,8 @@ final class JdiService {
 
         Object continueFor(long timeoutMs) throws RpcException, InterruptedException {
             long deadline = System.currentTimeMillis() + timeoutMs;
+            long timeoutGraceMs = timeoutGraceMillis(timeoutMs);
+            boolean usedTimeoutGrace = false;
             waitingForStopResponse = true;
             try {
                 StopRecord stop = pollQueuedStopOrResume();
@@ -639,11 +650,18 @@ final class JdiService {
                     if (stop == null) {
                         long remaining = deadline - System.currentTimeMillis();
                         if (remaining <= 0) {
-                            return Json.object("timedOut", true, "partialOutput", "", "state", "running");
+                            if (!usedTimeoutGrace && timeoutGraceMs > 0) {
+                                usedTimeoutGrace = true;
+                                stop = stops.poll(timeoutGraceMs, TimeUnit.MILLISECONDS);
+                                if (stop != null) {
+                                    continue;
+                                }
+                            }
+                            return timeoutPayload();
                         }
                         stop = stops.poll(remaining, TimeUnit.MILLISECONDS);
                         if (stop == null) {
-                            return Json.object("timedOut", true, "partialOutput", "", "state", "running");
+                            continue;
                         }
                     }
                     if (!stop.deliverToWaitingRequest && !"vmDisconnected".equals(stop.payload.get("event"))) {
@@ -662,6 +680,17 @@ final class JdiService {
             } finally {
                 waitingForStopResponse = false;
             }
+        }
+
+        private long timeoutGraceMillis(long timeoutMs) {
+            if (timeoutMs <= 0) {
+                return 0;
+            }
+            return Math.min(STOP_TIMEOUT_GRACE_MS, timeoutMs / 10);
+        }
+
+        private Map<String, Object> timeoutPayload() {
+            return Json.object("timedOut", true, "partialOutput", "", "state", "running");
         }
 
         Object stepInto(long timeoutMs) throws Exception {
@@ -1410,14 +1439,53 @@ final class JdiService {
                     continue;
                 }
                 Path rootPath = Paths.get(root);
-                out.add(rootPath.resolve(candidate));
-                out.add(rootPath.resolve("src").resolve("main").resolve("java").resolve(candidate));
-                out.add(rootPath.resolve("src").resolve("test").resolve("java").resolve(candidate));
-                out.add(rootPath.resolve("src").resolve("main").resolve("kotlin").resolve(candidate));
-                out.add(rootPath.resolve("src").resolve("test").resolve("kotlin").resolve(candidate));
+                addSourceRootCandidates(out, rootPath, candidate);
+                for (Path moduleRoot : sourceModuleRoots(rootPath)) {
+                    addSourceRootCandidates(out, moduleRoot, candidate);
+                }
             }
         }
         return new ArrayList<>(out);
+    }
+
+    private static void addSourceRootCandidates(Set<Path> out, Path rootPath, String candidate) {
+        out.add(rootPath.resolve(candidate));
+        for (String[] suffix : SOURCE_ROOT_SUFFIXES) {
+            out.add(resolveSegments(rootPath, suffix).resolve(candidate));
+        }
+    }
+
+    private static List<Path> sourceModuleRoots(Path rootPath) {
+        if (!Files.isDirectory(rootPath)) {
+            return Collections.emptyList();
+        }
+        List<Path> roots = new ArrayList<>();
+        try (DirectoryStream<Path> entries = Files.newDirectoryStream(rootPath)) {
+            for (Path entry : entries) {
+                if (Files.isDirectory(entry) && looksLikeSourceModule(entry)) {
+                    roots.add(entry);
+                }
+            }
+        } catch (IOException ignored) {
+        }
+        return roots;
+    }
+
+    private static boolean looksLikeSourceModule(Path path) {
+        for (String[] suffix : SOURCE_ROOT_SUFFIXES) {
+            if (Files.isDirectory(resolveSegments(path, suffix))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    private static Path resolveSegments(Path root, String[] segments) {
+        Path path = root;
+        for (String segment : segments) {
+            path = path.resolve(segment);
+        }
+        return path;
     }
 
     private static String sourcePathFromClassName(String className, String sourceName) {
