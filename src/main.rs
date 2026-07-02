@@ -1,6 +1,7 @@
 //! `jdbg` entry point: parse the command line with clap and dispatch to daemon or client mode.
 
 use std::process::ExitCode;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 
@@ -51,6 +52,7 @@ fn run_client(cli: Cli) -> anyhow::Result<ExitCode> {
             }
             DaemonAction::Start => {
                 daemon::spawn_daemon_detached()?;
+                wait_for_daemon_ready(Duration::from_secs(3))?;
                 println!("Daemon started.");
                 Ok(ExitCode::SUCCESS)
             }
@@ -240,4 +242,23 @@ fn build_command(cli: &Cli) -> anyhow::Result<Command> {
         Commands::Mcp_ => unreachable!("handled above"),
     };
     Ok(cmd)
+}
+
+fn wait_for_daemon_ready(timeout: Duration) -> anyhow::Result<()> {
+    let deadline = Instant::now() + timeout;
+    let req = Request::new(Command::DaemonStatus, None);
+    loop {
+        let error = match client::send_request_to_existing(&req) {
+            Ok(resp) if resp.ok => return Ok(()),
+            Ok(resp) => resp
+                .error
+                .map(|e| e.message)
+                .unwrap_or_else(|| "daemon status returned no result".into()),
+            Err(err) => err.to_string(),
+        };
+        if Instant::now() >= deadline {
+            anyhow::bail!("daemon did not become ready within {timeout:?}: {error}");
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }

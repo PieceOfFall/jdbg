@@ -16,6 +16,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// Send a request and receive a response. This public API is also used by `daemon::stop_daemon`.
 pub fn send_request(req: &Request) -> anyhow::Result<Response> {
     let stream = connect_or_spawn()?;
+    send_request_on_stream(req, stream)
+}
+
+/// Send a request to an already-running daemon without auto-spawning another one.
+pub fn send_request_to_existing(req: &Request) -> anyhow::Result<Response> {
+    let stream = try_connect(&registry::socket_name())?;
+    send_request_on_stream(req, stream)
+}
+
+fn send_request_on_stream(req: &Request, stream: LocalStream) -> anyhow::Result<Response> {
     let mut writer = stream;
     let json = serde_json::to_string(req)?;
     writer.write_all(json.as_bytes())?;
