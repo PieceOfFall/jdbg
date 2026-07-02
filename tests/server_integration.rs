@@ -336,6 +336,122 @@ fn run_mcp_jsonrpc(messages: &[Value], guard: &TestDaemonGuard) -> Vec<Value> {
     responses
 }
 
+#[test]
+fn daemon_stop_exits_gracefully_after_response() {
+    let guard = TestDaemonGuard::new("daemon-stop");
+
+    let start = jdbg_command(&guard)
+        .arg("daemon")
+        .arg("start")
+        .output()
+        .expect("spawn daemon start");
+    assert!(
+        start.status.success(),
+        "daemon start failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&start.stdout),
+        String::from_utf8_lossy(&start.stderr)
+    );
+
+    let status = jdbg_command(&guard)
+        .arg("daemon")
+        .arg("status")
+        .output()
+        .expect("spawn daemon status");
+    assert!(
+        status.status.success(),
+        "daemon status failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&status.stdout),
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&status.stdout).contains("running"),
+        "daemon status should report running, got stdout:\n{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+    let daemon_pid = parse_daemon_pid(&String::from_utf8_lossy(&status.stdout));
+
+    let stop = jdbg_command(&guard)
+        .arg("daemon")
+        .arg("stop")
+        .output()
+        .expect("spawn daemon stop");
+    assert!(
+        stop.status.success(),
+        "daemon stop failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&stop.stdout).contains("Daemon stopped."),
+        "daemon stop should print confirmation, got stdout:\n{}",
+        String::from_utf8_lossy(&stop.stdout)
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while process_alive(daemon_pid) {
+        assert!(
+            Instant::now() < deadline,
+            "daemon pid {daemon_pid} still running after stop response"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn parse_daemon_pid(output: &str) -> u32 {
+    let pid = output
+        .split_whitespace()
+        .find_map(|part| part.strip_prefix("pid="))
+        .expect("daemon status should include pid=<pid>");
+    pid.parse().expect("daemon pid should be numeric")
+}
+
+#[cfg(windows)]
+fn process_alive(pid: u32) -> bool {
+    use std::ffi::c_void;
+
+    const PROCESS_QUERY_LIMITED_INFORMATION: u32 = 0x1000;
+    const STILL_ACTIVE: u32 = 259;
+
+    #[link(name = "kernel32")]
+    unsafe extern "system" {
+        fn OpenProcess(dwDesiredAccess: u32, bInheritHandle: i32, dwProcessId: u32) -> *mut c_void;
+        fn GetExitCodeProcess(hProcess: *mut c_void, lpExitCode: *mut u32) -> i32;
+        fn CloseHandle(hObject: *mut c_void) -> i32;
+    }
+
+    let handle = unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) };
+    if handle.is_null() {
+        return false;
+    }
+    let mut code = 0;
+    let ok = unsafe { GetExitCodeProcess(handle, &mut code) };
+    unsafe {
+        CloseHandle(handle);
+    }
+    ok != 0 && code == STILL_ACTIVE
+}
+
+#[cfg(unix)]
+fn process_alive(pid: u32) -> bool {
+    Command::new("kill")
+        .arg("-0")
+        .arg(pid.to_string())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn jdbg_command(guard: &TestDaemonGuard) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_jdbg"));
+    command
+        .env("USERNAME", &guard.username)
+        .env("USER", &guard.username)
+        .env("JDBG_DATA_DIR", &guard.data_dir)
+        .stdin(Stdio::null());
+    hide_console(&mut command);
+    command
+}
+
 fn mcp_response<'a>(responses: &'a [Value], id: i64) -> &'a Value {
     responses
         .iter()

@@ -10,8 +10,10 @@ pub mod manager;
 
 use std::io;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
-use interprocess::local_socket::{ListenerOptions, prelude::*};
+use interprocess::local_socket::{ListenerNonblockingMode, ListenerOptions, prelude::*};
 
 use crate::registry::{self, DaemonInfo, Registry};
 use manager::SessionManager;
@@ -59,17 +61,24 @@ pub fn run_daemon() -> anyhow::Result<()> {
     eprintln!("[daemon] listening on {sock_name} (pid={})", info.pid);
 
     let mgr = Arc::new(SessionManager::new(registry));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    listener.set_nonblocking(ListenerNonblockingMode::Accept)?;
 
-    // Accept loop: spawn one short-lived thread per connection.
-    for conn in listener.incoming() {
-        match conn {
+    // Accept loop: spawn one short-lived thread per connection, and poll a shutdown flag so
+    // `daemon stop` can return a response before the daemon exits naturally.
+    while !shutdown.load(Ordering::SeqCst) {
+        match listener.accept() {
             Ok(stream) => {
                 let mgr = Arc::clone(&mgr);
+                let shutdown = Arc::clone(&shutdown);
                 std::thread::spawn(move || {
-                    if let Err(e) = handler::handle_connection(stream, &mgr) {
+                    if let Err(e) = handler::handle_connection(stream, &mgr, &shutdown) {
                         eprintln!("[daemon] connection error: {e}");
                     }
                 });
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(25));
             }
             Err(e) => {
                 eprintln!("[daemon] accept error: {e}");
@@ -84,9 +93,11 @@ pub fn run_daemon() -> anyhow::Result<()> {
 
 /// Detached spawn helper used by the CLI to auto-start the daemon.
 ///
-/// Windows: `CREATE_NEW_PROCESS_GROUP | DETACHED_PROCESS`，stdio null。
-/// Unix: `setsid` via pre_exec，stdio null。
+/// Windows uses detached process flags and null stdio. Unix uses `setsid` in `pre_exec`.
 pub fn spawn_daemon_detached() -> io::Result<()> {
+    #[cfg(windows)]
+    detach_std_handles_from_children();
+
     let exe = std::env::current_exe()?;
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("__daemon");
@@ -103,12 +114,44 @@ pub fn spawn_daemon_detached() -> io::Result<()> {
 
     #[cfg(unix)]
     {
-        // setsid would require libc/nix (§9 excludes them). For now, stdio null plus no parent wait gives basic detach.
-        // A full controlling-terminal detach can be added here later if needed.
+        use std::os::unix::process::CommandExt;
+
+        unsafe extern "C" {
+            fn setsid() -> i32;
+        }
+
+        // SAFETY: this child hook calls only `setsid` before exec and reports OS failure directly.
+        unsafe {
+            cmd.pre_exec(|| {
+                if setsid() < 0 {
+                    Err(io::Error::last_os_error())
+                } else {
+                    Ok(())
+                }
+            });
+        }
     }
 
     cmd.spawn()?;
     Ok(())
+}
+
+#[cfg(windows)]
+fn detach_std_handles_from_children() {
+    use std::os::windows::io::AsRawHandle;
+
+    const HANDLE_FLAG_INHERIT: u32 = 0x0000_0001;
+    unsafe extern "system" {
+        fn SetHandleInformation(h: *mut std::ffi::c_void, mask: u32, flags: u32) -> i32;
+    }
+
+    let stdout = std::io::stdout();
+    let stderr = std::io::stderr();
+    for raw in [stdout.as_raw_handle(), stderr.as_raw_handle()] {
+        if !raw.is_null() {
+            unsafe { SetHandleInformation(raw as *mut std::ffi::c_void, HANDLE_FLAG_INHERIT, 0) };
+        }
+    }
 }
 
 /// Stop the daemon by connecting to the socket and sending `DaemonStop`.

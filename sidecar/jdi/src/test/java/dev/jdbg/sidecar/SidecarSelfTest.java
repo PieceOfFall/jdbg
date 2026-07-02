@@ -14,8 +14,11 @@ public final class SidecarSelfTest {
     public static void main(String[] args) throws Exception {
         testJsonRoundTripKeepsProtocolShape();
         testJsonRejectsMalformedInput();
-        testConfigParsesTokenAndProtocolVersion();
+        testConfigParsesEndpointTokenAndProtocolVersion();
+        testConfigParsesUnixDomainSocketTransport();
         testConfigRequiresToken();
+        testConfigRequiresEndpoint();
+        testConfigRejectsTcpTransport();
         testUnknownRpcMethodHasStableErrorCode();
         testValueRendererAppliesStringLimit();
         System.out.println("SidecarSelfTest passed");
@@ -50,29 +53,83 @@ public final class SidecarSelfTest {
         });
     }
 
-    private static void testConfigParsesTokenAndProtocolVersion() {
+    private static void testConfigParsesEndpointTokenAndProtocolVersion() {
         SidecarMain.Config config = SidecarMain.Config.parse(new String[] {
-                "--port", "4555",
+                "--transport", "named-pipe",
+                "--endpoint", "\\\\.\\pipe\\jdbg-jdi-test",
                 "--token", "secret-token",
                 "--protocol-version", "7"
         });
 
-        assertEquals(4555, config.port, "port");
+        assertEquals("named-pipe", config.transport, "transport");
+        assertEquals("\\\\.\\pipe\\jdbg-jdi-test", config.endpoint, "endpoint");
         assertEquals("secret-token", config.token, "token");
         assertEquals(7, config.protocolVersion, "protocol version");
+    }
+
+    private static void testConfigParsesUnixDomainSocketTransport() {
+        SidecarMain.Config config = SidecarMain.Config.parse(new String[] {
+                "--transport", "unix-domain-socket",
+                "--endpoint", "42",
+                "--token", "secret-token"
+        });
+
+        assertEquals("unix-domain-socket", config.transport, "transport");
+        assertEquals("42", config.endpoint, "endpoint");
     }
 
     private static void testConfigRequiresToken() {
         assertThrows("--token is required", new ThrowingRunnable() {
             @Override
             public void run() {
-                SidecarMain.Config.parse(new String[] {"--port", "4555"});
+                SidecarMain.Config.parse(new String[] {
+                        "--transport", "named-pipe",
+                        "--endpoint", "\\\\.\\pipe\\jdbg-jdi-test"
+                });
             }
         });
         assertThrows("--token is required", new ThrowingRunnable() {
             @Override
             public void run() {
-                SidecarMain.Config.parse(new String[] {"--port", "4555", "--token", ""});
+                SidecarMain.Config.parse(new String[] {
+                        "--transport", "named-pipe",
+                        "--endpoint", "\\\\.\\pipe\\jdbg-jdi-test",
+                        "--token", ""
+                });
+            }
+        });
+    }
+
+    private static void testConfigRequiresEndpoint() {
+        assertThrows("--endpoint is required", new ThrowingRunnable() {
+            @Override
+            public void run() {
+                SidecarMain.Config.parse(new String[] {
+                        "--transport", "named-pipe",
+                        "--token", "secret-token"
+                });
+            }
+        });
+        assertThrows("--transport is required", new ThrowingRunnable() {
+            @Override
+            public void run() {
+                SidecarMain.Config.parse(new String[] {
+                        "--endpoint", "\\\\.\\pipe\\jdbg-jdi-test",
+                        "--token", "secret-token"
+                });
+            }
+        });
+    }
+
+    private static void testConfigRejectsTcpTransport() {
+        assertThrows("unsupported --transport", new ThrowingRunnable() {
+            @Override
+            public void run() {
+                SidecarMain.Config.parse(new String[] {
+                        "--transport", "tcp",
+                        "--endpoint", "4555",
+                        "--token", "secret-token"
+                });
             }
         });
     }

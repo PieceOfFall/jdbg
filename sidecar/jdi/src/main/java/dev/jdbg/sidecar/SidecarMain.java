@@ -1,6 +1,5 @@
 package dev.jdbg.sidecar;
 
-import java.net.Socket;
 import java.util.Map;
 
 public final class SidecarMain {
@@ -12,8 +11,7 @@ public final class SidecarMain {
     public static void main(String[] args) {
         try {
             Config config = Config.parse(args);
-            try (Socket socket = new Socket("127.0.0.1", config.port);
-                 FrameConnection connection = new FrameConnection(socket)) {
+            try (FrameConnection connection = FrameConnection.connect(config)) {
                 handshake(connection, config);
                 serve(connection);
             }
@@ -78,24 +76,30 @@ public final class SidecarMain {
     }
 
     static final class Config {
-        final int port;
+        final String transport;
+        final String endpoint;
         final String token;
         final int protocolVersion;
 
-        Config(int port, String token, int protocolVersion) {
-            this.port = port;
+        Config(String transport, String endpoint, String token, int protocolVersion) {
+            this.transport = transport;
+            this.endpoint = endpoint;
             this.token = token;
             this.protocolVersion = protocolVersion;
         }
 
         static Config parse(String[] args) {
-            Integer port = null;
+            String transport = null;
+            String endpoint = null;
             String token = null;
             int protocolVersion = 1;
             for (int i = 0; i < args.length; i++) {
                 switch (args[i]) {
-                    case "--port":
-                        port = Integer.parseInt(args[++i]);
+                    case "--transport":
+                        transport = args[++i];
+                        break;
+                    case "--endpoint":
+                        endpoint = args[++i];
                         break;
                     case "--token":
                         token = args[++i];
@@ -107,13 +111,19 @@ public final class SidecarMain {
                         throw new IllegalArgumentException("unknown argument: " + args[i]);
                 }
             }
-            if (port == null) {
-                throw new IllegalArgumentException("--port is required");
+            if (transport == null || transport.isEmpty()) {
+                throw new IllegalArgumentException("--transport is required");
+            }
+            if (endpoint == null || endpoint.isEmpty()) {
+                throw new IllegalArgumentException("--endpoint is required");
             }
             if (token == null || token.isEmpty()) {
                 throw new IllegalArgumentException("--token is required");
             }
-            return new Config(port, token, protocolVersion);
+            if (!"named-pipe".equals(transport) && !"unix-domain-socket".equals(transport)) {
+                throw new IllegalArgumentException("unsupported --transport: " + transport);
+            }
+            return new Config(transport, endpoint, token, protocolVersion);
         }
     }
 }

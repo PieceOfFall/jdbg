@@ -213,15 +213,13 @@ Loaded  ──run──►  Suspended  ──cont/step/next──►  Suspended
 | 功能 | 优先级 | 说明 |
 |------|--------|------|
 | `dump` 输出解析 | 低 | 当前对复杂对象的 dump 回退为 Raw |
-| graceful daemon shutdown | 低 | 当前用 `process::exit(0)`，可改为 shutdown flag |
-| Unix setsid detach | 低 | 当前 Unix detach 只靠 stdio null（Windows 完善，Unix 最小可用） |
-| 集成测试 | 中 | 需要 JDK 的 feature-gated 集成测试（当前只有单元测试 + 手动/e2e 验证） |
 | MCP plugin 跨平台二进制名 | 中 | `plugin.json` 的 `${CLAUDE_PLUGIN_ROOT}/bin/jdbg` 在 Windows 需 `.exe`，plugin.json 无法按平台分支；打包阶段需按平台放对应二进制。开发期用 `.mcp.json` 不受影响 |
 
 ### 7.2 已完成（历史轮次）
 
 | 功能 | 说明 |
 |------|------|
+| **JDI sidecar 平台本地传输 + daemon/CI hardening** | JDI sidecar 保持 length-prefixed JSON，但底层 byte stream 已替换为平台本地传输：Windows 使用两条单向 Named Pipe，Linux/macOS 使用 AF_UNIX socketpair（child fd 继承只是 Java 8 兼容传递方式）；`daemon stop` 通过 shutdown flag 返回响应后自然退出；Unix daemon spawn 在 `pre_exec` 中调用 `setsid`；`.github/workflows/ci.yml` 在 Windows/Linux/macOS 上用 JDK 8/11/17/21 跑 `cargo test`。 |
 | **Multi-agent setup（Claude + Codex + OpenCode + Pi）** | `src/setup.rs` 新增 target registry，支持交互多选、`--target` CSV/`auto`/`all`/`none`、`--yes`、`--print`、按 target 删除。Claude 继续写 `~/.claude.json` / `~/.claude/settings.json` / `~/.claude/skills/jdbg/SKILL.md`；Codex 写 `~/.codex/config.toml` 的 `[mcp_servers.jdbg]` 和 `~/.codex/skills/jdbg/SKILL.md`；OpenCode 写 `~/.config/opencode/opencode.json` 的 `mcp.jdbg` 和 `~/.config/opencode/skills/jdbg/SKILL.md`；Pi 写 `~/.pi/agent/skills/jdbg/SKILL.md` CLI skill，不写 MCP config。`src/update.rs` 在安装新 binary 前检测已配置 jdbg targets，更新后重注册同一组；无配置时 fallback Claude。 |
 | **v0.8.0：定位线程提速 + 6 命令 + 十进制 thread id** | 真实大型 Spring Boot（Tomcat+nacos+redisson，90+ 线程）attach 调试体验增强。**① 十进制 thread id 解析**——某些 JDK 的 `threads` 输出把 id 打成纯十进制（`18315`）而非 `0x` hex，`RE_THREAD_LINE` 的 id 捕获改 `0x[0-9a-fA-F]+|\d+`（hex 分支在前避免截断），否则整段回退 Raw 透传、且 SKILL 误导加 `0x` 前缀致 jdb 拒绝。**② `Stopped`/`ExceptionCaught` 带 `thread_id`**——命中后回填命中线程 id（PartialStop 路径复用既有 `threads` 查询零开销；完整 banner 路径在 `enrich_thread_id` 跑一次 `threads` 用纯函数 `thread_id_for` 按名/at-breakpoint 反查），agent 直接拿 id 切线程，无需肉眼搜。**③ `threads { filter }`**——handler 层纯函数 `filter_threads` 按名大小写不敏感子串过滤，命中行 output 加 `*` 标记。**④ 6 新工具**：`suspend`/`resume`（单线程挂起恢复）、`set`（改变量/字段/数组元素，镜像赋值）、`ignore`（`catch` 的对称移除，复用 mode dispatch）、`lock`/`threadlocks`（锁排查）——全部 Normal + Raw 透传。30→36 工具。 |
 | **Thread 断点（native `stop thread`）** | `suspend: "thread"` → jdb 原生 `stop thread at/in`（SUSPEND_THREAD policy：仅挂起触发线程，VM 其余线程继续跑）。**关键修复：JDK 8 截断 banner**——SUSPEND_THREAD 下命中时 jdb 只写出 `"Breakpoint hit: "` 前缀（无 thread/location，无 thread-prompt，光标停此），原有 blocking 完成检测三信号全不满足 → 死等到超时。reader 用 500ms patience window 把"截断前缀 + 无后续字节"识别为 `DetectedEvent::PartialStop`；session 层随即 `threads`(找 `(at breakpoint)` 线程)→`thread <id>`(切当前线程，否则 `where` 报 No thread specified)→`where`(取栈顶帧) 补全 thread/location/frame，失败写 WARNING note 不静默。完整 banner（SUSPEND_ALL / 选中线程后的 step）仍走原 `RE_BREAKPOINT_OR_STEP`，两路径并存天然向后兼容（JDK 9+ 若写完整 banner 不受影响）。 |
@@ -248,10 +246,14 @@ Loaded  ──run──►  Suspended  ──cont/step/next──►  Suspended
 | directories | 6 | 平台数据目录定位 |
 | rand | 0.9 | 生成 session ID |
 | jiff | 0.2 | 时间戳 |
+| rmcp | 2 | MCP stdio server/tool serving |
+| tokio | 1 | `rmcp` runtime island；后续 JDI 本地传输/进程生命周期可复用窄特性 |
 
-> MCP server / setup **零新增依赖**：MCP 手写 JSON-RPC（serde_json）、Windows 句柄修复用 `std` 裸 FFI
->（kernel32 `SetHandleInformation`，无 windows/winapi crate）；setup 的 Codex TOML 使用窄范围文本 upsert/remove，OpenCode JSON 使用 `serde_json` upsert/remove。
-> 刻意排除 `rmcp`（会引入 tokio）、`tokio`、`once_cell`、`nix`、`daemonize`、ConPTY、TCP/RPC 框架。
+> MCP server 已迁移到 `rmcp`，但仍只作为 `jdbg __mcp` 的 stdio protocol/tool serving 层；
+> daemon IPC、debugger backend RPC、registry、setup/update 继续保持窄依赖和现有边界。
+> Windows 句柄修复仍用 `std` 裸 FFI（kernel32 `SetHandleInformation`，无 windows/winapi crate）。
+> setup 的 Codex TOML 使用窄范围文本 upsert/remove，OpenCode JSON 使用 `serde_json` upsert/remove。
+> JDI sidecar 的消息协议固定为 length-prefixed JSON；gRPC、protobuf、direct Rust JDWP 是非目标。
 
 ## 9. 构建与运行
 
@@ -339,7 +341,7 @@ This branch now keeps the existing prompt-aware `jdb` backend as the compatibili
 - `jdbg __mcp` is served through `rmcp` over stdio while preserving the same 36 tool names and routing every tool call through `client::send_request` plus `output::render`.
 - Session creation accepts `backend: jdb|jdi` on both CLI and MCP. `jdb` remains the default and supports the full command surface. `jdi` currently supports attach, threads, line breakpoints, field watchpoints, cont, next, where, locals, thread selection, and safe JSON inspect. Unsupported JDI commands return explicit backend errors.
 - `SessionManager` stores backend-neutral `DebugSession` handles. The existing `Session` type still owns only the `jdb` process/reader state; JDI state lives under `src/jdi/`.
-- The JDI sidecar protocol is length-prefixed JSON over localhost TCP. Rust owns sidecar lifecycle, auth token, handshake, request/response correlation, event queueing, and no-window process launch on Windows.
+- The JDI sidecar message protocol is length-prefixed JSON over platform-local transport: two one-way Named Pipes on Windows, or an AF_UNIX socketpair on Linux/macOS. The Unix child fd is inherited only because Java 8 has no pathname UDS client API. Rust owns sidecar lifecycle, auth token, handshake, request/response correlation, event queueing, and no-window process launch on Windows. gRPC, protobuf, and direct Rust JDWP are not planned.
 - JDI session state is refreshed on every status/command path. A target `vmDisconnected` event marks the session `Exited`; if the sidecar process exits unexpectedly while the daemon still has the session handle, the session is marked `Dead` and `status` reports `jdb_alive=false`. Follow-up commands return explicit sidecar/session failures; they never fall back to `jdb`.
 - The Java sidecar source lives under `sidecar/jdi/src/main/java/dev/jdbg/sidecar/` and uses only JDK/JDI APIs. `build.rs` compiles `jdbg-jdi-sidecar.jar` next to the `jdbg` binary when `javac` and `jar` are available.
 - Automated fixture coverage includes JDI target exit, detach/kill, step-over stack/locals, sidecar-process death, JDI watch/unwatch flows, MCP JDI smoke tests, advanced collection/map inspect coverage, and Java sidecar self-tests for JSON/config/RPC/value limits.

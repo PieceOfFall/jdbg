@@ -222,6 +222,7 @@ impl SessionManager {
         for session in map.values() {
             let _ = session.kill();
         }
+        self.registry.remove_daemon();
     }
 
     /// Persist the current session snapshot to sessions.json.

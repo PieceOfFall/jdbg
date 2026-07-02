@@ -5,6 +5,7 @@
 
 pub mod codec;
 pub mod lifecycle;
+pub mod local;
 pub mod protocol;
 pub mod session;
 pub mod transport;

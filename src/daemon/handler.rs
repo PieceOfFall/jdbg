@@ -2,6 +2,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use interprocess::local_socket::Stream;
 
@@ -14,7 +15,11 @@ use crate::protocol::*;
 use crate::session::{CommandKind, Session};
 
 /// Handle one connection: one request → one response.
-pub fn handle_connection(stream: Stream, mgr: &Arc<SessionManager>) -> anyhow::Result<()> {
+pub fn handle_connection(
+    stream: Stream,
+    mgr: &Arc<SessionManager>,
+    shutdown: &Arc<AtomicBool>,
+) -> anyhow::Result<()> {
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();
     reader.read_line(&mut line)?;
@@ -32,13 +37,13 @@ pub fn handle_connection(stream: Stream, mgr: &Arc<SessionManager>) -> anyhow::R
         }
     };
 
-    let resp = dispatch(&req, mgr);
+    let resp = dispatch(&req, mgr, shutdown);
     write_response(&stream, &resp)?;
     Ok(())
 }
 
 /// Route a command to concrete handling logic.
-fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
+fn dispatch(req: &Request, mgr: &Arc<SessionManager>, shutdown: &AtomicBool) -> Response {
     let id = &req.id;
     match &req.cmd {
         // ── Session lifecycle ──
@@ -189,26 +194,7 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
                 },
             )
         }
-        Command::DaemonStop => {
-            // Respond ok first, then the daemon exits after this connection closes.
-            let result = CommandResult::Raw {
-                text: "daemon stopping".into(),
-            };
-            let resp = Response::ok(
-                id,
-                CommandResponse {
-                    result,
-                    stderr: None,
-                    note: None,
-                },
-            );
-            // Exit after flushing the response. Crude but effective; can later become a graceful shutdown flag.
-            std::thread::spawn(|| {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                std::process::exit(0);
-            });
-            resp
-        }
+        Command::DaemonStop => daemon_stop_response(id, shutdown),
 
         // ── All session-bound commands ──
         _ => dispatch_session_cmd(req, mgr),
@@ -226,6 +212,20 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
         DebugSession::Jdb(session) => dispatch_jdb_session_cmd(req, session),
         DebugSession::Jdi(session) => dispatch_jdi_session_cmd(req, session),
     }
+}
+
+fn daemon_stop_response(id: &str, shutdown: &AtomicBool) -> Response {
+    shutdown.store(true, Ordering::SeqCst);
+    Response::ok(
+        id,
+        CommandResponse {
+            result: CommandResult::Raw {
+                text: "daemon stopping".into(),
+            },
+            stderr: None,
+            note: None,
+        },
+    )
 }
 
 fn dispatch_jdb_session_cmd(req: &Request, session: Arc<Session>) -> Response {
@@ -1142,6 +1142,7 @@ fn needs_string_quoting(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn ti(id: &str, name: &str, state: &str) -> ThreadInfo {
         ThreadInfo {
@@ -1150,6 +1151,16 @@ mod tests {
             group: None,
             state: state.into(),
         }
+    }
+
+    #[test]
+    fn daemon_stop_response_sets_shutdown_flag() {
+        let shutdown = AtomicBool::new(false);
+
+        let resp = daemon_stop_response("r1", &shutdown);
+
+        assert!(resp.ok);
+        assert!(shutdown.load(Ordering::SeqCst));
     }
 
     #[test]

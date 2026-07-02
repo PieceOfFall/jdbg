@@ -44,7 +44,8 @@ tool mapping, session registry, output rendering, and setup/update integration.
 The Java sidecar owns JDI/JDWP semantics: attach, events, breakpoints, thread and
 stack state, locals, value serialization, and structured object inspection.
 
-The JDI backend should communicate with the sidecar over length-prefixed JSON:
+The JDI backend communicates with the sidecar over length-prefixed JSON. This
+message format is the settled protocol and applies to every transport:
 
 ```text
 [4-byte big-endian length][UTF-8 JSON payload]
@@ -60,13 +61,22 @@ Message classes:
 Responses must be correlated by request id. Events may arrive between responses and
 must be queued for the owning session.
 
+The sidecar transport direction is platform-local:
+
+- Linux/macOS: Rust <-> AF_UNIX socketpair <-> Java sidecar;
+- Windows: Rust <-> two one-way Named Pipes <-> Java sidecar.
+
+Do not add gRPC, protobuf, direct Rust JDWP, or any broad RPC framework for the
+sidecar path. Future transport work must preserve the length-prefixed JSON frames
+and the existing request/response/event/heartbeat message classes.
+
 ## Engineering Guardrails
 
 Tokio is approved only for bounded async islands where it improves robustness and
 maintainability:
 
 - `rmcp`-based MCP protocol/tool serving behind `jdbg __mcp` stdio;
-- JDI localhost TCP transport;
+- JDI platform-local transport;
 - framed reads and writes;
 - request/response correlation;
 - event queues;
@@ -82,13 +92,17 @@ Keep dependencies narrow:
 - add `rmcp` only for MCP protocol/tool serving, not daemon IPC or debugger backend RPC;
 - add `tokio` with only the features needed by `rmcp` MCP serving and JDI transport/process work;
 - consider `tokio-util` only if the framed codec materially benefits from it;
-- do not add gRPC, protobuf, direct Rust JDWP, or broad RPC frameworks unless separately approved.
+- do not add gRPC, protobuf, direct Rust JDWP, or broad RPC frameworks.
 
-For MVP startup, prefer Rust-owned localhost TCP:
+The implementation keeps Rust-owned lifecycle and replaces the byte stream beneath
+the frame codec with platform-local transport:
 
-1. Rust binds `127.0.0.1:0`.
+1. Rust creates the platform-local endpoint: two one-way Named Pipes on Windows,
+   or an AF_UNIX socketpair on Linux/macOS. The child-side fd is inherited by the
+   Java 8 sidecar because Java 8 has no pathname UDS client API.
 2. Rust generates a per-sidecar auth token.
-3. Rust launches `jdbg-jdi-sidecar.jar` with the chosen port and token.
+3. Rust launches `jdbg-jdi-sidecar.jar` with the chosen endpoint, token, and
+   protocol version.
 4. The sidecar connects back to Rust.
 5. Rust accepts the connection and performs handshake.
 
@@ -154,6 +168,8 @@ Scope:
 
 - frame codec with max frame size;
 - JSON request, response, event, heartbeat, and error payloads;
+- transport adapter over an AF_UNIX socketpair on Linux/macOS and two one-way
+  Named Pipes on Windows, with the same framed JSON payloads on both platforms;
 - handshake with protocol version, server version, capabilities, and auth token;
 - ping and shutdown methods;
 - request timeouts;
@@ -174,14 +190,15 @@ Add a Java sidecar process lifecycle managed by Rust.
 Scope:
 
 - package or locate `jdbg-jdi-sidecar.jar`;
-- launch the sidecar with port, token, and protocol version arguments;
+- launch the sidecar with endpoint, token, and protocol version arguments;
 - supervise process exit and mark affected sessions disconnected;
 - keep sidecar stderr/logs separate from protocol messages;
 - cleanly detach or shut down sidecar sessions.
 
 Acceptance:
 
-- Rust can launch, handshake, ping, and shut down the sidecar on Windows;
+- Rust can launch, handshake, ping, and shut down the sidecar on Windows and
+  Unix-like platforms;
 - sidecar crash or disconnect produces a structured session-level failure;
 - sidecar auth token is never printed in normal logs.
 
@@ -320,9 +337,11 @@ This section tracks the current branch state against the roadmap above.
   request/response/event/heartbeat protocol types, handshake validation, auth token
   checks, request timeouts, response id matching, and interleaved event queuing.
 - Milestone 4, sidecar lifecycle: `build.rs` packages `jdbg-jdi-sidecar.jar`;
-  Rust launches the Java sidecar over localhost TCP with a per-process token,
-  keeps stdout out of protocol traffic, captures stderr separately, uses no-window
-  process launch on Windows, and shuts the sidecar down with the session.
+  Rust launches the Java sidecar over platform-local transport with a per-process
+  token, keeps stdout out of protocol traffic, captures stderr separately, uses
+  no-window process launch on Windows, and shuts the sidecar down with the
+  session. Windows uses two one-way Named Pipes; Linux/macOS use an AF_UNIX
+  socketpair.
 - Milestone 5, JDI attach MVP: `jdbg attach --backend jdi` can attach to a JDWP
   target, detach, list threads, read stacks, and surface VM-disconnect events into
   session state.
@@ -366,14 +385,18 @@ This section tracks the current branch state against the roadmap above.
 - Unexpected sidecar process exit while the Rust daemon still holds a JDI session
   now marks the session `Dead`; `status` reports `jdb_alive=false` and follow-up
   operations fail explicitly instead of falling back to `jdb`.
+- `daemon stop` now returns a response before exiting through a daemon-local
+  shutdown flag, and startup detaches cleanly on Unix via `setsid` while Windows
+  clears inherited stdout/stderr handles before spawning the background daemon.
+- CI now runs `cargo test` on Windows, Linux, and macOS across JDK 8, 11, 17,
+  and 21.
 - Structured inspect covers common `ArrayList`, `LinkedList`, `ArrayDeque`,
   `HashSet`, `LinkedHashSet`, `TreeMap`, `TreeSet`, `HashMap`, `LinkedHashMap`,
   and unmodifiable collection/map layouts without getter invocation.
 
 ### Pending MVP Follow-Ups
 
-No pending MVP follow-ups remain in this roadmap. Future work is tracked under
-Deferred Work below.
+No pending MVP follow-ups remain in this roadmap. Post-MVP work is tracked below.
 
 ## Test Strategy
 
@@ -426,17 +449,19 @@ CLI/MCP end-to-end tests should prove:
 - implemented JDI commands work through the same public tools;
 - unsupported JDI commands fail explicitly rather than falling back silently.
 
-## Deferred Work
+## Post-MVP Work
 
-The following are intentionally out of MVP scope:
+The following are intentionally out of MVP scope but remain valid future work:
 
 - JDI launch mode;
 - setValue;
 - method invocation;
 - force return;
 - method entry/exit events;
-- UDS and Named Pipe transport;
 - multi-client sidecar support;
+
+The following are closed non-goals for this roadmap:
+
 - protobuf;
 - gRPC;
 - direct Rust JDWP;

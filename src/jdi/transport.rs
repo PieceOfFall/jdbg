@@ -2,7 +2,10 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
+#[cfg(test)]
 use std::net::TcpStream;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::{Arc, Mutex};
@@ -15,6 +18,86 @@ use crate::jdi::codec::{DEFAULT_MAX_FRAME_SIZE, FrameError, encode_frame};
 use crate::jdi::protocol::{SidecarErrorPayload, SidecarMessage};
 
 type PendingMap = Arc<Mutex<HashMap<String, Sender<SidecarResponse>>>>;
+
+pub enum SidecarStream {
+    #[cfg(test)]
+    Tcp(TcpStream),
+    #[cfg(unix)]
+    Unix(UnixStream),
+    #[cfg(windows)]
+    FilePair {
+        reader: std::fs::File,
+        writer: std::fs::File,
+    },
+}
+
+impl SidecarStream {
+    #[cfg(test)]
+    fn tcp_for_tests(stream: TcpStream) -> Self {
+        Self::Tcp(stream)
+    }
+
+    #[cfg(unix)]
+    pub(crate) fn unix(stream: UnixStream) -> Self {
+        Self::Unix(stream)
+    }
+
+    #[cfg(windows)]
+    pub(crate) fn file_pair(reader: std::fs::File, writer: std::fs::File) -> Self {
+        Self::FilePair { reader, writer }
+    }
+
+    pub(crate) fn try_clone(&self) -> std::io::Result<Self> {
+        match self {
+            #[cfg(test)]
+            Self::Tcp(stream) => Ok(Self::Tcp(stream.try_clone()?)),
+            #[cfg(unix)]
+            Self::Unix(stream) => Ok(Self::Unix(stream.try_clone()?)),
+            #[cfg(windows)]
+            Self::FilePair { reader, writer } => Ok(Self::FilePair {
+                reader: reader.try_clone()?,
+                writer: writer.try_clone()?,
+            }),
+        }
+    }
+}
+
+impl Read for SidecarStream {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            #[cfg(test)]
+            Self::Tcp(stream) => stream.read(buf),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.read(buf),
+            #[cfg(windows)]
+            Self::FilePair { reader, .. } => reader.read(buf),
+        }
+    }
+}
+
+impl Write for SidecarStream {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self {
+            #[cfg(test)]
+            Self::Tcp(stream) => stream.write(buf),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.write(buf),
+            #[cfg(windows)]
+            Self::FilePair { writer, .. } => writer.write(buf),
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        match self {
+            #[cfg(test)]
+            Self::Tcp(stream) => stream.flush(),
+            #[cfg(unix)]
+            Self::Unix(stream) => stream.flush(),
+            #[cfg(windows)]
+            Self::FilePair { writer, .. } => writer.flush(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SidecarEvent {
@@ -49,7 +132,7 @@ pub enum SidecarTransportError {
 
 /// A connected sidecar transport.
 pub struct SidecarTransport {
-    writer: Mutex<TcpStream>,
+    writer: Mutex<SidecarStream>,
     pending: PendingMap,
     events: Arc<Mutex<VecDeque<SidecarEvent>>>,
     ids: AtomicU64,
@@ -57,7 +140,7 @@ pub struct SidecarTransport {
 }
 
 impl SidecarTransport {
-    pub fn start(stream: TcpStream) -> std::io::Result<Self> {
+    pub fn start(stream: SidecarStream) -> std::io::Result<Self> {
         let reader_stream = stream.try_clone()?;
         let pending = Arc::new(Mutex::new(HashMap::new()));
         let events = Arc::new(Mutex::new(VecDeque::new()));
@@ -127,12 +210,12 @@ impl SidecarTransport {
 
     fn write_message(&self, msg: &SidecarMessage) -> Result<(), SidecarTransportError> {
         let mut writer = self.writer.lock().expect("writer mutex poisoned");
-        write_framed_message(&mut writer, msg)
+        write_framed_message(&mut *writer, msg)
     }
 }
 
 fn spawn_reader(
-    mut stream: TcpStream,
+    mut stream: SidecarStream,
     pending: PendingMap,
     events: Arc<Mutex<VecDeque<SidecarEvent>>>,
 ) -> JoinHandle<()> {
@@ -144,7 +227,7 @@ fn spawn_reader(
 }
 
 pub(crate) fn read_framed_message(
-    stream: &mut TcpStream,
+    stream: &mut impl Read,
 ) -> Result<SidecarMessage, SidecarTransportError> {
     let mut header = [0; 4];
     stream.read_exact(&mut header)?;
@@ -162,7 +245,7 @@ pub(crate) fn read_framed_message(
 }
 
 pub(crate) fn write_framed_message(
-    stream: &mut TcpStream,
+    stream: &mut impl Write,
     msg: &SidecarMessage,
 ) -> Result<(), SidecarTransportError> {
     let body = serde_json::to_vec(msg)?;
@@ -248,7 +331,7 @@ mod tests {
                 },
             );
         });
-        let client = SidecarTransport::start(client_stream).unwrap();
+        let client = SidecarTransport::start(SidecarStream::tcp_for_tests(client_stream)).unwrap();
 
         let result = client
             .request("ping", json!({}), Duration::from_secs(1))
@@ -283,7 +366,7 @@ mod tests {
                 },
             );
         });
-        let client = SidecarTransport::start(client_stream).unwrap();
+        let client = SidecarTransport::start(SidecarStream::tcp_for_tests(client_stream)).unwrap();
 
         let result = client
             .request("ping", json!({}), Duration::from_secs(1))
@@ -314,7 +397,7 @@ mod tests {
                 },
             );
         });
-        let client = SidecarTransport::start(client_stream).unwrap();
+        let client = SidecarTransport::start(SidecarStream::tcp_for_tests(client_stream)).unwrap();
 
         assert!(matches!(
             client.request("slow", json!({}), Duration::from_millis(20)),

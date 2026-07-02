@@ -1,10 +1,9 @@
 //! Java sidecar process lifecycle helpers.
 
 use std::io::{BufRead, BufReader};
-use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -12,14 +11,31 @@ use rand::Rng;
 use serde_json::json;
 
 use crate::error::{Error, Result};
+use crate::jdi::local::PendingSidecarConnection;
 use crate::jdi::protocol::{
     HandshakeRequest, SIDECAR_PROTOCOL_VERSION, SidecarMessage, validate_handshake,
 };
 use crate::jdi::transport::{
-    SidecarTransport, SidecarTransportError, read_framed_message, write_framed_message,
+    SidecarStream, SidecarTransport, SidecarTransportError, read_framed_message,
+    write_framed_message,
 };
 
 pub const SIDECAR_JAR_NAME: &str = "jdbg-jdi-sidecar.jar";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidecarEndpoint {
+    pub transport: String,
+    pub endpoint: String,
+}
+
+impl SidecarEndpoint {
+    pub fn new(transport: impl Into<String>, endpoint: impl Into<String>) -> Self {
+        Self {
+            transport: transport.into(),
+            endpoint: endpoint.into(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidecarPaths {
@@ -135,11 +151,10 @@ pub fn launch_sidecar(paths: SidecarPaths, timeout: Duration) -> Result<Launched
         )));
     }
 
-    let listener = TcpListener::bind("127.0.0.1:0")?;
-    listener.set_nonblocking(true)?;
-    let port = listener.local_addr()?.port();
     let token = generate_auth_token();
-    let args = sidecar_args(port, &token, SIDECAR_PROTOCOL_VERSION);
+    let pending_connection = PendingSidecarConnection::new(&token[..8])?;
+    let endpoint = pending_connection.endpoint();
+    let args = sidecar_args(endpoint, &token, SIDECAR_PROTOCOL_VERSION);
     let java_args = sidecar_java_args(&paths.jar_path, paths.tools_jar.as_deref(), &args);
 
     let mut command = Command::new(&paths.java_path);
@@ -161,7 +176,7 @@ pub fn launch_sidecar(paths: SidecarPaths, timeout: Duration) -> Result<Launched
     let stderr = child.stderr.take().expect("stderr piped");
     let (stderr, stderr_handle) = spawn_stderr_drain(stderr);
 
-    let mut stream = match accept_sidecar(&listener, &mut child, &stderr, timeout) {
+    let mut stream = match accept_sidecar(pending_connection, &mut child, &stderr, timeout) {
         Ok(stream) => stream,
         Err(e) => {
             let _ = child.kill();
@@ -187,10 +202,12 @@ pub fn launch_sidecar(paths: SidecarPaths, timeout: Duration) -> Result<Launched
     })
 }
 
-pub fn sidecar_args(port: u16, token: &str, protocol_version: u32) -> Vec<String> {
+pub fn sidecar_args(endpoint: SidecarEndpoint, token: &str, protocol_version: u32) -> Vec<String> {
     vec![
-        "--port".into(),
-        port.to_string(),
+        "--transport".into(),
+        endpoint.transport,
+        "--endpoint".into(),
+        endpoint.endpoint,
         "--token".into(),
         token.into(),
         "--protocol-version".into(),
@@ -204,6 +221,11 @@ pub fn sidecar_java_args(
     sidecar_args: &[String],
 ) -> Vec<String> {
     let mut args = Vec::new();
+    #[cfg(unix)]
+    {
+        args.push("-XX:+IgnoreUnrecognizedVMOptions".into());
+        args.push("--add-opens=java.base/java.io=ALL-UNNAMED".into());
+    }
     if let Some(tools_jar) = tools_jar {
         args.push("-cp".into());
         args.push(format!(
@@ -239,23 +261,32 @@ pub fn redact_sidecar_args(args: &[String]) -> Vec<String> {
 }
 
 fn accept_sidecar(
-    listener: &TcpListener,
+    pending_connection: PendingSidecarConnection,
     child: &mut Child,
     stderr: &Arc<Mutex<String>>,
     timeout: Duration,
-) -> Result<TcpStream> {
+) -> Result<SidecarStream> {
     let deadline = Instant::now() + timeout;
+    let endpoint = pending_connection.endpoint();
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(pending_connection.accept());
+    });
+
     loop {
-        match listener.accept() {
-            Ok((stream, _)) => {
-                stream.set_nonblocking(false)?;
-                return Ok(stream);
+        match rx.recv_timeout(Duration::from_millis(10)) {
+            Ok(Ok(stream)) => return Ok(stream),
+            Ok(Err(e)) => return Err(e.into()),
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(Error::Connection(
+                    "JDI sidecar local transport accept thread disconnected".into(),
+                ));
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
-            Err(e) => return Err(e.into()),
         }
 
         if let Some(status) = child.try_wait()? {
+            nudge_accept(&endpoint);
             let detail = take_stderr(stderr).unwrap_or_else(|| "no sidecar stderr".into());
             return Err(Error::Connection(format!(
                 "JDI sidecar exited before connecting back (status {status}): {}",
@@ -263,23 +294,21 @@ fn accept_sidecar(
             )));
         }
         if Instant::now() >= deadline {
+            nudge_accept(&endpoint);
             let detail = take_stderr(stderr).unwrap_or_else(|| "no sidecar stderr".into());
             return Err(Error::Connection(format!(
                 "timed out waiting for JDI sidecar connection: {}",
                 detail.trim()
             )));
         }
-        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
 fn complete_handshake(
-    stream: &mut TcpStream,
+    stream: &mut SidecarStream,
     token: &str,
-    timeout: Duration,
+    _timeout: Duration,
 ) -> Result<SidecarTransport> {
-    stream.set_read_timeout(Some(timeout))?;
-    stream.set_write_timeout(Some(timeout))?;
     let msg = read_framed_message(stream).map_err(sidecar_transport_error)?;
     let SidecarMessage::Request { id, method, params } = msg else {
         return Err(Error::Connection(
@@ -304,10 +333,22 @@ fn complete_handshake(
         },
     )
     .map_err(sidecar_transport_error)?;
-    stream.set_read_timeout(None)?;
-    stream.set_write_timeout(None)?;
     SidecarTransport::start(stream.try_clone()?).map_err(|e| Error::Connection(e.to_string()))
 }
+
+#[cfg(windows)]
+fn nudge_accept(endpoint: &SidecarEndpoint) {
+    if endpoint.transport == "named-pipe" {
+        let _ = std::fs::File::open(format!("{}-to-sidecar", endpoint.endpoint));
+        let _ = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(format!("{}-from-sidecar", endpoint.endpoint));
+    }
+}
+
+#[cfg(not(windows))]
+fn nudge_accept(_endpoint: &SidecarEndpoint) {}
 
 fn sidecar_transport_error(e: SidecarTransportError) -> Error {
     Error::Connection(e.to_string())
@@ -372,14 +413,20 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn launch_args_include_protocol_port_and_token() {
-        let args = sidecar_args(4444, "secret-token", 1);
+    fn launch_args_include_transport_endpoint_protocol_and_token() {
+        let args = sidecar_args(
+            SidecarEndpoint::new("named-pipe", r"\\.\pipe\jdbg-jdi-test"),
+            "secret-token",
+            1,
+        );
 
         assert_eq!(
             args,
             vec![
-                "--port",
-                "4444",
+                "--transport",
+                "named-pipe",
+                "--endpoint",
+                r"\\.\pipe\jdbg-jdi-test",
                 "--token",
                 "secret-token",
                 "--protocol-version",
@@ -393,26 +440,36 @@ mod tests {
         let args = sidecar_java_args(
             Path::new("jdbg-jdi-sidecar.jar"),
             Some(Path::new("tools.jar")),
-            &sidecar_args(4444, "secret-token", 1),
+            &sidecar_args(
+                SidecarEndpoint::new("named-pipe", "pipe-name"),
+                "secret-token",
+                1,
+            ),
         );
 
-        assert_eq!(args[0], "-cp");
-        assert!(args[1].contains("jdbg-jdi-sidecar.jar"));
-        assert!(args[1].contains("tools.jar"));
-        assert_eq!(args[2], "dev.jdbg.sidecar.SidecarMain");
+        let cp_index = args.iter().position(|arg| arg == "-cp").unwrap();
+        assert!(args[cp_index + 1].contains("jdbg-jdi-sidecar.jar"));
+        assert!(args[cp_index + 1].contains("tools.jar"));
+        assert_eq!(args[cp_index + 2], "dev.jdbg.sidecar.SidecarMain");
     }
 
     #[test]
     fn redacted_args_never_print_auth_token() {
-        let args = sidecar_args(4444, "secret-token", 1);
+        let args = sidecar_args(
+            SidecarEndpoint::new("named-pipe", "pipe-name"),
+            "secret-token",
+            1,
+        );
 
         let redacted = redact_sidecar_args(&args);
 
         assert_eq!(
             redacted,
             vec![
-                "--port",
-                "4444",
+                "--transport",
+                "named-pipe",
+                "--endpoint",
+                "pipe-name",
                 "--token",
                 "<redacted>",
                 "--protocol-version",

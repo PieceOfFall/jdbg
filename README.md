@@ -374,6 +374,11 @@ for structured runtime data; it supports `attach`, `threads`, line `break-at`, `
 `thread`, `watch`, `unwatch`, and safe JSON `inspect`. Unsupported JDI commands fail explicitly instead of
 falling back to `jdb`.
 
+The JDI sidecar message protocol is length-prefixed JSON over platform-local byte streams: two one-way
+Named Pipes on Windows, or an AF_UNIX socketpair on Linux/macOS. The Unix socket is handed to the Java 8
+sidecar as an inherited fd because Java 8 has no pathname UDS client API. gRPC, protobuf, and direct Rust
+JDWP are not part of the roadmap.
+
 ## Architecture
 
 Two clients feed one daemon. The daemon owns live backend sessions and the in-memory session map.
@@ -391,7 +396,7 @@ flowchart LR
     CLI --> Daemon
     MCP --> Daemon
     Daemon --> JdbA --> JvmA
-    Daemon --> Jdi --> JvmB
+    Daemon -->|length-prefixed JSON| Jdi --> JvmB
 ```
 
 The internal dependency direction stays simple:
