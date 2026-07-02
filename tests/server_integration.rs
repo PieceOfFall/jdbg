@@ -93,6 +93,11 @@ fn compile_java_fixture(source_name: &str) {
     let mut command = Command::new(javac_path());
     command
         .arg("-g")
+        .arg("-Xlint:-options")
+        .arg("-source")
+        .arg("8")
+        .arg("-target")
+        .arg("8")
         .arg("-d")
         .arg(&dir)
         .arg(dir.join(source_name));
