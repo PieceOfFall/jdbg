@@ -2,20 +2,23 @@
 
 This roadmap captures the follow-up direction for this branch after the exploratory
 `PLAN.md`: keep the existing prompt-aware `jdb` backend stable, migrate the MCP
-server to `rmcp` for maintainability and call robustness, then add a Java JDI
+server to `rmcp` for maintainability and call robustness, and add a Java JDI
 sidecar backend that can return richer structured runtime facts to the same CLI and
-MCP surfaces.
+MCP surfaces. The MVP and the first executable JDI post-MVP batch are now
+implemented; remaining work is tracked at the end.
 
 This is a roadmap, not a detailed implementation plan. Each milestone below should
 be expanded into a focused PLAN before implementation.
 
 ## Current Baseline
 
-`jdbg` is currently a Rust CLI/MCP/daemon that wraps the JDK's `jdb` through piped
-stdio. The daemon owns long-lived sessions, the CLI and MCP server both talk to the
-daemon through the existing JSONL IPC protocol, and `src/session.rs` owns the
-prompt-aware `jdb` child process plus reader state. The current MCP server is a
-thin daemon client and remains reachable as `jdbg __mcp` over stdio.
+`jdbg` is currently a Rust CLI/MCP/daemon with two debugger backends. The default
+compatibility path wraps the JDK's `jdb` through piped stdio. The optional JDI path
+attaches through a local Java sidecar and supports structured stop state, safe
+inspect, executable expression evaluation, mutation, watchpoints, and non-void
+force return. The daemon owns long-lived sessions, the CLI and MCP server both talk
+to the daemon through the existing JSONL IPC protocol, and the MCP server remains a
+thin daemon client reachable as `jdbg __mcp` over stdio.
 
 The existing `jdb` path remains the compatibility baseline:
 
@@ -23,7 +26,7 @@ The existing `jdb` path remains the compatibility baseline:
 - keep prompt-aware reads, timeout buffer cleanup, normal-command purge, and
   one in-flight command per session;
 - keep raw `jdb` as an escape hatch for commands that are not yet modeled;
-- keep the current CLI and MCP behavior green while the JDI backend is introduced.
+- keep the current CLI and MCP behavior green as the JDI backend expands.
 
 ## Target Architecture
 
@@ -42,7 +45,8 @@ The Rust daemon remains responsible for the user-facing workflow: CLI parsing, M
 tool mapping, session registry, output rendering, and setup/update integration.
 
 The Java sidecar owns JDI/JDWP semantics: attach, events, breakpoints, thread and
-stack state, locals, value serialization, and structured object inspection.
+stack state, locals, value serialization, structured object inspection, expression
+evaluation, state mutation, and force return.
 
 The JDI backend communicates with the sidecar over length-prefixed JSON. This
 message format is the settled protocol and applies to every transport:
@@ -213,8 +217,8 @@ Scope:
 - list threads;
 - read stack frames;
 - report `vmDisconnected` events;
-- initially require JDK 9+ for the sidecar runtime while allowing the target JVM to
-  be JDK 8+.
+- keep sidecar bytecode/runtime compatible with JDK 8+ targets while source builds
+  use JDK 17+ to run Gradle packaging.
 
 Acceptance:
 
@@ -297,12 +301,39 @@ Scope:
 Acceptance:
 
 - default `jdbg attach` still uses `jdb`;
-- `jdbg attach --backend jdi` creates a JDI session once implemented;
+- `jdbg attach --backend jdi` creates a JDI session;
 - MCP `attach` can create a JDI session through an optional `backend` parameter;
 - subsequent commands route by session backend;
 - current `jdb` tests and MCP tool mapping tests remain green.
 
-### 9. Release Readiness
+### 9. Executable JDI Expressions And Mutation
+
+Add the explicit side-effecting JDI capabilities while keeping `inspect` safe.
+
+Scope:
+
+- parse Java expressions in the sidecar with JavaParser and evaluate against the
+  current suspended JDI frame;
+- route JDI `print`, `eval`, and `dump` through `evaluateExpression`;
+- support instance/static method invocation, local/field/array access, primitive
+  operators, casts, and overload resolution where the sidecar evaluator supports it;
+- route `set` through sidecar `setValue` so locals, fields, and array elements can
+  be assigned;
+- add CLI `force-return <value>` and MCP `force_return { value }`, implemented with
+  `ThreadReference.forceEarlyReturn`;
+- reject running/dead/exited sessions and unsupported void force return clearly.
+
+Acceptance:
+
+- expression integration covers local arithmetic, instance methods, static methods,
+  arrays, casts, and overloaded calls;
+- `set` integration mutates locals, fields, and array elements and verifies the
+  changed state through follow-up public commands;
+- `force-return` replaces the current non-void return value and the caller observes
+  the replacement;
+- `inspect` remains field-reading only and does not invoke getters.
+
+### 10. Release Readiness
 
 Update project-facing docs and release metadata once public behavior changes.
 
@@ -357,20 +388,22 @@ This section tracks the current branch state against the roadmap above.
   backend; JDI supports `break-at`, `watch`, `unwatch`, `cont`, `next`, `where`,
   `locals`, `threads`, `thread`, `inspect`, expression `print`/`eval`/`dump`,
   `set`, and non-void `force-return`.
-- Milestone 10, executable JDI expressions and mutation: the sidecar Gradle fat jar
+- Milestone 9, executable JDI expressions and mutation: the sidecar Gradle fat jar
   bundles JavaParser, parses Java expressions in the sidecar, evaluates them against
   the suspended JDI frame/object graph, supports instance/static method invocation,
   local/field/array reads, primitive operators, casts, `setValue`, and
   `ThreadReference.forceEarlyReturn` for non-void returns. Safe `inspect` remains
   field-reading only and does not invoke getters.
-- Milestone 9, release readiness: `README.md`, `DESIGN.md`, both installed skills,
+- Milestone 10, release readiness: `README.md`, `DESIGN.md`, both installed skills,
   and `Cargo.toml` metadata have been updated for the public JDI/rmcp behavior.
 - Setup integration beyond the original roadmap: `jdbg setup` can record an
   installed-skill backend preference through interactive TUI selection or
   `--backend jdb|jdi`; `jdbg update` preserves that preference when re-registering
   agents.
-- JDK 8 sidecar compatibility: the sidecar source/build path is JDK 8 compatible
-  when `tools.jar` is available, while still working on newer JDKs.
+- JDK 8 sidecar compatibility: the sidecar source and bytecode target remain Java 8
+  compatible, runtime adds `tools.jar` on JDK 8 when needed, and source builds use
+  a JDK 17+ Gradle JVM via `JDBG_GRADLE_JAVA_HOME` when the debug target JVM is
+  older.
 
 ### Implemented Hardening
 
@@ -398,7 +431,7 @@ This section tracks the current branch state against the roadmap above.
   shutdown flag, and startup detaches cleanly on Unix via `setsid` while Windows
   clears inherited stdout/stderr handles before spawning the background daemon.
 - CI now runs `cargo test` on Windows, Linux, and macOS across JDK 8, 11, 17,
-  and 21.
+  and 21. Windows runs tests serially to avoid JDWP/JDI fixture process contention.
 - Structured inspect covers common `ArrayList`, `LinkedList`, `ArrayDeque`,
   `HashSet`, `LinkedHashSet`, `TreeMap`, `TreeSet`, `HashMap`, `LinkedHashMap`,
   and unmodifiable collection/map layouts without getter invocation.
@@ -449,6 +482,9 @@ Fixture-based JDI integration tests should cover:
 - stack;
 - locals;
 - inspect;
+- expression print/eval/dump;
+- set local, field, and array element;
+- non-void force-return;
 - detach;
 - target VM disconnect.
 
@@ -479,5 +515,6 @@ The final shape should be easy to explain:
 ```text
 jdbg keeps the existing prompt-aware jdb backend for compatibility and raw command
 escape hatches, while adding a native JDI backend through a local Java sidecar for
-structured events, stack/locals, and safe object inspection.
+structured events, stack/locals, safe object inspection, and explicit executable
+eval/set/force-return operations.
 ```

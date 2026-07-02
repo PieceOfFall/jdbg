@@ -54,6 +54,7 @@
         <li><strong>Prompt-aware</strong>: reads <code>jdb</code> until the prompt or stop event is complete.</li>
         <li><strong>Stateful</strong>: one background daemon keeps sessions alive across calls.</li>
         <li><strong>Agent-native</strong>: exposes the same debugger through CLI and MCP tools.</li>
+        <li><strong>JDI-capable</strong>: optional sidecar backend for structured inspect, expression eval, mutation, and force return.</li>
       </ul>
     </td>
     <td width="42%" valign="top">
@@ -115,6 +116,7 @@ cargo install --git https://github.com/PieceOfFall/jdbg.git
 # Build from source
 git clone https://github.com/PieceOfFall/jdbg.git
 cd jdbg
+# Source builds need JDK 17+ for the Gradle sidecar build.
 cargo build --release
 ```
 
@@ -196,6 +198,10 @@ It drives the same flow through `mcp__jdbg__*` tools. In Pi, the installed skill
   <tr>
     <td><strong>Focused inspection</strong></td>
     <td><code>locals</code>, <code>where</code>, <code>inspect</code>, <code>watch</code>, and <code>thread-locks</code> keep agent loops short.</td>
+  </tr>
+  <tr>
+    <td><strong>JDI runtime actions</strong></td>
+    <td><code>print</code>, <code>eval</code>, <code>set</code>, and <code>force-return</code> let agents test hypotheses in a suspended frame when explicit side effects are intended.</td>
   </tr>
 </table>
 
@@ -322,7 +328,7 @@ OpenCode config:
 
 ```text
 # Session lifecycle
-jdbg launch <MainClass> [--backend jdb|jdi] [--classpath CP] [--sourcepath SP] [--name N] [-- app-args...]
+jdbg launch <MainClass> [--backend jdb] [--classpath CP] [--sourcepath SP] [--name N] [-- app-args...]
 jdbg attach [--backend jdb|jdi] [--host H] [--port P] [--sourcepath SP] [--name N]
 jdbg status | list | kill [--session ID]
 jdbg daemon start | stop | status
@@ -370,16 +376,18 @@ Global flags:
 | `--jdb-path <path>` | Use an explicit `jdb` executable. |
 
 Backend selection is made only when creating a session. The default `jdb` backend is the compatibility path
-and supports the full command surface. The `jdi` backend is currently attach-only and uses a local Java sidecar
-for structured runtime data; it supports `attach`, `threads`, line `break-at`, `cont`, `next`, `where`, `locals`,
-`thread`, `watch`, `unwatch`, safe JSON `inspect`, expression `print`/`eval`/`dump`, `set`, and non-void
+and supports the full command surface. The `jdi` backend is currently attach-only for session creation
+(`launch --backend jdi` returns an explicit unsupported error) and uses a local Java sidecar for structured
+runtime data; it supports `attach`, `threads`, line `break-at`, `cont`, `next`, `where`, `locals`, `thread`,
+`watch`, `unwatch`, safe JSON `inspect`, expression `print`/`eval`/`dump`, `set`, and non-void
 `force-return`. Unsupported JDI commands fail explicitly instead of falling back to `jdb`.
 
 On JDI sessions, `inspect` is intentionally safe and reads fields directly without invoking getters. JDI
 `print`, `eval`, `dump`, `set`, and `force-return` are executable capabilities: method calls may run in the
 target JVM and can have side effects. `set` assigns locals, fields, or array elements by evaluating the right
 hand side as a Java expression. `force-return` evaluates its value expression and forces the current non-void
-method to return it; void force-return is reported as unsupported.
+method to return it; void force-return is reported as unsupported. These executable JDI operations require a
+suspended stop site; running, dead, or exited sessions fail explicitly.
 
 The JDI sidecar message protocol is length-prefixed JSON over platform-local byte streams: two one-way
 Named Pipes on Windows, or an AF_UNIX socketpair on Linux/macOS. The Unix socket is handed to the Java 8
@@ -418,7 +426,7 @@ See [`DESIGN.md`](DESIGN.md) for the full design reference.
 
 | Requirement | Notes |
 |---|---|
-| Target JDK | JDK 8-21+ with `jdb` on `PATH` or discoverable via `JAVA_HOME`. |
+| Debug target JDK | JDK 8-21+ with `jdb` on `PATH` or discoverable via `JAVA_HOME`. |
 | Debug info | Compile Java with `javac -g` for locals and reliable line breakpoints. |
 | Rust | Rust 1.85+ only when installing through cargo or building from source. |
 | Source build JDK | JDK 17+ is required to run Gradle and build the JDI sidecar fat jar. Debug targets still support JDK 8+. |
@@ -429,7 +437,8 @@ For JDWP attach on JDK 8, start the target with `address=5005` or `address=local
 When building from source, `cargo build` runs the Gradle wrapper in `sidecar/jdi`, builds the fat jar
 `jdbg-jdi-sidecar.jar`, and copies it next to the `jdbg` binary. Set `JDBG_GRADLE_JAVA_HOME` when the build
 JDK is different from the target/debuggee JDK. Override sidecar discovery with `JDBG_JDI_SIDECAR_JAR` or the
-Java runtime with `JDBG_JDI_JAVA`.
+Java runtime with `JDBG_JDI_JAVA`. Set `JDBG_SKIP_JDI_SIDECAR_BUILD` only when a suitable sidecar jar is already
+available through `JDBG_JDI_SIDECAR_JAR` or next to the `jdbg` binary.
 
 `classes` works without a pattern, but that lists every loaded class; pass a pattern in real application
 servers. `watch --mode all` creates separate access and modification watchpoints on both backends, so
@@ -442,9 +451,10 @@ structured inspect covers common list, deque, set, and map implementations witho
 cargo build
 cargo build --release
 cargo test
+cargo test -- --test-threads=1   # mirrors Windows CI when investigating JDI fixture contention
 ```
 
-Tests cover parser fixtures from real `jdb` transcripts, reader behavior, protocol mapping, MCP tools, sessions, watchpoints, JDI fixture flows, JDI watchpoint flows, MCP JDI smoke coverage, sidecar death handling, Java sidecar self-tests, and end-to-end flows where the environment has a JDK.
+Tests cover parser fixtures from real `jdb` transcripts, reader behavior, protocol mapping, MCP tools, sessions, watchpoints, JDI fixture flows, JDI watchpoint flows, expression eval/set/force-return, MCP JDI smoke coverage, sidecar death handling, Java sidecar self-tests, and end-to-end flows where the environment has a JDK. CI runs the matrix on Windows, Linux, and macOS across JDK 8, 11, 17, and 21; Windows runs tests serially to avoid JDWP/JDI fixture process contention.
 
 ## License
 
