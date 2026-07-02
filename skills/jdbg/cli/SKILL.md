@@ -4,7 +4,7 @@ description: "Use the jdbg CLI to debug Java programs interactively from Pi when
 compatibility: "Requires a JDK 8+ with jdb available through JAVA_HOME, PATH, or --jdb-path. Requires the jdbg CLI on PATH. Native on Windows, Linux, and macOS."
 allowed-tools: "Bash(jdbg:*), Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "1.8"
+  version: "1.9"
 ---
 
 # jdbg CLI - interactive Java debugging for Pi
@@ -59,16 +59,16 @@ Attach to a running JVM with JDWP enabled:
 jdbg attach --host localhost --port 5005 --sourcepath src/main/java
 ```
 
-Use the JDI sidecar subset for structured attach debugging:
+Use the JDI sidecar for structured attach debugging:
 
 ```bash
 jdbg attach --backend jdi --host localhost --port 5005 --sourcepath src/main/java
 ```
 
-The default backend is `jdb` and supports all commands. The current JDI backend supports launch, attach,
-threads, line breakpoints, method entry/exit events, field watchpoints, run for launched sessions, cont,
-next, where, locals, thread selection, safe JSON inspect, executable print/eval/dump, set, and non-void
-force-return; unsupported commands fail explicitly instead of silently falling back.
+The default backend is `jdb`. The JDI backend supports the normal debugging surface too: breakpoints,
+exception catchpoints, watchpoints, stepping, stack frames, classes/methods, source listing, thread control,
+locks, safe JSON inspect, executable print/eval/dump, set, and non-void force-return. JDI `raw` dispatches
+supported jdb-style aliases through the sidecar rather than writing to a literal jdb stdin.
 
 If the JDK is not the one you need, pass:
 

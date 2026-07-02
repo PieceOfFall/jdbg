@@ -373,6 +373,106 @@ impl JdiSession {
         })
     }
 
+    pub fn breakpoints(&self) -> Result<CommandResponse> {
+        let _guard = self
+            .command_lock
+            .lock()
+            .expect("jdi command mutex poisoned");
+        self.drain_events();
+        let value = request(
+            &self.sidecar,
+            "breakpoints",
+            json!({ "session": self.meta.id }),
+            SIDECAR_REQUEST_TIMEOUT,
+        )?;
+        let payload: BreakpointsPayload = serde_json::from_value(value)
+            .map_err(|e| Error::Connection(format!("invalid JDI breakpoints response: {e}")))?;
+        Ok(CommandResponse {
+            result: CommandResult::BreakpointList {
+                breakpoints: payload.breakpoints,
+            },
+            stderr: self.sidecar.take_stderr(),
+            note: None,
+        })
+    }
+
+    pub fn clear(&self, spec: &str) -> Result<CommandResponse> {
+        let _guard = self
+            .command_lock
+            .lock()
+            .expect("jdi command mutex poisoned");
+        self.drain_events();
+        let value = request(
+            &self.sidecar,
+            "clearBreakpoint",
+            json!({ "session": self.meta.id, "spec": spec }),
+            SIDECAR_REQUEST_TIMEOUT,
+        )?;
+        let payload: RemovedPayload = serde_json::from_value(value)
+            .map_err(|e| Error::Connection(format!("invalid JDI clear response: {e}")))?;
+        Ok(CommandResponse {
+            result: CommandResult::Raw {
+                text: format!(
+                    "Removed {} breakpoint(s): {}",
+                    payload.removed, payload.spec
+                ),
+            },
+            stderr: self.sidecar.take_stderr(),
+            note: None,
+        })
+    }
+
+    pub fn catch_exception(&self, exception: &str, mode: &str) -> Result<CommandResponse> {
+        let _guard = self
+            .command_lock
+            .lock()
+            .expect("jdi command mutex poisoned");
+        self.drain_events();
+        let value = request(
+            &self.sidecar,
+            "catchException",
+            json!({ "session": self.meta.id, "exception": exception, "mode": mode }),
+            SIDECAR_REQUEST_TIMEOUT,
+        )?;
+        let payload: BreakpointPayload = serde_json::from_value(value)
+            .map_err(|e| Error::Connection(format!("invalid JDI catch response: {e}")))?;
+        Ok(CommandResponse {
+            result: CommandResult::BreakpointSet {
+                spec: payload.spec,
+                bp_kind: BreakpointKind::Catch,
+                deferred: payload.deferred,
+            },
+            stderr: self.sidecar.take_stderr(),
+            note: payload.note,
+        })
+    }
+
+    pub fn ignore_exception(&self, exception: &str, mode: &str) -> Result<CommandResponse> {
+        let _guard = self
+            .command_lock
+            .lock()
+            .expect("jdi command mutex poisoned");
+        self.drain_events();
+        let value = request(
+            &self.sidecar,
+            "ignoreException",
+            json!({ "session": self.meta.id, "exception": exception, "mode": mode }),
+            SIDECAR_REQUEST_TIMEOUT,
+        )?;
+        let payload: RemovedPayload = serde_json::from_value(value)
+            .map_err(|e| Error::Connection(format!("invalid JDI ignore response: {e}")))?;
+        Ok(CommandResponse {
+            result: CommandResult::Raw {
+                text: format!(
+                    "Ignored {} catchpoint(s): {}",
+                    payload.removed, payload.spec
+                ),
+            },
+            stderr: self.sidecar.take_stderr(),
+            note: None,
+        })
+    }
+
     pub fn cont(&self, timeout: Option<u64>) -> Result<CommandResponse> {
         let _guard = self
             .command_lock
@@ -412,6 +512,69 @@ impl JdiSession {
         self.resume_like("stepOver", timeout)
     }
 
+    pub fn step(&self, timeout: Option<u64>) -> Result<CommandResponse> {
+        let _guard = self
+            .command_lock
+            .lock()
+            .expect("jdi command mutex poisoned");
+        self.resume_like("stepInto", timeout)
+    }
+
+    pub fn step_out(&self, timeout: Option<u64>) -> Result<CommandResponse> {
+        let _guard = self
+            .command_lock
+            .lock()
+            .expect("jdi command mutex poisoned");
+        self.resume_like("stepOut", timeout)
+    }
+
+    pub fn classes(&self, pattern: Option<&str>) -> Result<CommandResponse> {
+        let _guard = self
+            .command_lock
+            .lock()
+            .expect("jdi command mutex poisoned");
+        self.drain_events();
+        let value = request(
+            &self.sidecar,
+            "classes",
+            json!({ "session": self.meta.id, "pattern": pattern }),
+            SIDECAR_REQUEST_TIMEOUT,
+        )?;
+        let payload: ClassesPayload = serde_json::from_value(value)
+            .map_err(|e| Error::Connection(format!("invalid JDI classes response: {e}")))?;
+        Ok(CommandResponse {
+            result: CommandResult::Classes {
+                classes: payload.classes,
+            },
+            stderr: self.sidecar.take_stderr(),
+            note: None,
+        })
+    }
+
+    pub fn methods(&self, class: &str) -> Result<CommandResponse> {
+        let _guard = self
+            .command_lock
+            .lock()
+            .expect("jdi command mutex poisoned");
+        self.drain_events();
+        let value = request(
+            &self.sidecar,
+            "methods",
+            json!({ "session": self.meta.id, "class": class }),
+            SIDECAR_REQUEST_TIMEOUT,
+        )?;
+        let payload: MethodsPayload = serde_json::from_value(value)
+            .map_err(|e| Error::Connection(format!("invalid JDI methods response: {e}")))?;
+        Ok(CommandResponse {
+            result: CommandResult::Methods {
+                class: payload.class,
+                methods: payload.methods,
+            },
+            stderr: self.sidecar.take_stderr(),
+            note: None,
+        })
+    }
+
     pub fn select_thread(&self, id: &str) -> Result<CommandResponse> {
         let _guard = self
             .command_lock
@@ -427,6 +590,51 @@ impl JdiSession {
         Ok(CommandResponse {
             result: CommandResult::Raw {
                 text: format!("Current JDI thread set to {id}"),
+            },
+            stderr: self.sidecar.take_stderr(),
+            note: None,
+        })
+    }
+
+    pub fn frame(&self, direction: &str, count: u32) -> Result<CommandResponse> {
+        let _guard = self
+            .command_lock
+            .lock()
+            .expect("jdi command mutex poisoned");
+        self.require_suspended("select frame")?;
+        let value = request(
+            &self.sidecar,
+            "selectFrame",
+            json!({ "session": self.meta.id, "direction": direction, "count": count }),
+            SIDECAR_REQUEST_TIMEOUT,
+        )?;
+        let payload: TextPayload = serde_json::from_value(value)
+            .map_err(|e| Error::Connection(format!("invalid JDI frame response: {e}")))?;
+        Ok(CommandResponse {
+            result: CommandResult::Raw { text: payload.text },
+            stderr: self.sidecar.take_stderr(),
+            note: None,
+        })
+    }
+
+    pub fn list_source(&self, line: Option<u32>) -> Result<CommandResponse> {
+        let _guard = self
+            .command_lock
+            .lock()
+            .expect("jdi command mutex poisoned");
+        self.require_suspended("list source")?;
+        let value = request(
+            &self.sidecar,
+            "listSource",
+            json!({ "session": self.meta.id, "line": line }),
+            SIDECAR_REQUEST_TIMEOUT,
+        )?;
+        let payload: SourcePayload = serde_json::from_value(value)
+            .map_err(|e| Error::Connection(format!("invalid JDI source response: {e}")))?;
+        Ok(CommandResponse {
+            result: CommandResult::Source {
+                around_line: payload.around_line,
+                lines: payload.lines,
             },
             stderr: self.sidecar.take_stderr(),
             note: None,
@@ -583,6 +791,205 @@ impl JdiSession {
         })
     }
 
+    pub fn suspend(&self, id: Option<&str>) -> Result<CommandResponse> {
+        let _guard = self
+            .command_lock
+            .lock()
+            .expect("jdi command mutex poisoned");
+        self.drain_events();
+        let value = request(
+            &self.sidecar,
+            "suspend",
+            json!({ "session": self.meta.id, "threadId": id }),
+            SIDECAR_REQUEST_TIMEOUT,
+        )?;
+        let payload: TextPayload = serde_json::from_value(value)
+            .map_err(|e| Error::Connection(format!("invalid JDI suspend response: {e}")))?;
+        if id.is_none() {
+            self.inner.lock().expect("jdi session mutex poisoned").state = RunState::Suspended;
+        }
+        Ok(CommandResponse {
+            result: CommandResult::Raw { text: payload.text },
+            stderr: self.sidecar.take_stderr(),
+            note: None,
+        })
+    }
+
+    pub fn resume(&self, id: Option<&str>) -> Result<CommandResponse> {
+        let _guard = self
+            .command_lock
+            .lock()
+            .expect("jdi command mutex poisoned");
+        self.drain_events();
+        let value = request(
+            &self.sidecar,
+            "resume",
+            json!({ "session": self.meta.id, "threadId": id }),
+            SIDECAR_REQUEST_TIMEOUT,
+        )?;
+        let payload: TextPayload = serde_json::from_value(value)
+            .map_err(|e| Error::Connection(format!("invalid JDI resume response: {e}")))?;
+        if id.is_none() {
+            self.inner.lock().expect("jdi session mutex poisoned").state = RunState::Running;
+        }
+        Ok(CommandResponse {
+            result: CommandResult::Raw { text: payload.text },
+            stderr: self.sidecar.take_stderr(),
+            note: None,
+        })
+    }
+
+    pub fn lock(&self, expr: &str) -> Result<CommandResponse> {
+        let _guard = self
+            .command_lock
+            .lock()
+            .expect("jdi command mutex poisoned");
+        self.require_suspended("inspect lock")?;
+        let value = request(
+            &self.sidecar,
+            "lockInfo",
+            json!({ "session": self.meta.id, "expr": expr }),
+            SIDECAR_REQUEST_TIMEOUT,
+        )?;
+        let payload: TextPayload = serde_json::from_value(value)
+            .map_err(|e| Error::Connection(format!("invalid JDI lock response: {e}")))?;
+        Ok(CommandResponse {
+            result: CommandResult::Raw { text: payload.text },
+            stderr: self.sidecar.take_stderr(),
+            note: None,
+        })
+    }
+
+    pub fn threadlocks(&self, id: Option<&str>) -> Result<CommandResponse> {
+        let _guard = self
+            .command_lock
+            .lock()
+            .expect("jdi command mutex poisoned");
+        self.require_suspended("inspect thread locks")?;
+        let value = request(
+            &self.sidecar,
+            "threadLocks",
+            json!({ "session": self.meta.id, "threadId": id }),
+            SIDECAR_REQUEST_TIMEOUT,
+        )?;
+        let payload: TextPayload = serde_json::from_value(value)
+            .map_err(|e| Error::Connection(format!("invalid JDI threadLocks response: {e}")))?;
+        Ok(CommandResponse {
+            result: CommandResult::Raw { text: payload.text },
+            stderr: self.sidecar.take_stderr(),
+            note: None,
+        })
+    }
+
+    pub fn raw(&self, command: &str, timeout: Option<u64>) -> Result<CommandResponse> {
+        let command = command.trim();
+        if command.is_empty() || command == "help" {
+            return Ok(CommandResponse {
+                result: CommandResult::Raw {
+                    text: "JDI raw supports jdb-style aliases: classes, methods, where, locals, threads, print, eval, dump, clear, catch, ignore, list, step, next, step up, cont, run, suspend, resume, lock, threadlocks.".into(),
+                },
+                stderr: self.sidecar.take_stderr(),
+                note: Some("JDI has no literal jdb command stream; raw dispatches supported aliases through the sidecar.".into()),
+            });
+        }
+
+        if command == "classes" {
+            return self.classes(None);
+        }
+        if let Some(rest) = command.strip_prefix("classes ") {
+            return self.classes(Some(rest.trim()));
+        }
+        if let Some(rest) = command.strip_prefix("methods ") {
+            return self.methods(rest.trim());
+        }
+        if command == "where" {
+            return self.stack(false);
+        }
+        if command == "where all" {
+            return self.stack(true);
+        }
+        if command == "locals" {
+            return self.locals();
+        }
+        if command == "threads" {
+            return self.threads(None);
+        }
+        if let Some(rest) = command.strip_prefix("thread ") {
+            return self.select_thread(rest.trim());
+        }
+        if let Some(rest) = command.strip_prefix("print ") {
+            return self.evaluate(rest.trim());
+        }
+        if let Some(rest) = command.strip_prefix("eval ") {
+            return self.evaluate(rest.trim());
+        }
+        if let Some(rest) = command.strip_prefix("dump ") {
+            return self.dump(rest.trim(), 10);
+        }
+        if let Some(rest) = command.strip_prefix("clear ") {
+            return self.clear(rest.trim());
+        }
+        if let Some(rest) = command.strip_prefix("catch ") {
+            let (mode, exception) = parse_mode_prefixed(rest.trim());
+            return self.catch_exception(exception, mode);
+        }
+        if let Some(rest) = command.strip_prefix("ignore ") {
+            let (mode, exception) = parse_mode_prefixed(rest.trim());
+            return self.ignore_exception(exception, mode);
+        }
+        if command == "step" {
+            return self.step(timeout);
+        }
+        if command == "next" {
+            return self.next(timeout);
+        }
+        if command == "step up" {
+            return self.step_out(timeout);
+        }
+        if command == "cont" {
+            return self.cont(timeout);
+        }
+        if command == "run" {
+            return self.run(timeout);
+        }
+        if command == "suspend" {
+            return self.suspend(None);
+        }
+        if let Some(rest) = command.strip_prefix("suspend ") {
+            return self.suspend(Some(rest.trim()));
+        }
+        if command == "resume" {
+            return self.resume(None);
+        }
+        if let Some(rest) = command.strip_prefix("resume ") {
+            return self.resume(Some(rest.trim()));
+        }
+        if let Some(rest) = command.strip_prefix("lock ") {
+            return self.lock(rest.trim());
+        }
+        if command == "threadlocks" {
+            return self.threadlocks(None);
+        }
+        if let Some(rest) = command.strip_prefix("threadlocks ") {
+            return self.threadlocks(Some(rest.trim()));
+        }
+        if command == "list" {
+            return self.list_source(None);
+        }
+        if let Some(rest) = command.strip_prefix("list ") {
+            let line = rest.trim().parse::<u32>().ok();
+            return self.list_source(line);
+        }
+
+        Ok(CommandResponse {
+            result: CommandResult::Raw {
+                text: format!("JDI raw cannot execute literal jdb command: {command}"),
+            },
+            stderr: self.sidecar.take_stderr(),
+            note: Some("Use a first-class jdbg command or a supported JDI raw alias.".into()),
+        })
+    }
+
     pub fn unsupported(&self, operation: &str) -> Error {
         Error::UnsupportedBackend {
             backend: "jdi".into(),
@@ -671,6 +1078,25 @@ impl JdiSession {
                 note: None,
             });
         }
+        if let Event::Exception {
+            exception,
+            caught,
+            thread,
+            ..
+        } = event.clone()
+        {
+            return Ok(CommandResponse {
+                result: CommandResult::ExceptionCaught {
+                    exception,
+                    caught,
+                    location: payload.location,
+                    thread,
+                    thread_id: payload.thread_id,
+                },
+                stderr: self.sidecar.take_stderr(),
+                note: payload.note,
+            });
+        }
         Ok(CommandResponse {
             result: CommandResult::Stopped {
                 event,
@@ -734,6 +1160,11 @@ struct LocalsPayload {
 }
 
 #[derive(Debug, Deserialize)]
+struct BreakpointsPayload {
+    breakpoints: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct BreakpointPayload {
     spec: String,
     deferred: bool,
@@ -748,6 +1179,35 @@ struct WatchpointPayload {
     deferred: bool,
     #[serde(default)]
     note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RemovedPayload {
+    removed: u32,
+    spec: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClassesPayload {
+    classes: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MethodsPayload {
+    class: String,
+    methods: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SourcePayload {
+    around_line: u32,
+    lines: Vec<SourceLine>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TextPayload {
+    text: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -789,6 +1249,10 @@ struct StopPayload {
     return_value: Option<String>,
     #[serde(default)]
     return_type: Option<String>,
+    #[serde(default)]
+    exception: Option<String>,
+    #[serde(default)]
+    caught: Option<bool>,
     #[serde(default)]
     message: Option<String>,
     #[serde(default)]
@@ -835,6 +1299,15 @@ fn event_from_stop_payload(payload: &StopPayload) -> Result<(Event, RunState)> {
             },
             RunState::Suspended,
         )),
+        "exception" => Ok((
+            Event::Exception {
+                exception: payload.exception.clone().unwrap_or_default(),
+                caught: payload.caught.unwrap_or(false),
+                location: Some(payload.location.clone()),
+                thread: payload.thread.clone(),
+            },
+            RunState::Suspended,
+        )),
         "vmDisconnected" => Ok((Event::VmExit, RunState::Exited)),
         other => Err(Error::Connection(format!(
             "unsupported JDI stop event '{other}'"
@@ -845,6 +1318,18 @@ fn event_from_stop_payload(payload: &StopPayload) -> Result<(Event, RunState)> {
 #[cfg(test)]
 fn payload_to_event_for_test(payload: &StopPayload) -> Result<Event> {
     event_from_stop_payload(payload).map(|(event, _)| event)
+}
+
+fn parse_mode_prefixed(input: &str) -> (&str, &str) {
+    for mode in ["caught", "uncaught", "all"] {
+        if input == mode {
+            return (mode, "");
+        }
+        if let Some(rest) = input.strip_prefix(&format!("{mode} ")) {
+            return (mode, rest.trim());
+        }
+    }
+    ("all", input)
 }
 
 fn request(

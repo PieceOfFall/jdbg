@@ -378,9 +378,11 @@ Global flags:
 Backend selection is made only when creating a session. The default `jdb` backend is the compatibility path
 and supports the full command surface. The `jdi` backend can `launch` or `attach` through a local Java sidecar
 for structured runtime data; it supports `threads`, line `break-at`, method `break-in` entry/exit events,
-field `watch`/`unwatch`, `run` for launched sessions, `cont`, `next`, `where`, `locals`, `thread`, safe JSON
-`inspect`, expression `print`/`eval`/`dump`, `set`, and non-void `force-return`. Unsupported JDI commands fail
-explicitly instead of falling back to `jdb`.
+field `watch`/`unwatch`, exception `catch`/`ignore`, breakpoint listing/clearing, `run` for launched sessions,
+`cont`, `step`, `next`, `step-out`, `where`, `frame`, `locals`, `thread`, `classes`, `methods`,
+`list-source`, thread suspend/resume, lock inspection, safe JSON `inspect`, expression `print`/`eval`/`dump`,
+`set`, and non-void `force-return`. JDI `raw` dispatches supported jdb-style aliases through the sidecar
+instead of writing to a literal jdb stdin.
 
 JDI method breakpoints accept `--event entry|exit|both`. Method exit stops include the rendered return value
 when the target VM provides it. The `jdb` backend keeps method-entry behavior; `--event exit` and `both` fail

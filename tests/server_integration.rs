@@ -1133,6 +1133,304 @@ fn jdi_step_over_returns_step_event_with_stack_and_locals() {
 }
 
 #[test]
+fn jdi_command_surface_supports_metadata_source_raw_and_array_length() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("JdiLaunchTest.java");
+    let classpath = vec![fixture_dir().display().to_string()];
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::launch(
+        "JdiLaunchTest",
+        &classpath,
+        &sourcepath,
+        &[],
+        "jdi-command-surface-metadata".into(),
+        None,
+    )
+    .expect("JDI launch failed");
+
+    let line = fixture_line("JdiLaunchTest.java", "System.out.println(label");
+    session
+        .stop_at("JdiLaunchTest", line, None)
+        .expect("JDI launch breakpoint failed");
+
+    let breakpoints = session.breakpoints().expect("JDI breakpoints failed");
+    match &breakpoints.result {
+        CommandResult::BreakpointList { breakpoints } => assert!(
+            breakpoints
+                .iter()
+                .any(|bp| bp.contains(&format!("JdiLaunchTest:{line}"))),
+            "breakpoints should include deferred line breakpoint, got {breakpoints:?}"
+        ),
+        other => panic!("expected JDI BreakpointList, got {other:?}"),
+    }
+
+    let clear = session
+        .clear(&format!("JdiLaunchTest:{line}"))
+        .expect("JDI clear failed");
+    assert!(
+        matches!(clear.result, CommandResult::Raw { ref text } if text.contains("Removed 1")),
+        "expected clear raw removal, got {:?}",
+        clear.result
+    );
+    session
+        .stop_at("JdiLaunchTest", line, None)
+        .expect("JDI launch breakpoint reset failed");
+
+    let stop = session.run(Some(30)).expect("JDI launch run failed");
+    assert!(
+        matches!(
+            stop.result,
+            CommandResult::Stopped {
+                event: Event::Breakpoint { .. },
+                ..
+            }
+        ),
+        "expected JDI breakpoint stop, got {:?}",
+        stop.result
+    );
+
+    let classes = session
+        .classes(Some("JdiLaunchTest"))
+        .expect("JDI classes failed");
+    match &classes.result {
+        CommandResult::Classes { classes } => assert!(
+            classes.iter().any(|class| class == "JdiLaunchTest"),
+            "classes should include JdiLaunchTest, got {classes:?}"
+        ),
+        other => panic!("expected JDI Classes, got {other:?}"),
+    }
+
+    let methods = session
+        .methods("JdiLaunchTest")
+        .expect("JDI methods failed");
+    match &methods.result {
+        CommandResult::Methods { methods, .. } => assert!(
+            methods.iter().any(|method| method.contains(".main(")),
+            "methods should include main, got {methods:?}"
+        ),
+        other => panic!("expected JDI Methods, got {other:?}"),
+    }
+
+    let source = session
+        .list_source(Some(line))
+        .expect("JDI list_source failed");
+    match &source.result {
+        CommandResult::Source { lines, .. } => assert!(
+            lines
+                .iter()
+                .any(|source_line| source_line.text.contains("System.out.println(label")),
+            "source should include println line, got {lines:?}"
+        ),
+        other => panic!("expected JDI Source, got {other:?}"),
+    }
+
+    let args_len = session
+        .evaluate("args.length")
+        .expect("JDI args.length eval failed");
+    match &args_len.result {
+        CommandResult::Value { value, ty, .. } => {
+            assert_eq!(value, "0");
+            assert_eq!(ty.as_deref(), Some("int"));
+        }
+        other => panic!("expected JDI Value for args.length, got {other:?}"),
+    }
+
+    let raw = session
+        .raw("classes JdiLaunchTest", Some(5))
+        .expect("JDI raw classes failed");
+    assert!(
+        matches!(raw.result, CommandResult::Classes { .. }),
+        "raw classes should dispatch to JDI classes, got {:?}",
+        raw.result
+    );
+
+    let _ = session.kill();
+}
+
+#[test]
+fn jdi_frame_step_out_suspend_and_lock_commands_work() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("EvalMutationTest.java");
+    let target = start_jdwp_fixture("EvalMutationTest");
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::attach(
+        "127.0.0.1",
+        target.port,
+        &sourcepath,
+        "jdi-command-surface-runtime".into(),
+        None,
+    )
+    .expect("JDI attach failed");
+
+    let compute_line = fixture_line("EvalMutationTest.java", "int before = box.add(values[1]);");
+    session
+        .stop_at("EvalMutationTest", compute_line, None)
+        .expect("JDI compute breakpoint failed");
+    let stop = session.cont(Some(30)).expect("JDI cont to compute failed");
+    assert!(
+        matches!(
+            stop.result,
+            CommandResult::Stopped {
+                event: Event::Breakpoint { .. },
+                ..
+            }
+        ),
+        "expected JDI breakpoint stop, got {:?}",
+        stop.result
+    );
+
+    let frame_up = session.frame("up", 1).expect("JDI frame up failed");
+    assert!(
+        matches!(frame_up.result, CommandResult::Raw { ref text } if text.contains(".main")),
+        "frame up should select main, got {:?}",
+        frame_up.result
+    );
+    let frame_down = session.frame("down", 1).expect("JDI frame down failed");
+    assert!(
+        matches!(frame_down.result, CommandResult::Raw { ref text } if text.contains(".compute")),
+        "frame down should return to compute, got {:?}",
+        frame_down.result
+    );
+
+    let locks = session.threadlocks(None).expect("JDI threadlocks failed");
+    assert!(
+        matches!(locks.result, CommandResult::Raw { ref text } if text.contains("locks")),
+        "threadlocks should return raw lock info, got {:?}",
+        locks.result
+    );
+    let lock = session.lock("box").expect("JDI lock failed");
+    assert!(
+        matches!(lock.result, CommandResult::Raw { ref text } if text.contains("owner")),
+        "lock should return monitor owner info, got {:?}",
+        lock.result
+    );
+
+    let threads = session.threads(None).expect("JDI threads failed");
+    let thread_id = match &threads.result {
+        CommandResult::Threads { threads } => threads
+            .iter()
+            .find(|thread| thread.name == "main")
+            .map(|thread| thread.id.clone())
+            .expect("main thread should be present"),
+        other => panic!("expected JDI Threads, got {other:?}"),
+    };
+    session
+        .suspend(Some(&thread_id))
+        .expect("JDI suspend thread failed");
+    session
+        .resume(Some(&thread_id))
+        .expect("JDI resume thread failed");
+
+    let step = session.step(Some(30)).expect("JDI step failed");
+    match &step.result {
+        CommandResult::Stopped {
+            event: Event::Step { .. },
+            location,
+            ..
+        } => {
+            assert_eq!(location.class, "EvalMutationTest$Box");
+            assert_eq!(location.method, "add");
+        }
+        other => panic!("expected JDI step into Box.add, got {other:?}"),
+    }
+
+    let step_out = session.step_out(Some(30)).expect("JDI step_out failed");
+    assert!(
+        matches!(
+            step_out.result,
+            CommandResult::Stopped {
+                event: Event::Step { .. },
+                ..
+            }
+        ),
+        "expected JDI step_out stop, got {:?}",
+        step_out.result
+    );
+
+    let _ = session.kill();
+}
+
+#[test]
+fn jdi_catch_and_ignore_exception_commands_work() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("Throw.java");
+
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let target = start_jdwp_fixture("Throw");
+    let session = JdiSession::attach(
+        "127.0.0.1",
+        target.port,
+        &sourcepath,
+        "jdi-catch-exception".into(),
+        None,
+    )
+    .expect("JDI attach failed");
+    let catch = session
+        .catch_exception("java.lang.NullPointerException", "all")
+        .expect("JDI catch failed");
+    assert!(
+        matches!(
+            catch.result,
+            CommandResult::BreakpointSet {
+                bp_kind: BreakpointKind::Catch,
+                ..
+            }
+        ),
+        "expected catch breakpoint set, got {:?}",
+        catch.result
+    );
+    let caught = session
+        .cont(Some(30))
+        .expect("JDI cont to exception failed");
+    match &caught.result {
+        CommandResult::ExceptionCaught {
+            exception, caught, ..
+        } => {
+            assert_eq!(exception, "java.lang.NullPointerException");
+            assert!(!caught, "Throw fixture exception should be uncaught");
+        }
+        other => panic!("expected JDI ExceptionCaught, got {other:?}"),
+    }
+    let _ = session.kill();
+
+    let target = start_jdwp_fixture("Throw");
+    let session = JdiSession::attach(
+        "127.0.0.1",
+        target.port,
+        &sourcepath,
+        "jdi-ignore-exception".into(),
+        None,
+    )
+    .expect("JDI attach failed");
+    session
+        .catch_exception("java.lang.NullPointerException", "all")
+        .expect("JDI catch before ignore failed");
+    let ignored = session
+        .ignore_exception("java.lang.NullPointerException", "all")
+        .expect("JDI ignore failed");
+    assert!(
+        matches!(ignored.result, CommandResult::Raw { ref text } if text.contains("Ignored 1")),
+        "expected ignore raw removal, got {:?}",
+        ignored.result
+    );
+    let exited = session
+        .cont(Some(30))
+        .expect("JDI cont after ignore failed");
+    assert!(
+        matches!(exited.result, CommandResult::VmExited { .. }),
+        "expected VM exit after ignore, got {:?}",
+        exited.result
+    );
+    let _ = session.kill();
+}
+
+#[test]
 fn jdi_eval_set_and_force_return_execute_in_stopped_frame() {
     use java_agent_debugger::jdi::session::JdiSession;
 

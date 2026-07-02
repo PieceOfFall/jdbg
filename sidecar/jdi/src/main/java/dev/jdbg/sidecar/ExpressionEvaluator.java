@@ -238,6 +238,9 @@ final class ExpressionEvaluator {
         }
 
         Value base = valueOf(scope);
+        if (base instanceof ArrayReference && "length".equals(name)) {
+            return Resolved.value(vm.mirrorOf(((ArrayReference) base).length()));
+        }
         if (!(base instanceof ObjectReference)) {
             throw new RpcException("not_object", "cannot read field '" + name + "' from non-object value");
         }

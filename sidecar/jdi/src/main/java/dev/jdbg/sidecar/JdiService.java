@@ -24,6 +24,7 @@ import com.sun.jdi.event.ClassPrepareEvent;
 import com.sun.jdi.event.Event;
 import com.sun.jdi.event.EventIterator;
 import com.sun.jdi.event.EventSet;
+import com.sun.jdi.event.ExceptionEvent;
 import com.sun.jdi.event.MethodEntryEvent;
 import com.sun.jdi.event.MethodExitEvent;
 import com.sun.jdi.event.ModificationWatchpointEvent;
@@ -36,13 +37,20 @@ import com.sun.jdi.request.AccessWatchpointRequest;
 import com.sun.jdi.request.BreakpointRequest;
 import com.sun.jdi.request.ClassPrepareRequest;
 import com.sun.jdi.request.EventRequest;
+import com.sun.jdi.request.ExceptionRequest;
 import com.sun.jdi.request.MethodEntryRequest;
 import com.sun.jdi.request.MethodExitRequest;
 import com.sun.jdi.request.ModificationWatchpointRequest;
 import com.sun.jdi.request.StepRequest;
 
+import java.io.IOException;
 import java.io.File;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -84,18 +92,41 @@ final class JdiService {
                 return session(params).locals();
             case "setBreakpoint":
                 return session(params).setBreakpoint(params);
+            case "breakpoints":
+                return session(params).breakpoints();
+            case "clearBreakpoint":
+                return session(params).clearBreakpoint(params);
             case "setMethodEvent":
                 return session(params).setMethodEvent(params);
+            case "catchException":
+                return session(params).catchException(params);
+            case "ignoreException":
+                return session(params).ignoreException(params);
             case "setWatchpoint":
                 return session(params).setWatchpoint(params);
             case "clearWatchpoint":
                 return session(params).clearWatchpoint(params);
             case "continue":
                 return session(params).continueFor(Json.longValue(params, "timeoutMs", 30000));
+            case "stepInto":
+                return session(params).stepInto(Json.longValue(params, "timeoutMs", 30000));
             case "stepOver":
                 return session(params).stepOver(Json.longValue(params, "timeoutMs", 30000));
+            case "stepOut":
+                return session(params).stepOut(Json.longValue(params, "timeoutMs", 30000));
+            case "classes":
+                return session(params).classes(Json.optionalString(params, "pattern", null));
+            case "methods":
+                return session(params).methods(Json.string(params, "class"));
             case "selectThread":
                 return session(params).selectThread(Json.string(params, "threadId"));
+            case "selectFrame":
+                return session(params).selectFrame(
+                        Json.string(params, "direction"),
+                        Json.intValue(params, "count", 1)
+                );
+            case "listSource":
+                return session(params).listSource(optionalInteger(params, "line"));
             case "inspect":
                 return session(params).inspect(params);
             case "evaluateExpression":
@@ -106,6 +137,14 @@ final class JdiService {
                 return session(params).setValue(params);
             case "forceReturn":
                 return session(params).forceReturn(params);
+            case "suspend":
+                return session(params).suspendThread(Json.optionalString(params, "threadId", null));
+            case "resume":
+                return session(params).resumeThread(Json.optionalString(params, "threadId", null));
+            case "lockInfo":
+                return session(params).lockInfo(Json.string(params, "expr"));
+            case "threadLocks":
+                return session(params).threadLocks(Json.optionalString(params, "threadId", null));
             case "shutdown":
                 shutdown();
                 return Json.object("ok", true);
@@ -123,7 +162,7 @@ final class JdiService {
         args.get("hostname").setValue(host);
         args.get("port").setValue(Integer.toString(port));
         VirtualMachine vm = connector.attach(args);
-        DebugSession session = new DebugSession(id, vm);
+        DebugSession session = new DebugSession(id, vm, stringList(params, "sourcepath"));
         sessions.put(id, session);
         session.startEventLoop();
         return Json.object("ok", true, "session", id);
@@ -144,7 +183,7 @@ final class JdiService {
             args.get("options").setValue(options);
         }
         VirtualMachine vm = connector.launch(args);
-        DebugSession session = new DebugSession(id, vm);
+        DebugSession session = new DebugSession(id, vm, stringList(params, "sourcepath"));
         sessions.put(id, session);
         session.startEventLoop();
         return Json.object("ok", true, "session", id);
@@ -247,21 +286,34 @@ final class JdiService {
         return out;
     }
 
+    private static Integer optionalInteger(Map<String, Object> params, String key) {
+        Object value = params.get(key);
+        if (value == null) {
+            return null;
+        }
+        return Json.intValue(params, key, 0);
+    }
+
     private final class DebugSession {
         final String id;
         final VirtualMachine vm;
+        final List<String> sourcePaths;
         final BlockingQueue<StopRecord> stops = new LinkedBlockingQueue<>();
         final List<PendingBreakpoint> pendingBreakpoints = new ArrayList<>();
+        final List<ActiveBreakpoint> activeBreakpoints = new ArrayList<>();
         final List<PendingWatchpoint> pendingWatchpoints = new ArrayList<>();
         final List<ActiveWatchpoint> activeWatchpoints = new ArrayList<>();
         final List<ActiveMethodEvent> activeMethodEvents = new ArrayList<>();
+        final List<ActiveExceptionRequest> activeExceptionRequests = new ArrayList<>();
         volatile String currentThreadId;
+        volatile int currentFrameIndex;
         volatile EventSet currentStopSet;
         volatile boolean disconnected;
 
-        DebugSession(String id, VirtualMachine vm) {
+        DebugSession(String id, VirtualMachine vm, List<String> sourcePaths) {
             this.id = id;
             this.vm = vm;
+            this.sourcePaths = sourcePaths;
         }
 
         void startEventLoop() {
@@ -336,7 +388,7 @@ final class JdiService {
                     : EventRequest.SUSPEND_ALL;
             List<ReferenceType> loaded = vm.classesByName(className);
             if (!loaded.isEmpty()) {
-                createBreakpoint(loaded.get(0), line, suspendPolicy);
+                createBreakpoint(loaded.get(0), line, suspendPolicy, className + ":" + line);
                 return Json.object("spec", className + ":" + line, "deferred", false);
             }
 
@@ -348,6 +400,103 @@ final class JdiService {
             request.enable();
             pending.prepareRequest = request;
             return Json.object("spec", className + ":" + line, "deferred", true);
+        }
+
+        Object breakpoints() {
+            List<Object> out = Json.array();
+            for (PendingBreakpoint pending : pendingBreakpoints) {
+                out.add(pending.spec() + " (deferred)");
+            }
+            for (ActiveBreakpoint active : activeBreakpoints) {
+                out.add(active.spec);
+            }
+            for (ActiveMethodEvent active : activeMethodEvents) {
+                out.add(active.spec.display() + " (" + active.eventKind + ")");
+            }
+            for (PendingWatchpoint pending : pendingWatchpoints) {
+                out.add("watch " + pending.field.spec + " (" + pending.mode + ", deferred)");
+            }
+            for (ActiveWatchpoint active : activeWatchpoints) {
+                out.add("watch " + active.field.spec + " (" + active.mode + ")");
+            }
+            for (ActiveExceptionRequest active : activeExceptionRequests) {
+                out.add("catch " + active.exceptionName + " (" + active.mode + ")");
+            }
+            return Json.object("breakpoints", out);
+        }
+
+        Object clearBreakpoint(Map<String, Object> params) throws Exception {
+            String spec = Json.string(params, "spec");
+            int removed = 0;
+
+            Iterator<PendingBreakpoint> pendingIt = pendingBreakpoints.iterator();
+            while (pendingIt.hasNext()) {
+                PendingBreakpoint pending = pendingIt.next();
+                if (pending.matches(spec)) {
+                    if (pending.prepareRequest != null) {
+                        vm.eventRequestManager().deleteEventRequest(pending.prepareRequest);
+                    }
+                    pendingIt.remove();
+                    removed++;
+                }
+            }
+
+            Iterator<ActiveBreakpoint> activeIt = activeBreakpoints.iterator();
+            while (activeIt.hasNext()) {
+                ActiveBreakpoint active = activeIt.next();
+                if (active.matches(spec)) {
+                    vm.eventRequestManager().deleteEventRequest(active.request);
+                    activeIt.remove();
+                    removed++;
+                }
+            }
+
+            Iterator<ActiveMethodEvent> methodIt = activeMethodEvents.iterator();
+            while (methodIt.hasNext()) {
+                ActiveMethodEvent active = methodIt.next();
+                if (active.matches(spec)) {
+                    vm.eventRequestManager().deleteEventRequest(active.request);
+                    methodIt.remove();
+                    removed++;
+                }
+            }
+
+            Iterator<PendingWatchpoint> pendingWatchIt = pendingWatchpoints.iterator();
+            while (pendingWatchIt.hasNext()) {
+                PendingWatchpoint pending = pendingWatchIt.next();
+                if (pending.field.spec.equals(spec)) {
+                    if (pending.prepareRequest != null) {
+                        vm.eventRequestManager().deleteEventRequest(pending.prepareRequest);
+                    }
+                    pendingWatchIt.remove();
+                    removed++;
+                }
+            }
+
+            Iterator<ActiveWatchpoint> activeWatchIt = activeWatchpoints.iterator();
+            while (activeWatchIt.hasNext()) {
+                ActiveWatchpoint active = activeWatchIt.next();
+                if (active.field.spec.equals(spec)) {
+                    vm.eventRequestManager().deleteEventRequest(active.request);
+                    activeWatchIt.remove();
+                    removed++;
+                }
+            }
+
+            Iterator<ActiveExceptionRequest> exceptionIt = activeExceptionRequests.iterator();
+            while (exceptionIt.hasNext()) {
+                ActiveExceptionRequest active = exceptionIt.next();
+                if (active.exceptionName.equals(spec)) {
+                    vm.eventRequestManager().deleteEventRequest(active.request);
+                    exceptionIt.remove();
+                    removed++;
+                }
+            }
+
+            if (removed == 0) {
+                throw new RpcException("breakpoint_not_found", "breakpoint not found: " + spec);
+            }
+            return Json.object("removed", removed, "spec", spec);
         }
 
         Object setMethodEvent(Map<String, Object> params) throws Exception {
@@ -382,6 +531,51 @@ final class JdiService {
                     "deferred", vm.classesByName(spec.className).isEmpty(),
                     "note", "JDI method " + spec.eventKind + " event request installed"
             );
+        }
+
+        Object catchException(Map<String, Object> params) throws Exception {
+            String exceptionName = Json.string(params, "exception");
+            String mode = Json.optionalString(params, "mode", "all");
+            boolean caught = "caught".equals(mode) || "all".equals(mode);
+            boolean uncaught = "uncaught".equals(mode) || "all".equals(mode);
+            if (!caught && !uncaught) {
+                throw new RpcException("bad_catch_mode", "catch mode must be caught, uncaught, or all: " + mode);
+            }
+
+            ReferenceType exceptionType = null;
+            List<ReferenceType> loaded = vm.classesByName(exceptionName);
+            if (!loaded.isEmpty()) {
+                exceptionType = loaded.get(0);
+            }
+            ExceptionRequest request = vm.eventRequestManager().createExceptionRequest(exceptionType, caught, uncaught);
+            request.setSuspendPolicy(EventRequest.SUSPEND_ALL);
+            request.putProperty("jdbg.exceptionName", exceptionName);
+            request.putProperty("jdbg.exceptionMode", mode);
+            request.enable();
+            activeExceptionRequests.add(new ActiveExceptionRequest(exceptionName, mode, request));
+            String note = exceptionType == null
+                    ? "Exception type is not loaded yet; JDI will filter matching exceptions at throw time."
+                    : null;
+            return Json.object("spec", exceptionName, "deferred", exceptionType == null, "note", note);
+        }
+
+        Object ignoreException(Map<String, Object> params) throws Exception {
+            String exceptionName = Json.string(params, "exception");
+            String mode = Json.optionalString(params, "mode", "all");
+            int removed = 0;
+            Iterator<ActiveExceptionRequest> it = activeExceptionRequests.iterator();
+            while (it.hasNext()) {
+                ActiveExceptionRequest active = it.next();
+                if (active.matches(exceptionName, mode)) {
+                    vm.eventRequestManager().deleteEventRequest(active.request);
+                    it.remove();
+                    removed++;
+                }
+            }
+            if (removed == 0) {
+                throw new RpcException("catchpoint_not_found", "catchpoint not found: " + exceptionName + " (" + mode + ")");
+            }
+            return Json.object("removed", removed, "spec", exceptionName, "mode", mode);
         }
 
         Object setWatchpoint(Map<String, Object> params) throws Exception {
@@ -457,12 +651,56 @@ final class JdiService {
             }
         }
 
+        Object stepInto(long timeoutMs) throws Exception {
+            return step(timeoutMs, StepRequest.STEP_INTO);
+        }
+
         Object stepOver(long timeoutMs) throws Exception {
+            return step(timeoutMs, StepRequest.STEP_OVER);
+        }
+
+        Object stepOut(long timeoutMs) throws Exception {
+            return step(timeoutMs, StepRequest.STEP_OUT);
+        }
+
+        Object classes(String pattern) {
+            String needle = pattern == null ? null : pattern.toLowerCase();
+            List<String> names = new ArrayList<>();
+            for (ReferenceType type : vm.allClasses()) {
+                String name = type.name();
+                if (needle == null || name.toLowerCase().contains(needle)) {
+                    names.add(name);
+                }
+            }
+            Collections.sort(names);
+            List<Object> out = Json.array();
+            out.addAll(names);
+            return Json.object("classes", out);
+        }
+
+        Object methods(String className) throws RpcException {
+            List<ReferenceType> loaded = vm.classesByName(className);
+            if (loaded.isEmpty()) {
+                throw new RpcException("class_not_loaded", "class is not loaded: " + className);
+            }
+            ReferenceType type = loaded.get(0);
+            List<String> methods = new ArrayList<>();
+            for (Method method : type.allMethods()) {
+                methods.add(type.name() + "." + method.name() + method.signature() + " : " + method.returnTypeName());
+            }
+            Collections.sort(methods);
+            List<Object> out = Json.array();
+            out.addAll(methods);
+            return Json.object("class", className, "methods", out);
+        }
+
+        private Object step(long timeoutMs, int depth) throws Exception {
             ThreadReference thread = currentThread();
+            deleteStepRequests(thread);
             StepRequest request = vm.eventRequestManager().createStepRequest(
                     thread,
                     StepRequest.STEP_LINE,
-                    StepRequest.STEP_OVER
+                    depth
             );
             request.addCountFilter(1);
             request.setSuspendPolicy(EventRequest.SUSPEND_ALL);
@@ -470,10 +708,148 @@ final class JdiService {
             return continueFor(timeoutMs);
         }
 
+        private void deleteStepRequests(ThreadReference thread) {
+            for (StepRequest request : vm.eventRequestManager().stepRequests()) {
+                if (request.thread().equals(thread)) {
+                    vm.eventRequestManager().deleteEventRequest(request);
+                }
+            }
+        }
+
         Object selectThread(String id) throws RpcException {
             findThread(id);
             currentThreadId = id;
+            currentFrameIndex = 0;
             return Json.object("ok", true);
+        }
+
+        Object selectFrame(String direction, int count) throws RpcException {
+            if (!"up".equals(direction) && !"down".equals(direction)) {
+                throw new RpcException("bad_frame_direction", "frame direction must be up or down: " + direction);
+            }
+            ThreadReference thread = currentThread();
+            int frameCount;
+            try {
+                frameCount = thread.frameCount();
+            } catch (IncompatibleThreadStateException e) {
+                throw new RpcException("thread_not_suspended", "current thread is not suspended", e);
+            }
+            int delta = Math.max(count, 0);
+            int next = "up".equals(direction) ? currentFrameIndex + delta : currentFrameIndex - delta;
+            if (next < 0) {
+                next = 0;
+            }
+            if (next >= frameCount) {
+                next = frameCount - 1;
+            }
+            currentFrameIndex = next;
+            StackFrame frame = frame(thread);
+            return Json.object(
+                    "index", currentFrameIndex,
+                    "frame", frameMap(currentFrameIndex, frame),
+                    "text", "Current frame #" + currentFrameIndex + ": " + frame.location().declaringType().name()
+                            + "." + frame.location().method().name() + " line " + Math.max(frame.location().lineNumber(), 0)
+            );
+        }
+
+        Object listSource(Integer requestedLine) throws RpcException {
+            StackFrame frame = currentFrame();
+            Location location = frame.location();
+            int center = requestedLine == null ? Math.max(location.lineNumber(), 1) : requestedLine.intValue();
+            Path source = findSourcePath(location);
+            List<String> sourceLines;
+            try {
+                sourceLines = Files.readAllLines(source, StandardCharsets.UTF_8);
+            } catch (IOException e) {
+                throw new RpcException("source_unreadable", "failed to read source file: " + source, e);
+            }
+            int start = Math.max(1, center - 5);
+            int end = Math.min(sourceLines.size(), center + 5);
+            List<Object> lines = Json.array();
+            for (int line = start; line <= end; line++) {
+                lines.add(Json.object("number", line, "text", sourceLines.get(line - 1)));
+            }
+            return Json.object("aroundLine", center, "lines", lines);
+        }
+
+        Object suspendThread(String id) throws RpcException {
+            if (id == null || id.isEmpty()) {
+                vm.suspend();
+                return Json.object("text", "Suspended all threads");
+            }
+            ThreadReference thread = findThread(id);
+            thread.suspend();
+            return Json.object("text", "Suspended thread " + id + " (" + thread.name() + ")");
+        }
+
+        Object resumeThread(String id) throws RpcException {
+            if (id == null || id.isEmpty()) {
+                EventSet stopSet = currentStopSet;
+                if (stopSet != null) {
+                    resumeStopSet(stopSet);
+                } else {
+                    vm.resume();
+                }
+                return Json.object("text", "Resumed all threads");
+            }
+            ThreadReference thread = findThread(id);
+            thread.resume();
+            return Json.object("text", "Resumed thread " + id + " (" + thread.name() + ")");
+        }
+
+        Object lockInfo(String expr) throws RpcException {
+            if (!vm.canGetMonitorInfo()) {
+                throw new RpcException("capability_unavailable", "target VM does not expose monitor info");
+            }
+            Value value = resolveExpression(expr);
+            if (!(value instanceof ObjectReference)) {
+                throw new RpcException("not_object", "lock target is not an object: " + expr);
+            }
+            ObjectReference object = (ObjectReference) value;
+            StringBuilder text = new StringBuilder();
+            text.append(expr).append(" monitor");
+            try {
+                ThreadReference owner = object.owningThread();
+                text.append("\n  owner: ").append(owner == null ? "(none)" : threadLabel(owner));
+                text.append("\n  entryCount: ").append(object.entryCount());
+                List<ThreadReference> waiters = object.waitingThreads();
+                text.append("\n  waiters:");
+                if (waiters.isEmpty()) {
+                    text.append(" (none)");
+                } else {
+                    for (ThreadReference waiter : waiters) {
+                        text.append("\n    ").append(threadLabel(waiter));
+                    }
+                }
+            } catch (IncompatibleThreadStateException e) {
+                throw new RpcException("thread_not_suspended", "monitor information requires a suspended VM", e);
+            }
+            return Json.object("text", text.toString());
+        }
+
+        Object threadLocks(String id) throws RpcException {
+            if (!vm.canGetOwnedMonitorInfo() || !vm.canGetCurrentContendedMonitor()) {
+                throw new RpcException("capability_unavailable", "target VM does not expose thread lock info");
+            }
+            ThreadReference thread = id == null || id.isEmpty() ? currentThread() : findThread(id);
+            StringBuilder text = new StringBuilder();
+            text.append("Thread ").append(threadLabel(thread)).append(" locks:");
+            try {
+                ObjectReference blockedOn = thread.currentContendedMonitor();
+                text.append("\n  blockedOn: ").append(blockedOn == null ? "(none)" : objectLabel(blockedOn));
+                List<ObjectReference> owned = thread.ownedMonitors();
+                text.append("\n  owned:");
+                if (owned.isEmpty()) {
+                    text.append(" (none)");
+                } else {
+                    for (ObjectReference monitor : owned) {
+                        text.append("\n    ").append(objectLabel(monitor));
+                    }
+                }
+            } catch (IncompatibleThreadStateException e) {
+                throw new RpcException("thread_not_suspended", "thread lock information requires a suspended thread", e);
+            }
+            return Json.object("text", text.toString());
         }
 
         Object inspect(Map<String, Object> params) throws RpcException {
@@ -577,6 +953,10 @@ final class JdiService {
                             handleVmStart(eventSet);
                         } else if (event instanceof ClassPrepareEvent) {
                             resolvePending((ClassPrepareEvent) event);
+                        } else if (event instanceof ExceptionEvent) {
+                            if (handleExceptionStop(eventSet, (ExceptionEvent) event)) {
+                                shouldResume = false;
+                            }
                         } else if (event instanceof MethodEntryEvent) {
                             if (handleMethodEntryStop(eventSet, (MethodEntryEvent) event)) {
                                 shouldResume = false;
@@ -619,6 +999,7 @@ final class JdiService {
             synchronized (this) {
                 currentStopSet = eventSet;
                 currentThreadId = Long.toString(thread.uniqueID());
+                currentFrameIndex = 0;
                 stops.offer(new StopRecord(stop, eventSet));
             }
             sendEvent(kind, stop);
@@ -631,9 +1012,30 @@ final class JdiService {
             synchronized (this) {
                 currentStopSet = eventSet;
                 currentThreadId = Long.toString(event.thread().uniqueID());
+                currentFrameIndex = 0;
                 stops.offer(new StopRecord(stop, eventSet));
             }
             sendEvent("fieldWatch", stop);
+        }
+
+        private boolean handleExceptionStop(EventSet eventSet, ExceptionEvent event) {
+            String exceptionName = event.exception().referenceType().name();
+            for (ActiveExceptionRequest active : activeExceptionRequests) {
+                if (active.request == event.request() && !active.matchesException(exceptionName)) {
+                    return false;
+                }
+            }
+            Map<String, Object> stop = stopPayload("exception", event.thread(), event.location(), null);
+            stop.put("exception", exceptionName);
+            stop.put("caught", event.catchLocation() != null);
+            synchronized (this) {
+                currentStopSet = eventSet;
+                currentThreadId = Long.toString(event.thread().uniqueID());
+                currentFrameIndex = 0;
+                stops.offer(new StopRecord(stop, eventSet));
+            }
+            sendEvent("exception", stop);
+            return true;
         }
 
         private boolean handleMethodEntryStop(EventSet eventSet, MethodEntryEvent event) {
@@ -657,6 +1059,7 @@ final class JdiService {
             synchronized (this) {
                 currentStopSet = eventSet;
                 currentThreadId = Long.toString(event.thread().uniqueID());
+                currentFrameIndex = 0;
                 stops.offer(new StopRecord(stop, eventSet));
             }
             sendEvent("methodExit", stop);
@@ -744,6 +1147,7 @@ final class JdiService {
             if (threadId instanceof String) {
                 currentThreadId = (String) threadId;
             }
+            currentFrameIndex = 0;
         }
 
         private synchronized void resumeFromStop() {
@@ -777,7 +1181,7 @@ final class JdiService {
             while (it.hasNext()) {
                 PendingBreakpoint pending = it.next();
                 if (pending.className.equals(name)) {
-                    createBreakpoint(event.referenceType(), pending.line, pending.suspendPolicy);
+                    createBreakpoint(event.referenceType(), pending.line, pending.suspendPolicy, pending.spec());
                     if (pending.prepareRequest != null) {
                         vm.eventRequestManager().deleteEventRequest(pending.prepareRequest);
                     }
@@ -797,7 +1201,7 @@ final class JdiService {
             }
         }
 
-        private void createBreakpoint(ReferenceType type, int line, int suspendPolicy) throws Exception {
+        private void createBreakpoint(ReferenceType type, int line, int suspendPolicy, String spec) throws Exception {
             List<Location> locations = type.locationsOfLine(line);
             if (locations.isEmpty()) {
                 throw new RpcException("no_executable_line", "no executable location at " + type.name() + ":" + line);
@@ -805,6 +1209,7 @@ final class JdiService {
             BreakpointRequest request = vm.eventRequestManager().createBreakpointRequest(locations.get(0));
             request.setSuspendPolicy(suspendPolicy);
             request.enable();
+            activeBreakpoints.add(new ActiveBreakpoint(spec, type.name(), line, request));
         }
 
         private void createWatchpoints(ReferenceType type, FieldSpec fieldSpec, String mode) throws RpcException {
@@ -872,7 +1277,9 @@ final class JdiService {
                 if (thread.frameCount() == 0) {
                     throw new RpcException("empty_stack", "current thread has no stack frames");
                 }
-                return thread.frame(0);
+                int index = Math.max(0, Math.min(currentFrameIndex, thread.frameCount() - 1));
+                currentFrameIndex = index;
+                return thread.frame(index);
             } catch (IncompatibleThreadStateException e) {
                 throw new RpcException("thread_not_suspended", "current thread is not suspended", e);
             }
@@ -921,6 +1328,9 @@ final class JdiService {
         }
 
         private Value fieldValue(Value value, String fieldName) throws RpcException {
+            if (value instanceof ArrayReference && "length".equals(fieldName)) {
+                return vm.mirrorOf(((ArrayReference) value).length());
+            }
             if (!(value instanceof ObjectReference)) {
                 throw new RpcException("not_object", "cannot read field '" + fieldName + "' from non-object value");
             }
@@ -931,6 +1341,39 @@ final class JdiService {
                 }
             }
             throw new RpcException("field_not_found", "field not found: " + fieldName);
+        }
+
+        private Path findSourcePath(Location location) throws RpcException {
+            List<String> candidates = new ArrayList<>();
+            try {
+                candidates.add(location.sourcePath());
+            } catch (AbsentInformationException ignored) {
+            }
+            try {
+                candidates.add(location.sourceName());
+            } catch (AbsentInformationException ignored) {
+            }
+            for (String candidate : candidates) {
+                Path path = Paths.get(candidate);
+                if (path.isAbsolute() && Files.isRegularFile(path)) {
+                    return path;
+                }
+                for (String root : sourcePaths) {
+                    Path resolved = Paths.get(root).resolve(candidate);
+                    if (Files.isRegularFile(resolved)) {
+                        return resolved;
+                    }
+                }
+            }
+            throw new RpcException("source_not_found", "source file not found for " + location.declaringType().name());
+        }
+
+        private String threadLabel(ThreadReference thread) {
+            return Long.toString(thread.uniqueID()) + " " + thread.name();
+        }
+
+        private String objectLabel(ObjectReference object) {
+            return object.referenceType().name() + "@" + object.uniqueID();
         }
     }
 
@@ -1007,6 +1450,32 @@ final class JdiService {
             this.line = line;
             this.suspendPolicy = suspendPolicy;
         }
+
+        String spec() {
+            return className + ":" + line;
+        }
+
+        boolean matches(String spec) {
+            return spec().equals(spec);
+        }
+    }
+
+    private static final class ActiveBreakpoint {
+        final String spec;
+        final String className;
+        final int line;
+        final EventRequest request;
+
+        ActiveBreakpoint(String spec, String className, int line, EventRequest request) {
+            this.spec = spec;
+            this.className = className;
+            this.line = line;
+            this.request = request;
+        }
+
+        boolean matches(String other) {
+            return spec.equals(other) || (className + ":" + line).equals(other);
+        }
     }
 
     private static final class PendingWatchpoint {
@@ -1062,6 +1531,30 @@ final class JdiService {
             this.spec = spec;
             this.eventKind = eventKind;
             this.request = request;
+        }
+
+        boolean matches(String clearSpec) {
+            return spec.matchesClearSpec(clearSpec);
+        }
+    }
+
+    private static final class ActiveExceptionRequest {
+        final String exceptionName;
+        final String mode;
+        final ExceptionRequest request;
+
+        ActiveExceptionRequest(String exceptionName, String mode, ExceptionRequest request) {
+            this.exceptionName = exceptionName;
+            this.mode = mode;
+            this.request = request;
+        }
+
+        boolean matches(String otherExceptionName, String otherMode) {
+            return exceptionName.equals(otherExceptionName) && ("all".equals(otherMode) || mode.equals(otherMode));
+        }
+
+        boolean matchesException(String thrownName) {
+            return exceptionName.equals(thrownName) || thrownName.endsWith("." + exceptionName);
         }
     }
 
@@ -1127,6 +1620,10 @@ final class JdiService {
             }
             descriptor.append(')');
             return signature.startsWith(descriptor.toString());
+        }
+
+        boolean matchesClearSpec(String clearSpec) {
+            return display().equals(clearSpec) || (className + "." + methodName).equals(clearSpec);
         }
 
         String display() {
