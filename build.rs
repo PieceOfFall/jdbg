@@ -39,7 +39,7 @@ fn main() {
     let jar_path = profile_dir.join(SIDECAR_JAR);
     let sidecar_dir = PathBuf::from("sidecar").join("jdi");
 
-    let mut gradle_cmd = Command::new(gradle_wrapper_path(&sidecar_dir));
+    let mut gradle_cmd = gradle_wrapper_command(&sidecar_dir);
     gradle_cmd
         .current_dir(&sidecar_dir)
         .arg("--no-daemon")
@@ -90,12 +90,14 @@ fn run_or_panic(mut command: Command, label: &str) {
     }
 }
 
-fn gradle_wrapper_path(sidecar_dir: &Path) -> PathBuf {
-    sidecar_dir.join(if cfg!(windows) {
-        "gradlew.bat"
+fn gradle_wrapper_command(sidecar_dir: &Path) -> Command {
+    if cfg!(windows) {
+        Command::new(sidecar_dir.join("gradlew.bat"))
     } else {
-        "gradlew"
-    })
+        let mut command = Command::new("sh");
+        command.arg("./gradlew");
+        command
+    }
 }
 
 fn java_exe_name(name: &str) -> OsString {

@@ -18,7 +18,10 @@ static JAVAC_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 static JDI_E2E_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 fn jdi_e2e_guard() -> std::sync::MutexGuard<'static, ()> {
-    JDI_E2E_LOCK.lock().expect("JDI e2e lock poisoned")
+    match JDI_E2E_LOCK.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
 }
 
 /// Helper: get the jdb path.
@@ -85,11 +88,7 @@ fn run_java_sidecar_self_tests() {
     let sidecar_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("sidecar")
         .join("jdi");
-    let mut gradle = Command::new(sidecar_dir.join(if cfg!(windows) {
-        "gradlew.bat"
-    } else {
-        "gradlew"
-    }));
+    let mut gradle = gradle_wrapper_command(&sidecar_dir);
     gradle
         .current_dir(&sidecar_dir)
         .arg("--no-daemon")
@@ -109,6 +108,16 @@ fn run_java_sidecar_self_tests() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn gradle_wrapper_command(sidecar_dir: &Path) -> Command {
+    if cfg!(windows) {
+        Command::new(sidecar_dir.join("gradlew.bat"))
+    } else {
+        let mut command = Command::new("sh");
+        command.arg("./gradlew");
+        command
+    }
 }
 
 fn gradle_java_home() -> Option<PathBuf> {
@@ -1097,7 +1106,7 @@ fn jdi_eval_set_and_force_return_execute_in_stopped_frame() {
     .expect("JDI attach failed");
 
     session
-        .stop_at("EvalMutationTest", 26, None)
+        .stop_at("EvalMutationTest", 25, None)
         .expect("JDI breakpoint failed");
     let stop = session.cont(Some(30)).expect("JDI cont failed");
     assert!(
@@ -1105,6 +1114,21 @@ fn jdi_eval_set_and_force_return_execute_in_stopped_frame() {
         "expected breakpoint stop, got {:?}",
         stop.result
     );
+    let step = session.next(Some(30)).expect("JDI step-over failed");
+    match &step.result {
+        CommandResult::Stopped {
+            event, location, ..
+        } => {
+            assert!(matches!(event, Event::Step { .. }));
+            assert_eq!(location.class, "EvalMutationTest");
+            assert_eq!(location.method, "compute");
+            assert!(
+                (25..=26).contains(&location.line),
+                "expected step-over to remain near the compute return site, got {location:?}"
+            );
+        }
+        other => panic!("expected step stop at return line, got {other:?}"),
+    }
 
     let evaluated = session
         .evaluate("box.add(values[1]) + local + EvalMutationTest.staticAdd(1, 2)")
@@ -1521,7 +1545,7 @@ fn mcp_jdi_eval_set_force_return_smoke() {
             "method": "tools/call",
             "params": {
                 "name": "break_at",
-                "arguments": {"class": "EvalMutationTest", "line": 26}
+                "arguments": {"class": "EvalMutationTest", "line": 25}
             }
         }),
         json!({
@@ -1538,6 +1562,15 @@ fn mcp_jdi_eval_set_force_return_smoke() {
             "id": 5,
             "method": "tools/call",
             "params": {
+                "name": "next",
+                "arguments": {"timeout": 10}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
                 "name": "print",
                 "arguments": {
                     "expr": "box.add(values[1]) + local + EvalMutationTest.staticAdd(1, 2)"
@@ -1546,7 +1579,7 @@ fn mcp_jdi_eval_set_force_return_smoke() {
         }),
         json!({
             "jsonrpc": "2.0",
-            "id": 6,
+            "id": 7,
             "method": "tools/call",
             "params": {
                 "name": "set",
@@ -1555,7 +1588,7 @@ fn mcp_jdi_eval_set_force_return_smoke() {
         }),
         json!({
             "jsonrpc": "2.0",
-            "id": 7,
+            "id": 8,
             "method": "tools/call",
             "params": {
                 "name": "set",
@@ -1564,7 +1597,7 @@ fn mcp_jdi_eval_set_force_return_smoke() {
         }),
         json!({
             "jsonrpc": "2.0",
-            "id": 8,
+            "id": 9,
             "method": "tools/call",
             "params": {
                 "name": "force_return",
@@ -1573,7 +1606,7 @@ fn mcp_jdi_eval_set_force_return_smoke() {
         }),
         json!({
             "jsonrpc": "2.0",
-            "id": 9,
+            "id": 10,
             "method": "tools/call",
             "params": {
                 "name": "break_at",
@@ -1582,7 +1615,7 @@ fn mcp_jdi_eval_set_force_return_smoke() {
         }),
         json!({
             "jsonrpc": "2.0",
-            "id": 10,
+            "id": 11,
             "method": "tools/call",
             "params": {
                 "name": "cont",
@@ -1591,7 +1624,7 @@ fn mcp_jdi_eval_set_force_return_smoke() {
         }),
         json!({
             "jsonrpc": "2.0",
-            "id": 11,
+            "id": 12,
             "method": "tools/call",
             "params": {
                 "name": "eval",
@@ -1600,7 +1633,7 @@ fn mcp_jdi_eval_set_force_return_smoke() {
         }),
         json!({
             "jsonrpc": "2.0",
-            "id": 12,
+            "id": 13,
             "method": "tools/call",
             "params": {
                 "name": "inspect",
@@ -1609,36 +1642,38 @@ fn mcp_jdi_eval_set_force_return_smoke() {
         }),
         json!({
             "jsonrpc": "2.0",
-            "id": 13,
+            "id": 14,
             "method": "tools/call",
             "params": {"name": "kill", "arguments": {}}
         }),
     ];
 
     let responses = run_mcp_jsonrpc(&messages, &guard);
-    for id in 2..=13 {
+    for id in 2..=14 {
         assert_mcp_success(mcp_response(&responses, id));
     }
 
-    let printed = mcp_text(mcp_response(&responses, 5));
+    let stepped = mcp_text(mcp_response(&responses, 5));
+    assert!(stepped.contains("Step completed"), "{stepped}");
+    let printed = mcp_text(mcp_response(&responses, 6));
     assert!(printed.contains("= 15"), "{printed}");
-    let set_field = mcp_text(mcp_response(&responses, 6));
+    let set_field = mcp_text(mcp_response(&responses, 7));
     assert!(set_field.contains("box.count = 10"), "{set_field}");
-    let set_array = mcp_text(mcp_response(&responses, 7));
+    let set_array = mcp_text(mcp_response(&responses, 8));
     assert!(set_array.contains("values[1] = 5"), "{set_array}");
-    let forced = mcp_text(mcp_response(&responses, 8));
+    let forced = mcp_text(mcp_response(&responses, 9));
     assert!(
         forced.contains("Forced current method to return 123"),
         "{forced}"
     );
-    let stopped = mcp_text(mcp_response(&responses, 10));
+    let stopped = mcp_text(mcp_response(&responses, 11));
     assert!(stopped.contains("Breakpoint hit"), "{stopped}");
-    let result = mcp_text(mcp_response(&responses, 11));
+    let result = mcp_text(mcp_response(&responses, 12));
     assert!(result.contains("= 123"), "{result}");
-    let inspect = mcp_text(mcp_response(&responses, 12));
+    let inspect = mcp_text(mcp_response(&responses, 13));
     assert!(inspect.contains("\"name\": \"count\""), "{inspect}");
     assert!(inspect.contains("\"value\": \"10\""), "{inspect}");
-    let kill = mcp_text(mcp_response(&responses, 13));
+    let kill = mcp_text(mcp_response(&responses, 14));
     assert!(kill.contains("killed"), "{kill}");
 }
 
