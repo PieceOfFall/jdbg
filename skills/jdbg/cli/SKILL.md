@@ -4,7 +4,7 @@ description: "Use the jdbg CLI to debug Java programs interactively from Pi when
 compatibility: "Requires a JDK 8+ with jdb available through JAVA_HOME, PATH, or --jdb-path. Requires the jdbg CLI on PATH. Native on Windows, Linux, and macOS."
 allowed-tools: "Bash(jdbg:*), Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "1.10"
+  version: "1.11"
 ---
 
 # jdbg CLI - interactive Java debugging for Pi
@@ -67,7 +67,9 @@ jdbg attach --backend jdi --host localhost --port 5005 --sourcepath src/main/jav
 
 If `--sourcepath` is omitted, jdbg uses the shell's current working directory as the source root and sends it
 to the daemon as an absolute path. Relative `--sourcepath` values are also absolutized before the daemon sees
-them, so source lookup is stable even when the daemon was started from another directory.
+them, so source lookup is stable even when the daemon was started from another directory. On JDI sessions,
+source lookup also tries the target JVM's `user.dir` and Maven/Gradle module roots inferred from
+`java.class.path` (for example `mall-portal/target/classes` -> `mall-portal/src/main/java`).
 
 The default backend is `jdb`. The JDI backend supports the normal debugging surface too: breakpoints,
 exception catchpoints, watchpoints, stepping, stack frames, classes/methods, source listing, thread control,
@@ -347,7 +349,9 @@ jdbg force-return "123"
 ```
 
 `force-return` is JDI-only and currently supports non-void methods. It mutates control flow by forcing the
-current suspended method to return the evaluated value expression.
+current suspended method to return the evaluated value expression. The forced return is applied when the
+thread resumes; a `where` command before the next `cont`/`step` may still show the old frame and include a
+note explaining that pending refresh.
 
 ## Raw Escape Hatch
 

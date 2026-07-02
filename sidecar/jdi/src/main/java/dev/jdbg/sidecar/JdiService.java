@@ -3,6 +3,7 @@ package dev.jdbg.sidecar;
 import com.sun.jdi.AbsentInformationException;
 import com.sun.jdi.ArrayReference;
 import com.sun.jdi.Bootstrap;
+import com.sun.jdi.ClassType;
 import com.sun.jdi.Field;
 import com.sun.jdi.IncompatibleThreadStateException;
 import com.sun.jdi.Location;
@@ -319,7 +320,7 @@ final class JdiService {
         volatile String currentThreadId;
         volatile int currentFrameIndex;
         volatile EventSet currentStopSet;
-        volatile boolean waitingForStopResponse;
+        volatile boolean forceReturnPending;
         volatile boolean disconnected;
 
         DebugSession(String id, VirtualMachine vm, List<String> sourcePaths) {
@@ -353,7 +354,14 @@ final class JdiService {
 
         Object stack(int maxFrames) throws RpcException {
             ThreadReference thread = currentThread();
-            return Json.object("frames", frames(thread, maxFrames));
+            Map<String, Object> out = Json.object("frames", frames(thread, maxFrames));
+            if (forceReturnPending) {
+                out.put(
+                        "note",
+                        "force_return takes effect when the thread resumes; the current stack may show the old frame until the next cont/step."
+                );
+            }
+            return out;
         }
 
         Object stacks(int maxFrames) {
@@ -643,42 +651,32 @@ final class JdiService {
             long deadline = System.currentTimeMillis() + timeoutMs;
             long timeoutGraceMs = timeoutGraceMillis(timeoutMs);
             boolean usedTimeoutGrace = false;
-            waitingForStopResponse = true;
-            try {
-                StopRecord stop = pollQueuedStopOrResume();
-                while (true) {
-                    if (stop == null) {
-                        long remaining = deadline - System.currentTimeMillis();
-                        if (remaining <= 0) {
-                            if (!usedTimeoutGrace && timeoutGraceMs > 0) {
-                                usedTimeoutGrace = true;
-                                stop = stops.poll(timeoutGraceMs, TimeUnit.MILLISECONDS);
-                                if (stop != null) {
-                                    continue;
-                                }
+            StopRecord stop = pollQueuedStopOrResume();
+            while (true) {
+                if (stop == null) {
+                    long remaining = deadline - System.currentTimeMillis();
+                    if (remaining <= 0) {
+                        if (!usedTimeoutGrace && timeoutGraceMs > 0) {
+                            usedTimeoutGrace = true;
+                            stop = stops.poll(timeoutGraceMs, TimeUnit.MILLISECONDS);
+                            if (stop != null) {
+                                continue;
                             }
-                            return timeoutPayload();
                         }
-                        stop = stops.poll(remaining, TimeUnit.MILLISECONDS);
-                        if (stop == null) {
-                            continue;
-                        }
+                        return timeoutPayload();
                     }
-                    if (!stop.deliverToWaitingRequest && !"vmDisconnected".equals(stop.payload.get("event"))) {
-                        resumeStopSet(stop.eventSet);
-                        stop = null;
+                    stop = stops.poll(remaining, TimeUnit.MILLISECONDS);
+                    if (stop == null) {
                         continue;
                     }
-                    if ("vmStart".equals(stop.payload.get("event"))) {
-                        resumeStopSet(stop.eventSet);
-                        stop = null;
-                        continue;
-                    }
-                    selectStop(stop);
-                    return stop.payload;
                 }
-            } finally {
-                waitingForStopResponse = false;
+                if ("vmStart".equals(stop.payload.get("event"))) {
+                    resumeStopSet(stop.eventSet);
+                    stop = null;
+                    continue;
+                }
+                selectStop(stop);
+                return stop.payload;
             }
         }
 
@@ -942,6 +940,8 @@ final class JdiService {
             String valueExpr = Json.string(params, "value");
             EvaluationContext context = evaluationContext();
             Value value = new ExpressionEvaluator(vm, context.thread, context.frame).forceReturn(valueExpr);
+            currentFrameIndex = 0;
+            forceReturnPending = true;
             return Json.object(
                     "value", ValueRenderer.display(value),
                     "type", value == null ? null : value.type().name()
@@ -1042,7 +1042,8 @@ final class JdiService {
                 currentStopSet = eventSet;
                 currentThreadId = Long.toString(thread.uniqueID());
                 currentFrameIndex = 0;
-                stops.offer(new StopRecord(stop, eventSet, waitingForStopResponse));
+                forceReturnPending = false;
+                stops.offer(new StopRecord(stop, eventSet));
             }
             sendEvent(kind, stop);
         }
@@ -1055,7 +1056,8 @@ final class JdiService {
                 currentStopSet = eventSet;
                 currentThreadId = Long.toString(event.thread().uniqueID());
                 currentFrameIndex = 0;
-                stops.offer(new StopRecord(stop, eventSet, waitingForStopResponse));
+                forceReturnPending = false;
+                stops.offer(new StopRecord(stop, eventSet));
             }
             sendEvent("fieldWatch", stop);
         }
@@ -1074,7 +1076,8 @@ final class JdiService {
                 currentStopSet = eventSet;
                 currentThreadId = Long.toString(event.thread().uniqueID());
                 currentFrameIndex = 0;
-                stops.offer(new StopRecord(stop, eventSet, waitingForStopResponse));
+                forceReturnPending = false;
+                stops.offer(new StopRecord(stop, eventSet));
             }
             sendEvent("exception", stop);
             return true;
@@ -1102,7 +1105,8 @@ final class JdiService {
                 currentStopSet = eventSet;
                 currentThreadId = Long.toString(event.thread().uniqueID());
                 currentFrameIndex = 0;
-                stops.offer(new StopRecord(stop, eventSet, waitingForStopResponse));
+                forceReturnPending = false;
+                stops.offer(new StopRecord(stop, eventSet));
             }
             sendEvent("methodExit", stop);
             return true;
@@ -1123,7 +1127,8 @@ final class JdiService {
             );
             synchronized (this) {
                 currentStopSet = eventSet;
-                stops.offer(new StopRecord(stop, eventSet, waitingForStopResponse));
+                forceReturnPending = false;
+                stops.offer(new StopRecord(stop, eventSet));
             }
             sendEvent("vmStart", stop);
         }
@@ -1156,7 +1161,7 @@ final class JdiService {
                     "message", message
             );
             synchronized (this) {
-                stops.offer(new StopRecord(payload, null, true));
+                stops.offer(new StopRecord(payload, null));
             }
             sendEvent("vmDisconnected", Json.object("message", message));
         }
@@ -1209,6 +1214,7 @@ final class JdiService {
             if (currentStopSet == stopSet) {
                 currentStopSet = null;
             }
+            forceReturnPending = false;
             // Startup VMStartEvent delivery can race with the first continue call; only resume
             // an EventSet the event loop has actually recorded, otherwise deferred requests can
             // be installed after the VM has already run past their first possible stop site.
@@ -1395,7 +1401,8 @@ final class JdiService {
                 candidates.add(location.sourceName());
             } catch (AbsentInformationException ignored) {
             }
-            for (Path path : sourceCandidates(sourcePaths, candidates, location.declaringType().name())) {
+            List<String> roots = sourceSearchRoots();
+            for (Path path : sourceCandidates(roots, candidates, location.declaringType().name())) {
                 if (path.isAbsolute() && Files.isRegularFile(path)) {
                     return path;
                 }
@@ -1403,7 +1410,118 @@ final class JdiService {
                     return path;
                 }
             }
-            throw new RpcException("source_not_found", "source file not found for " + location.declaringType().name());
+            throw new RpcException(
+                    "source_not_found",
+                    "source file not found for " + location.declaringType().name() + " (roots: " + roots + ")"
+            );
+        }
+
+        private List<String> sourceSearchRoots() {
+            List<String> roots = new ArrayList<>(sourcePaths);
+            Map<String, String> properties = targetSystemProperties();
+            addIfPresent(roots, properties.get("user.dir"));
+            for (String root : sourceRootsFromClassPath(properties.get("java.class.path"))) {
+                addIfPresent(roots, root);
+            }
+            return roots;
+        }
+
+        private Map<String, String> targetSystemProperties() {
+            Map<String, String> out = new LinkedHashMap<>();
+            try {
+                ReferenceType systemType = loadedClass("java.lang.System");
+                if (systemType == null) {
+                    return out;
+                }
+                Field propsField = findField(systemType, "props");
+                Value propsValue = systemType.getValue(propsField);
+                if (propsValue instanceof ObjectReference) {
+                    collectHashtableEntries((ObjectReference) propsValue, out, 4096);
+                }
+            } catch (Exception e) {
+            }
+            addSystemPropertyByInvocation(out, "user.dir");
+            addSystemPropertyByInvocation(out, "java.class.path");
+            return out;
+        }
+
+        private void addSystemPropertyByInvocation(Map<String, String> out, String key) {
+            if (out.containsKey(key)) {
+                return;
+            }
+            try {
+                // Field-reading can fail on some VMs; this invokes only JDK System.getProperty, not user code.
+                ReferenceType systemType = loadedClass("java.lang.System");
+                if (!(systemType instanceof ClassType)) {
+                    return;
+                }
+                Method getProperty = null;
+                for (Method method : systemType.methodsByName("getProperty")) {
+                    if ("(Ljava/lang/String;)Ljava/lang/String;".equals(method.signature())) {
+                        getProperty = method;
+                        break;
+                    }
+                }
+                if (getProperty == null) {
+                    return;
+                }
+                Value value = ((ClassType) systemType).invokeMethod(
+                        currentThread(),
+                        getProperty,
+                        Collections.singletonList(vm.mirrorOf(key)),
+                        ObjectReference.INVOKE_SINGLE_THREADED
+                );
+                String text = stringValue(value);
+                if (text != null) {
+                    out.put(key, text);
+                }
+            } catch (Exception e) {
+            }
+        }
+
+        private ReferenceType loadedClass(String name) {
+            List<ReferenceType> exact = vm.classesByName(name);
+            if (!exact.isEmpty()) {
+                return exact.get(0);
+            }
+            for (ReferenceType type : vm.allClasses()) {
+                if (name.equals(type.name())) {
+                    return type;
+                }
+            }
+            return null;
+        }
+
+        private void collectHashtableEntries(ObjectReference tableObject, Map<String, String> out, int maxEntries)
+                throws RpcException {
+            Value tableValue = fieldValue(tableObject, "table");
+            if (!(tableValue instanceof ArrayReference)) {
+                return;
+            }
+            ArrayReference buckets = (ArrayReference) tableValue;
+            int seen = 0;
+            for (Value bucket : buckets.getValues()) {
+                ObjectReference entry = objectReference(bucket);
+                int chainDepth = 0;
+                while (entry != null && seen < maxEntries && chainDepth < 512) {
+                    String key = stringValue(fieldValue(entry, "key"));
+                    String value = stringValue(fieldValue(entry, "value"));
+                    if (key != null && value != null) {
+                        out.put(key, value);
+                        seen++;
+                    }
+                    entry = objectReference(fieldValue(entry, "next"));
+                    chainDepth++;
+                }
+            }
+        }
+
+        private ObjectReference objectReference(Value value) {
+            return value instanceof ObjectReference ? (ObjectReference) value : null;
+        }
+
+        private String stringValue(Value value) {
+            return value instanceof StringReference ? ((StringReference) value).value() : null;
         }
 
         private String threadLabel(ThreadReference thread) {
@@ -1448,6 +1566,22 @@ final class JdiService {
         return new ArrayList<>(out);
     }
 
+    static List<String> sourceRootsFromClassPath(String classPath) {
+        List<String> roots = new ArrayList<>();
+        if (classPath == null || classPath.isEmpty()) {
+            return roots;
+        }
+        for (String rawEntry : classPath.split(java.util.regex.Pattern.quote(File.pathSeparator))) {
+            if (rawEntry == null || rawEntry.trim().isEmpty()) {
+                continue;
+            }
+            Path entry = Paths.get(rawEntry.trim());
+            addIfPresent(roots, moduleRootFromTargetClasses(entry));
+            addIfPresent(roots, moduleRootFromGradleClasses(entry));
+        }
+        return roots;
+    }
+
     private static void addSourceRootCandidates(Set<Path> out, Path rootPath, String candidate) {
         out.add(rootPath.resolve(candidate));
         for (String[] suffix : SOURCE_ROOT_SUFFIXES) {
@@ -1478,6 +1612,51 @@ final class JdiService {
             }
         }
         return false;
+    }
+
+    private static String moduleRootFromTargetClasses(Path entry) {
+        Path fileName = entry.getFileName();
+        Path target = entry.getParent();
+        if (fileName == null || target == null || target.getFileName() == null) {
+            return null;
+        }
+        String leaf = fileName.toString();
+        if (!"classes".equals(leaf) && !"test-classes".equals(leaf)) {
+            return null;
+        }
+        if (!"target".equals(target.getFileName().toString())) {
+            return null;
+        }
+        Path moduleRoot = target.getParent();
+        return moduleRoot == null ? null : moduleRoot.toString();
+    }
+
+    private static String moduleRootFromGradleClasses(Path entry) {
+        if (entry.getNameCount() < 5) {
+            return null;
+        }
+        int count = entry.getNameCount();
+        String variant = entry.getName(count - 1).toString();
+        String language = entry.getName(count - 2).toString();
+        String classes = entry.getName(count - 3).toString();
+        String build = entry.getName(count - 4).toString();
+        if (!("main".equals(variant) || "test".equals(variant))) {
+            return null;
+        }
+        if (!("java".equals(language) || "kotlin".equals(language))) {
+            return null;
+        }
+        if (!"classes".equals(classes) || !"build".equals(build)) {
+            return null;
+        }
+        Path moduleRoot = entry.getParent().getParent().getParent().getParent();
+        return moduleRoot == null ? null : moduleRoot.toString();
+    }
+
+    private static void addIfPresent(List<String> values, String value) {
+        if (value != null && !value.isEmpty() && !values.contains(value)) {
+            values.add(value);
+        }
     }
 
     private static Path resolveSegments(Path root, String[] segments) {
@@ -1559,12 +1738,10 @@ final class JdiService {
     private static final class StopRecord {
         final Map<String, Object> payload;
         final EventSet eventSet;
-        final boolean deliverToWaitingRequest;
 
-        StopRecord(Map<String, Object> payload, EventSet eventSet, boolean deliverToWaitingRequest) {
+        StopRecord(Map<String, Object> payload, EventSet eventSet) {
             this.payload = payload;
             this.eventSet = eventSet;
-            this.deliverToWaitingRequest = deliverToWaitingRequest;
         }
     }
 

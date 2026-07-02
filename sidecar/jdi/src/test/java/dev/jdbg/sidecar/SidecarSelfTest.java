@@ -29,6 +29,7 @@ public final class SidecarSelfTest {
         testLaunchMainArgumentQuoting();
         testSourceCandidatesSearchMavenRoots();
         testSourceCandidatesSearchOneLevelModuleRoots();
+        testSourceRootsFromMavenClasspath();
         System.out.println("SidecarSelfTest passed");
     }
 
@@ -237,6 +238,39 @@ public final class SidecarSelfTest {
         assertTrue(
                 candidates.contains(expected),
                 "source candidates should include one-level Maven module source root"
+        );
+    }
+
+    private static void testSourceRootsFromMavenClasspath() throws IOException {
+        Path root = Files.createTempDirectory("jdbg-maven-classpath");
+        Path module = root.resolve("mall-portal");
+        Path classes = module.resolve("target").resolve("classes");
+        Files.createDirectories(classes);
+
+        List<String> roots = JdiService.sourceRootsFromClassPath(classes.toString());
+        assertTrue(
+                roots.contains(module.toString()),
+                "source roots should infer Maven module root from target/classes"
+        );
+
+        List<Path> candidates = JdiService.sourceCandidates(
+                roots,
+                java.util.Arrays.asList("HomeController.java"),
+                "com.macro.mall.portal.controller.HomeController"
+        );
+        Path expected = module
+                .resolve("src")
+                .resolve("main")
+                .resolve("java")
+                .resolve("com")
+                .resolve("macro")
+                .resolve("mall")
+                .resolve("portal")
+                .resolve("controller")
+                .resolve("HomeController.java");
+        assertTrue(
+                candidates.contains(expected),
+                "source candidates should include source path inferred from Maven classpath"
         );
     }
 

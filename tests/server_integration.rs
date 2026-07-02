@@ -287,6 +287,10 @@ impl Drop for TargetJvm {
 }
 
 fn start_jdwp_fixture(main_class: &str) -> TargetJvm {
+    start_jdwp_target(fixture_dir(), main_class)
+}
+
+fn start_jdwp_target(classpath: PathBuf, main_class: &str) -> TargetJvm {
     let port = free_loopback_port();
     let mut command = Command::new(java_path(false));
     command
@@ -294,7 +298,7 @@ fn start_jdwp_fixture(main_class: &str) -> TargetJvm {
             "-agentlib:jdwp=transport=dt_socket,server=y,suspend=y,address={port}"
         ))
         .arg("-cp")
-        .arg(fixture_dir())
+        .arg(classpath)
         .arg(main_class)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -314,6 +318,30 @@ fn start_jdwp_fixture(main_class: &str) -> TargetJvm {
         port,
         _output: rx,
     }
+}
+
+fn temp_test_dir(label: &str) -> PathBuf {
+    let path = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("target")
+        .join(format!(
+            "jdbg-{label}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("system time after epoch")
+                .as_millis()
+        ));
+    let _ = fs::remove_dir_all(&path);
+    fs::create_dir_all(&path).expect("create temp test dir");
+    path
+}
+
+fn source_line(source: &str, needle: &str) -> u32 {
+    source
+        .lines()
+        .position(|line| line.contains(needle))
+        .map(|index| index as u32 + 1)
+        .unwrap_or_else(|| panic!("source did not contain {needle:?}"))
 }
 
 struct TestDaemonGuard {
@@ -1280,6 +1308,105 @@ fn jdi_command_surface_supports_metadata_source_raw_and_array_length() {
 }
 
 #[test]
+fn jdi_attach_list_source_infers_maven_source_root_from_target_classpath() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    let root = temp_test_dir("maven-sourcepath");
+    let module = root.join("mall-portal");
+    let source_dir = module
+        .join("src")
+        .join("main")
+        .join("java")
+        .join("com")
+        .join("example")
+        .join("web");
+    let classes_dir = module.join("target").join("classes");
+    fs::create_dir_all(&source_dir).expect("create source dir");
+    fs::create_dir_all(&classes_dir).expect("create classes dir");
+    let source = r#"package com.example.web;
+
+public class MavenSourcePathTest {
+    public static void main(String[] args) throws Exception {
+        new MavenSourcePathTest().serve();
+        Thread.sleep(300000);
+    }
+
+    void serve() {
+        int marker = 7; // MAVEN_SOURCE_BREAKPOINT
+        System.out.println("marker=" + marker);
+    }
+}
+"#;
+    let source_file = source_dir.join("MavenSourcePathTest.java");
+    fs::write(&source_file, source).expect("write MavenSourcePathTest.java");
+    let line = source_line(source, "MAVEN_SOURCE_BREAKPOINT");
+
+    let _javac_guard = JAVAC_LOCK.lock().expect("javac fixture lock poisoned");
+    let mut javac = Command::new(javac_path());
+    javac
+        .arg("-g")
+        .arg("-Xlint:-options")
+        .arg("-source")
+        .arg("8")
+        .arg("-target")
+        .arg("8")
+        .arg("-d")
+        .arg(&classes_dir)
+        .arg(&source_file);
+    hide_console(&mut javac);
+    let status = javac
+        .status()
+        .expect("spawn javac for Maven sourcepath test");
+    assert!(status.success(), "javac failed with status {status}");
+    drop(_javac_guard);
+
+    let target = start_jdwp_target(classes_dir.clone(), "com.example.web.MavenSourcePathTest");
+    let session = JdiSession::attach(
+        "127.0.0.1",
+        target.port,
+        &[],
+        "jdi-maven-sourcepath".into(),
+        None,
+    )
+    .expect("JDI attach failed");
+    session
+        .stop_at("com.example.web.MavenSourcePathTest", line, None)
+        .expect("JDI Maven source breakpoint failed");
+    let stop = session
+        .cont(Some(30))
+        .expect("JDI cont to Maven source breakpoint failed");
+    match &stop.result {
+        CommandResult::Stopped {
+            event: Event::Breakpoint { location, .. },
+            ..
+        } => {
+            assert_eq!(location.class, "com.example.web.MavenSourcePathTest");
+            assert_eq!(location.method, "serve");
+            assert_eq!(location.line, line);
+        }
+        other => panic!("expected Maven source breakpoint stop, got {other:?}"),
+    }
+
+    let source_response = session
+        .list_source(Some(line))
+        .expect("JDI list_source should infer Maven source root");
+    match &source_response.result {
+        CommandResult::Source { lines, .. } => assert!(
+            lines
+                .iter()
+                .any(|source_line| source_line.text.contains("MAVEN_SOURCE_BREAKPOINT")),
+            "source should include Maven breakpoint line, got {lines:?}"
+        ),
+        other => panic!("expected JDI Source, got {other:?}"),
+    }
+
+    let _ = session.kill();
+    drop(target);
+    let _ = fs::remove_dir_all(root);
+}
+
+#[test]
 fn jdi_frame_step_out_suspend_and_lock_commands_work() {
     use java_agent_debugger::jdi::session::JdiSession;
 
@@ -1521,6 +1648,25 @@ fn jdi_eval_set_and_force_return_execute_in_stopped_frame() {
     session
         .force_return("123")
         .expect("JDI force return failed");
+    let stack_after_force_return = session
+        .stack(false)
+        .expect("JDI stack after force_return failed");
+    match &stack_after_force_return.result {
+        CommandResult::StackTrace { frames } => {
+            let top = frames.first().expect("stack should include top frame");
+            assert_eq!(top.location.class, "EvalMutationTest");
+            assert_eq!(top.location.method, "compute");
+        }
+        other => panic!("expected stack after force_return, got {other:?}"),
+    }
+    assert!(
+        stack_after_force_return
+            .note
+            .as_deref()
+            .is_some_and(|note| note.contains("force_return takes effect")),
+        "force_return stack should explain pending frame refresh, got {:?}",
+        stack_after_force_return.note
+    );
     let post_return = session
         .cont(Some(30))
         .expect("JDI cont after force return failed");
@@ -1687,9 +1833,25 @@ fn jdi_async_breakpoint_after_timeout_updates_status_and_resumes_cleanly() {
         other => panic!("expected value for this, got {other:?}"),
     }
 
+    let queued_stop = session
+        .cont(Some(1))
+        .expect("JDI cont after async stop should surface queued stop");
+    match &queued_stop.result {
+        CommandResult::Stopped {
+            event: Event::Breakpoint { location, thread },
+            ..
+        } => {
+            assert_eq!(location.class, "AsyncBreakpointTest");
+            assert_eq!(location.method, "hit");
+            assert_eq!(location.line, line);
+            assert_eq!(thread, "delayed-worker");
+        }
+        other => panic!("expected queued async breakpoint stop, got {other:?}"),
+    }
+
     let resumed = session
         .cont(Some(1))
-        .expect("JDI cont after async stop should resume current stop");
+        .expect("JDI cont after queued stop should resume current stop");
     assert!(
         matches!(
             resumed.result,
@@ -1698,7 +1860,7 @@ fn jdi_async_breakpoint_after_timeout_updates_status_and_resumes_cleanly() {
                 ..
             }
         ),
-        "cont should resume the async stop instead of returning it again: {:?}",
+        "second cont should resume the async stop: {:?}",
         resumed.result
     );
 

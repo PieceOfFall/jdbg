@@ -4,7 +4,7 @@ description: "Use when you need a Java program's real runtime state instead of r
 compatibility: "Requires a JDK 8+ (provides the `jdb` command). Debugging is driven through the `jdbg` MCP server (tools named `launch`, `break_at`, `run`, `locals`, …). Native on Windows, Linux, macOS."
 allowed-tools: "mcp__jdbg__launch, mcp__jdbg__attach, mcp__jdbg__status, mcp__jdbg__list, mcp__jdbg__kill, mcp__jdbg__break_at, mcp__jdbg__break_in, mcp__jdbg__catch, mcp__jdbg__watch, mcp__jdbg__unwatch, mcp__jdbg__breakpoints, mcp__jdbg__clear, mcp__jdbg__run, mcp__jdbg__cont, mcp__jdbg__step, mcp__jdbg__next, mcp__jdbg__step_out, mcp__jdbg__where, mcp__jdbg__locals, mcp__jdbg__print, mcp__jdbg__dump, mcp__jdbg__eval, mcp__jdbg__threads, mcp__jdbg__classes, mcp__jdbg__methods, mcp__jdbg__thread, mcp__jdbg__frame, mcp__jdbg__list_source, mcp__jdbg__inspect, mcp__jdbg__raw, mcp__jdbg__suspend, mcp__jdbg__resume, mcp__jdbg__set, mcp__jdbg__force_return, mcp__jdbg__ignore, mcp__jdbg__lock, mcp__jdbg__threadlocks, Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "2.17"
+  version: "2.18"
 ---
 
 # jdbg — interactive Java debugging for agents
@@ -49,7 +49,10 @@ The default `jdb` backend returns state `suspended`. Set breakpoints, then call 
 For the JDI sidecar, pass `backend: "jdi"` on `launch` or `attach`; launched sessions use `run`, attached sessions use `cont`.
 
 If `sourcepath` is omitted, jdbg uses the MCP server's current working directory as the source root and sends it
-to the daemon as an absolute path. Pass `sourcepath` explicitly when sources live outside the workspace root.
+to the daemon as an absolute path. On JDI sessions, source lookup also tries the target JVM's `user.dir` and
+Maven/Gradle module roots inferred from `java.class.path` (for example `mall-portal/target/classes` →
+`mall-portal/src/main/java`). Pass `sourcepath` explicitly when sources live outside the workspace root or
+the target classpath does not reveal module directories.
 
 > **`localhost` is auto-normalized to `127.0.0.1`.** On dual-stack machines `localhost` often
 > resolves to IPv6 `[::1]`, but JDWP usually listens only on IPv4 `0.0.0.0` → connection refused.
@@ -203,6 +206,9 @@ where available.
 On JDI sessions, `print`, `eval`, `dump`, `set`, and `force_return` are executable capabilities. They may
 invoke methods in the target JVM and can have side effects. Use `inspect` when you need safe field-reading
 without getters or method calls.
+
+After JDI `force_return`, the target VM applies the forced return when the thread resumes. A `where` call before
+the next `cont`/`step` may still show the old frame and include a note explaining that pending refresh.
 
 ## Finding classes and methods (Spring/CGLIB/Tomcat)
 
