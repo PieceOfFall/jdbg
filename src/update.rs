@@ -8,6 +8,7 @@ use anyhow::{Context, Result, bail};
 use crate::client;
 use crate::protocol::{Command, Request};
 use crate::setup;
+use crate::update_sidecar;
 
 const REPO: &str = "PieceOfFall/jdbg";
 
@@ -81,13 +82,14 @@ pub fn run_update() -> Result<()> {
     let backend = setup::configured_backend_or_default()?;
     let target_arg = setup::targets_to_arg(&targets);
     let backend_arg = backend.id();
+    let current_exe = std::env::current_exe().context("cannot determine current exe path")?;
 
     stop_daemon_if_running();
 
-    println!("[1/3] Removing old jdbg registration for configured agents ({target_arg})...");
+    println!("[1/4] Removing old jdbg registration for configured agents ({target_arg})...");
     setup::run_setup(true, false, Some(&target_arg), true, None)?;
 
-    println!("[2/3] Installing latest jdbg from GitHub releases...");
+    println!("[2/4] Installing latest jdbg from GitHub releases...");
     let old_path = move_self_aside()?;
 
     let (program, args) = install_command();
@@ -102,7 +104,11 @@ pub fn run_update() -> Result<()> {
 
     cleanup_old(old_path);
 
-    println!("[3/3] Re-registering jdbg for configured agents ({target_arg})...");
+    println!("[3/4] Installing JDI sidecar from the official release archive...");
+    let sidecar_path = update_sidecar::install_from_latest_release_next_to(&current_exe)?;
+    println!("Installed JDI sidecar at {}.", sidecar_path.display());
+
+    println!("[4/4] Re-registering jdbg for configured agents ({target_arg})...");
     let setup_bin = if cfg!(windows) { "jdbg.exe" } else { "jdbg" };
     let setup_status = ProcessCommand::new(setup_bin)
         .arg("setup")

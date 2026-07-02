@@ -30,5 +30,6 @@ pub mod session;
 pub mod setup;
 pub mod tui;
 pub mod update;
+pub mod update_sidecar;
 
 pub use error::{Error, Result};

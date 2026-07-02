@@ -247,7 +247,7 @@ jdbg setup --remove --target codex
 jdbg update
 ```
 
-`jdbg update` detects which agents already had `jdbg` configured, installs the latest release, then re-registers the same targets.
+`jdbg update` detects which agents already had `jdbg` configured, installs the latest release, installs the official JDI sidecar jar next to the `jdbg` binary, then re-registers the same targets.
 
 ## MCP Server
 

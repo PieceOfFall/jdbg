@@ -13,6 +13,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
+use crate::jdi::lifecycle::default_sidecar_jar_path;
+use crate::update_sidecar;
+
 const MCP_SERVER_KEY: &str = "jdbg";
 const PERMISSION_ENTRY: &str = "mcp__jdbg__*";
 const CODEX_TOML_HEADER: &str = "mcp_servers.jdbg";
@@ -827,6 +830,48 @@ fn select_backend(
     prompt_backend(default)
 }
 
+fn ensure_jdi_sidecar_available_with<F>(
+    backend: SetupBackend,
+    expected: &Path,
+    exe: &Path,
+    install: F,
+) -> Result<Option<PathBuf>>
+where
+    F: FnOnce(&Path) -> Result<PathBuf>,
+{
+    if backend != SetupBackend::Jdi {
+        return Ok(None);
+    }
+
+    if expected.is_file() {
+        return Ok(None);
+    }
+
+    let installed = install(exe).with_context(|| {
+        format!(
+            "JDI backend was selected, but {} is missing and the official sidecar jar could not be installed",
+            expected.display()
+        )
+    })?;
+    Ok(Some(installed))
+}
+
+fn ensure_jdi_sidecar_available(backend: SetupBackend) -> Result<Option<PathBuf>> {
+    if backend != SetupBackend::Jdi {
+        return Ok(None);
+    }
+
+    let expected =
+        default_sidecar_jar_path().context("cannot determine default JDI sidecar path")?;
+    let exe = std::env::current_exe().context("cannot determine current exe path")?;
+    ensure_jdi_sidecar_available_with(
+        backend,
+        &expected,
+        &exe,
+        update_sidecar::install_from_latest_release_next_to,
+    )
+}
+
 fn install_claude(paths: &Paths, backend: SetupBackend) -> Result<Vec<PathBuf>> {
     let config_path = paths.claude_config();
     let settings_path = paths.claude_settings();
@@ -1040,6 +1085,9 @@ pub fn run_setup(
             println!("Nothing to remove.");
         }
     } else {
+        if let Some(path) = ensure_jdi_sidecar_available(backend)? {
+            println!("Installed JDI sidecar at {}.", path.display());
+        }
         for target in targets {
             let written = match target {
                 TargetId::Claude => install_claude(&paths, backend)?,
@@ -1434,6 +1482,65 @@ mod tests {
         let installed = fs::read_to_string(paths.codex_skill_dir().join("SKILL.md")).unwrap();
         assert!(installed.contains("Preferred backend: JDI"));
         assert!(installed.contains(r#""backend": "jdi""#));
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn jdi_setup_installs_missing_sidecar_next_to_exe() {
+        let home = temp_home("jdi-sidecar-missing");
+        let bin = home.join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let exe = bin.join(if cfg!(windows) { "jdbg.exe" } else { "jdbg" });
+        let expected = bin.join(crate::jdi::lifecycle::SIDECAR_JAR_NAME);
+
+        let installed =
+            ensure_jdi_sidecar_available_with(SetupBackend::Jdi, &expected, &exe, |actual_exe| {
+                assert_eq!(actual_exe, exe.as_path());
+                fs::write(&expected, b"jar").unwrap();
+                Ok(expected.clone())
+            })
+            .unwrap();
+
+        assert_eq!(installed, Some(expected.clone()));
+        assert_eq!(fs::read(expected).unwrap(), b"jar");
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn jdb_setup_does_not_install_missing_sidecar() {
+        let home = temp_home("jdb-sidecar");
+        let exe = home.join(if cfg!(windows) { "jdbg.exe" } else { "jdbg" });
+        let expected = home.join(crate::jdi::lifecycle::SIDECAR_JAR_NAME);
+
+        let installed =
+            ensure_jdi_sidecar_available_with(SetupBackend::Jdb, &expected, &exe, |_| {
+                panic!("JDB setup must not install the JDI sidecar")
+            })
+            .unwrap();
+
+        assert_eq!(installed, None);
+
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn jdi_setup_keeps_existing_sidecar() {
+        let home = temp_home("jdi-sidecar-existing");
+        let exe = home.join(if cfg!(windows) { "jdbg.exe" } else { "jdbg" });
+        let expected = home.join(crate::jdi::lifecycle::SIDECAR_JAR_NAME);
+        fs::create_dir_all(&home).unwrap();
+        fs::write(&expected, b"existing").unwrap();
+
+        let installed =
+            ensure_jdi_sidecar_available_with(SetupBackend::Jdi, &expected, &exe, |_| {
+                panic!("JDI setup must not reinstall an existing sidecar")
+            })
+            .unwrap();
+
+        assert_eq!(installed, None);
+        assert_eq!(fs::read(expected).unwrap(), b"existing");
 
         let _ = fs::remove_dir_all(home);
     }

@@ -4,7 +4,7 @@ description: "Use the jdbg CLI to debug Java programs interactively from Pi when
 compatibility: "Requires a JDK 8+ with jdb available through JAVA_HOME, PATH, or --jdb-path. Requires the jdbg CLI on PATH. Native on Windows, Linux, and macOS."
 allowed-tools: "Bash(jdbg:*), Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "1.7"
+  version: "1.8"
 ---
 
 # jdbg CLI - interactive Java debugging for Pi
@@ -151,6 +151,9 @@ Source builds create `jdbg-jdi-sidecar.jar` during `cargo build` by running the 
 `sidecar/jdi`; this requires a JDK 17+ build JVM. Debug targets still support JDK 8+. Set
 `JDBG_GRADLE_JAVA_HOME` when the Gradle build JDK differs from the target/debuggee JDK. Override sidecar
 discovery with `JDBG_JDI_SIDECAR_JAR` or the Java runtime with `JDBG_JDI_JAVA` only when needed.
+Release updates install the official sidecar jar next to the `jdbg` binary. If it is missing, run
+`jdbg update` or reinstall from the official release archive; do not search the filesystem and copy a jar
+from a source checkout or unrelated build.
 
 List sessions and inspect state:
 

@@ -146,7 +146,7 @@ protocol 零改动**。
 | cli | `src/cli.rs` | clap derive：完整 §7 命令面 + 隐藏 `__daemon` / `__mcp` 入口 |
 | output | `src/output.rs` | 人类可读文本渲染 + `--json` 模式（返回 String，MCP 层复用） |
 | setup | `src/setup.rs` | multi-agent setup registry：Claude/Codex/OpenCode MCP + skill install/remove，Pi CLI skill install/remove，Codex TOML upsert，OpenCode JSON upsert，target detection for update |
-| update | `src/update.rs` | self-update：安装新版本后按已配置的 setup targets 重新注册，未检测到配置时 fallback Claude |
+| update | `src/update.rs` / `src/update_sidecar.rs` | self-update：安装新版本与官方 JDI sidecar jar 后按已配置的 setup targets 重新注册，未检测到配置时 fallback Claude |
 | mcp | `src/mcp/mod.rs` | MCP server `run_mcp()`：stdio JSON-RPC 主循环 + 生命周期 + 结果映射 |
 | mcp/jsonrpc | `src/mcp/jsonrpc.rs` | JSON-RPC 2.0 请求/响应/错误类型 + 标准错误码 |
 | mcp/tools | `src/mcp/tools.rs` | 36 工具 spec（name/description/inputSchema）+ `dispatch_tool` 工具→Command 翻译层 |
@@ -204,7 +204,7 @@ Loaded  ──run──►  Suspended  ──cont/step/next──►  Suspended
 | 5. cli.rs + output.rs | ✅ 完成 | clap 完整命令面 + 文本/JSON 渲染 |
 | 6. SKILL.md + plugin manifest | ✅ 完成 | native-first `skills/jdbg/mcp/SKILL.md` / `skills/jdbg/cli/SKILL.md` + `.claude-plugin/{plugin,marketplace}.json`，subagent 应用场景验证通过 |
 | 7. MCP server | ✅ 完成 | `src/mcp/{mod,jsonrpc,tools}.rs`：手写 stdio JSON-RPC、36 工具 1:1 映射、`.mcp.json` + plugin 内联 mcpServers、SKILL.md 改写为 MCP 工具面；真实 jdb e2e 验证（launch→break→run→locals→cont） |
-| 8. Multi-agent setup | ✅ 完成 | `jdbg setup --target claude,codex,opencode,pi|auto|all|none --backend jdb|jdi --yes`；Claude + Codex + OpenCode MCP/skill 安装删除；Pi CLI skill 安装删除；交互 setup 可选择安装 skill 的 backend 偏好；`jdbg update` 保留并重注册已配置 targets 与 backend 偏好；零新增依赖 |
+| 8. Multi-agent setup | ✅ 完成 | `jdbg setup --target claude,codex,opencode,pi|auto|all|none --backend jdb|jdi --yes`；Claude + Codex + OpenCode MCP/skill 安装删除；Pi CLI skill 安装删除；交互 setup 可选择安装 skill 的 backend 偏好；`jdbg update` 保留并重注册已配置 targets 与 backend 偏好，并安装官方 JDI sidecar jar；零新增依赖 |
 
 ## 7. 未实现 / TODO 项
 
