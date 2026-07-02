@@ -291,6 +291,14 @@ fn start_jdwp_fixture(main_class: &str) -> TargetJvm {
 }
 
 fn start_jdwp_target(classpath: PathBuf, main_class: &str) -> TargetJvm {
+    start_jdwp_target_with_args(classpath, main_class, &[])
+}
+
+fn start_jdwp_target_with_args(
+    classpath: PathBuf,
+    main_class: &str,
+    app_args: &[String],
+) -> TargetJvm {
     let port = free_loopback_port();
     let mut command = Command::new(java_path(false));
     command
@@ -300,6 +308,7 @@ fn start_jdwp_target(classpath: PathBuf, main_class: &str) -> TargetJvm {
         .arg("-cp")
         .arg(classpath)
         .arg(main_class)
+        .args(app_args)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -342,6 +351,33 @@ fn source_line(source: &str, needle: &str) -> u32 {
         .position(|line| line.contains(needle))
         .map(|index| index as u32 + 1)
         .unwrap_or_else(|| panic!("source did not contain {needle:?}"))
+}
+
+fn trigger_external_request_after_delay(port: u16) -> mpsc::Receiver<Result<(), String>> {
+    let (tx, rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(300));
+        let deadline = Instant::now() + Duration::from_secs(8);
+        loop {
+            match std::net::TcpStream::connect(("127.0.0.1", port)) {
+                Ok(mut stream) => {
+                    let _ = stream.write_all(b"x");
+                    drop(stream);
+                    let _ = tx.send(Ok(()));
+                    return;
+                }
+                Err(e) if Instant::now() < deadline => {
+                    std::thread::sleep(Duration::from_millis(50));
+                    let _ = e;
+                }
+                Err(e) => {
+                    let _ = tx.send(Err(e.to_string()));
+                    return;
+                }
+            }
+        }
+    });
+    rx
 }
 
 struct TestDaemonGuard {
@@ -1868,6 +1904,193 @@ fn jdi_async_breakpoint_after_timeout_updates_status_and_resumes_cleanly() {
 }
 
 #[test]
+fn jdi_cont_waits_for_thread_suspend_breakpoint_triggered_while_running() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("ExternalTriggerBreakpointTest.java");
+    let trigger_port = free_loopback_port();
+    let target = start_jdwp_target_with_args(
+        fixture_dir(),
+        "ExternalTriggerBreakpointTest",
+        &[trigger_port.to_string()],
+    );
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::attach(
+        "127.0.0.1",
+        target.port,
+        &sourcepath,
+        "jdi-external-trigger-breakpoint".into(),
+        None,
+    )
+    .expect("JDI attach failed");
+
+    let line = fixture_line(
+        "ExternalTriggerBreakpointTest.java",
+        "EXTERNAL_TRIGGER_BREAKPOINT",
+    );
+    session
+        .stop_at(
+            "ExternalTriggerBreakpointTest$Handler",
+            line,
+            Some("thread"),
+        )
+        .expect("JDI external trigger breakpoint failed");
+
+    let running = session
+        .cont(Some(1))
+        .expect("JDI cont should resume target before external trigger");
+    assert!(
+        matches!(
+            running.result,
+            CommandResult::Timeout {
+                state: RunState::Running,
+                ..
+            }
+        ),
+        "expected target to keep running before external trigger, got {:?}",
+        running.result
+    );
+
+    let trigger_rx = trigger_external_request_after_delay(trigger_port);
+
+    let stop = session
+        .cont(Some(10))
+        .expect("JDI cont should wait for external thread breakpoint");
+    trigger_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("external trigger should finish")
+        .expect("external trigger should connect");
+    match &stop.result {
+        CommandResult::Stopped {
+            event: Event::Breakpoint { location, thread },
+            ..
+        } => {
+            assert_eq!(location.class, "ExternalTriggerBreakpointTest$Handler");
+            assert_eq!(location.method, "handleRequest");
+            assert_eq!(location.line, line);
+            assert_eq!(thread, "external-trigger-worker");
+        }
+        other => panic!("expected direct thread-suspend breakpoint stop, got {other:?}"),
+    }
+
+    let _ = session.kill();
+}
+
+#[test]
+fn jdi_cli_cont_waits_for_running_thread_suspend_breakpoint() {
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("ExternalTriggerBreakpointTest.java");
+    let guard = TestDaemonGuard::new("jdi-cli-external-trigger");
+    let trigger_port = free_loopback_port();
+    let target = start_jdwp_target_with_args(
+        fixture_dir(),
+        "ExternalTriggerBreakpointTest",
+        &[trigger_port.to_string()],
+    );
+    let sourcepath = fixture_dir().display().to_string();
+    let line = fixture_line(
+        "ExternalTriggerBreakpointTest.java",
+        "EXTERNAL_TRIGGER_BREAKPOINT",
+    );
+
+    let attach = jdbg_command(&guard)
+        .arg("attach")
+        .arg("--backend")
+        .arg("jdi")
+        .arg("--host")
+        .arg("127.0.0.1")
+        .arg("--port")
+        .arg(target.port.to_string())
+        .arg("--sourcepath")
+        .arg(&sourcepath)
+        .arg("--name")
+        .arg("jdi-cli-external-trigger")
+        .output()
+        .expect("spawn jdbg attach");
+    assert!(
+        attach.status.success(),
+        "attach failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&attach.stdout),
+        String::from_utf8_lossy(&attach.stderr)
+    );
+    let attach_text = String::from_utf8_lossy(&attach.stdout);
+    let session = attach_text
+        .split_whitespace()
+        .nth(1)
+        .unwrap_or_else(|| panic!("missing session id in attach output: {attach_text}"))
+        .to_string();
+
+    let breakpoint = jdbg_command(&guard)
+        .arg("--session")
+        .arg(&session)
+        .arg("break-at")
+        .arg("ExternalTriggerBreakpointTest$Handler")
+        .arg(line.to_string())
+        .arg("--suspend")
+        .arg("thread")
+        .output()
+        .expect("spawn jdbg break-at");
+    assert!(
+        breakpoint.status.success(),
+        "break-at failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&breakpoint.stdout),
+        String::from_utf8_lossy(&breakpoint.stderr)
+    );
+
+    let running = jdbg_command(&guard)
+        .arg("--session")
+        .arg(&session)
+        .arg("--timeout")
+        .arg("1")
+        .arg("cont")
+        .output()
+        .expect("spawn first jdbg cont");
+    assert!(
+        running.status.success(),
+        "first cont failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&running.stdout),
+        String::from_utf8_lossy(&running.stderr)
+    );
+    let running_text = String::from_utf8_lossy(&running.stdout);
+    assert!(running_text.contains("TIMEOUT"), "{running_text}");
+
+    let trigger_rx = trigger_external_request_after_delay(trigger_port);
+
+    let stop = jdbg_command(&guard)
+        .arg("--session")
+        .arg(&session)
+        .arg("--timeout")
+        .arg("10")
+        .arg("cont")
+        .output()
+        .expect("spawn second jdbg cont");
+    trigger_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("external trigger should finish")
+        .expect("external trigger should connect");
+    assert!(
+        stop.status.success(),
+        "second cont failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&stop.stdout),
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    let stop_text = String::from_utf8_lossy(&stop.stdout);
+    assert!(stop_text.contains("Breakpoint hit"), "{stop_text}");
+    assert!(
+        stop_text.contains("ExternalTriggerBreakpointTest$Handler.handleRequest"),
+        "{stop_text}"
+    );
+    assert!(stop_text.contains("external-trigger-worker"), "{stop_text}");
+
+    let _ = jdbg_command(&guard)
+        .arg("--session")
+        .arg(session)
+        .arg("kill")
+        .output();
+}
+
+#[test]
 fn jdi_method_entry_and_exit_events_stop_with_return_value() {
     use java_agent_debugger::jdi::session::JdiSession;
 
@@ -2570,6 +2793,160 @@ fn mcp_jdi_attach_breakpoint_locals_and_inspect_smoke() {
     assert!(inspect.contains("\"kind\": \"collection\""), "{inspect}");
     let kill = mcp_text(mcp_response(&responses, 7));
     assert!(kill.contains("killed"), "{kill}");
+}
+
+#[test]
+fn mcp_jdi_cont_waits_for_running_thread_suspend_breakpoint() {
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("ExternalTriggerBreakpointTest.java");
+    let trigger_port = free_loopback_port();
+    let target = start_jdwp_target_with_args(
+        fixture_dir(),
+        "ExternalTriggerBreakpointTest",
+        &[trigger_port.to_string()],
+    );
+    let guard = TestDaemonGuard::new("mcp-jdi-external-trigger");
+    let sourcepath = fixture_dir().display().to_string();
+    let line = fixture_line(
+        "ExternalTriggerBreakpointTest.java",
+        "EXTERNAL_TRIGGER_BREAKPOINT",
+    );
+
+    let mut command = Command::new(env!("CARGO_BIN_EXE_jdbg"));
+    command
+        .arg("__mcp")
+        .env("USERNAME", &guard.username)
+        .env("USER", &guard.username)
+        .env("JDBG_DATA_DIR", &guard.data_dir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    hide_console(&mut command);
+    let mut child = command.spawn().expect("failed to spawn jdbg __mcp");
+    let mut stdin = child.stdin.take().expect("mcp stdin");
+    let mut stdout = BufReader::new(child.stdout.take().expect("mcp stdout"));
+    let stderr = child.stderr.take().expect("mcp stderr");
+    let stderr_reader = std::thread::spawn(move || {
+        let mut text = String::new();
+        let mut reader = BufReader::new(stderr);
+        let _ = reader.read_to_string(&mut text);
+        text
+    });
+
+    macro_rules! call_mcp {
+        ($message:expr) => {{
+            let message = $message;
+            writeln!(stdin, "{}", serde_json::to_string(&message).unwrap())
+                .expect("write mcp request");
+            stdin.flush().expect("flush mcp request");
+            let mut response_line = String::new();
+            stdout
+                .read_line(&mut response_line)
+                .expect("read mcp response");
+            serde_json::from_str::<Value>(&response_line)
+                .unwrap_or_else(|e| panic!("bad mcp response {response_line:?}: {e}"))
+        }};
+    }
+
+    macro_rules! notify_mcp {
+        ($message:expr) => {{
+            let message = $message;
+            writeln!(stdin, "{}", serde_json::to_string(&message).unwrap())
+                .expect("write mcp notification");
+            stdin.flush().expect("flush mcp notification");
+        }};
+    }
+
+    let init = call_mcp!(json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "initialize",
+        "params": {
+            "protocolVersion": "2025-06-18",
+            "capabilities": {},
+            "clientInfo": {"name": "jdbg-test", "version": "0"}
+        }
+    }));
+    assert!(init.pointer("/result/capabilities/tools").is_some());
+    notify_mcp!(json!({"jsonrpc": "2.0", "method": "notifications/initialized"}));
+
+    let attach = call_mcp!(json!({
+        "jsonrpc": "2.0",
+        "id": 2,
+        "method": "tools/call",
+        "params": {
+            "name": "attach",
+            "arguments": {
+                "backend": "jdi",
+                "host": "127.0.0.1",
+                "port": target.port,
+                "sourcepath": sourcepath
+            }
+        }
+    }));
+    assert_mcp_success(&attach);
+    let breakpoint = call_mcp!(json!({
+        "jsonrpc": "2.0",
+        "id": 3,
+        "method": "tools/call",
+        "params": {
+            "name": "break_at",
+            "arguments": {
+                "class": "ExternalTriggerBreakpointTest$Handler",
+                "line": line,
+                "suspend": "thread"
+            }
+        }
+    }));
+    assert_mcp_success(&breakpoint);
+
+    let running = call_mcp!(json!({
+        "jsonrpc": "2.0",
+        "id": 4,
+        "method": "tools/call",
+        "params": {
+            "name": "cont",
+            "arguments": {"timeout": 1}
+        }
+    }));
+    assert_mcp_success(&running);
+    assert!(mcp_text(&running).contains("TIMEOUT"), "{running:?}");
+
+    let trigger_rx = trigger_external_request_after_delay(trigger_port);
+
+    let stop = call_mcp!(json!({
+        "jsonrpc": "2.0",
+        "id": 5,
+        "method": "tools/call",
+        "params": {
+            "name": "cont",
+            "arguments": {"timeout": 10}
+        }
+    }));
+    trigger_rx
+        .recv_timeout(Duration::from_secs(1))
+        .expect("external trigger should finish")
+        .expect("external trigger should connect");
+    assert_mcp_success(&stop);
+    let stop_text = mcp_text(&stop);
+    assert!(stop_text.contains("Breakpoint hit"), "{stop_text}");
+    assert!(
+        stop_text.contains("ExternalTriggerBreakpointTest$Handler.handleRequest"),
+        "{stop_text}"
+    );
+    assert!(stop_text.contains("external-trigger-worker"), "{stop_text}");
+
+    let kill = call_mcp!(json!({
+        "jsonrpc": "2.0",
+        "id": 6,
+        "method": "tools/call",
+        "params": {"name": "kill", "arguments": {}}
+    }));
+    assert_mcp_success(&kill);
+    drop(stdin);
+    let status = child.wait().expect("wait for mcp process");
+    let stderr = stderr_reader.join().expect("join mcp stderr");
+    assert!(status.success(), "mcp failed: {status}; stderr={stderr}");
 }
 
 #[test]

@@ -40,6 +40,7 @@ pub struct JdiSession {
 struct JdiSessionInner {
     state: RunState,
     last_event: Option<Event>,
+    delivered_stop: Option<Event>,
 }
 
 impl JdiSession {
@@ -77,6 +78,7 @@ impl JdiSession {
             inner: Mutex::new(JdiSessionInner {
                 state: RunState::Running,
                 last_event: None,
+                delivered_stop: None,
             }),
         })
     }
@@ -115,6 +117,7 @@ impl JdiSession {
             inner: Mutex::new(JdiSessionInner {
                 state: RunState::Loaded,
                 last_event: None,
+                delivered_stop: None,
             }),
         })
     }
@@ -1000,7 +1003,9 @@ impl JdiSession {
     }
 
     fn resume_like(&self, method: &str, timeout: Option<u64>) -> Result<CommandResponse> {
-        self.drain_events();
+        if let Some(payload) = self.drain_events_and_take_stop_payload() {
+            return self.command_response_from_stop_payload(payload);
+        }
         {
             let mut inner = self.inner.lock().expect("jdi session mutex poisoned");
             if matches!(inner.state, RunState::Dead | RunState::Exited) {
@@ -1078,6 +1083,7 @@ impl JdiSession {
             let mut inner = self.inner.lock().expect("jdi session mutex poisoned");
             inner.state = state;
             inner.last_event = Some(event.clone());
+            inner.delivered_stop = Some(event.clone());
         }
         if matches!(event, Event::VmExit) {
             return Ok(CommandResponse {
@@ -1353,7 +1359,11 @@ fn apply_sidecar_events(
     for event in events {
         if event.session == session_id && is_stop_event(&event.event) {
             if let Ok(payload) = serde_json::from_value::<StopPayload>(event.payload.clone()) {
-                stop_payload = Some(payload);
+                if let Ok((next_event, _)) = event_from_stop_payload(&payload) {
+                    if inner.delivered_stop.as_ref() != Some(&next_event) {
+                        stop_payload = Some(payload);
+                    }
+                }
             }
         }
         apply_sidecar_event(inner, event, session_id);
@@ -1466,6 +1476,7 @@ mod tests {
         let mut inner = JdiSessionInner {
             state: RunState::Running,
             last_event: None,
+            delivered_stop: None,
         };
 
         let payload = apply_sidecar_events(&mut inner, vec![event], "s1", true)
@@ -1477,6 +1488,52 @@ mod tests {
         assert!(matches!(
             inner.last_event,
             Some(Event::Breakpoint { ref thread, .. }) if thread == "http-nio-8085-exec-1"
+        ));
+    }
+
+    #[test]
+    fn delivered_sidecar_stop_event_is_not_returned_again() {
+        let delivered = Event::Breakpoint {
+            location: Location {
+                class: "StructuredInspectTest".into(),
+                method: "main".into(),
+                file: Some("StructuredInspectTest.java".into()),
+                line: 35,
+            },
+            thread: "main".into(),
+        };
+        let event = SidecarEvent {
+            session: "s1".into(),
+            seq: 2,
+            event: "breakpoint".into(),
+            payload: json!({
+                "event": "breakpoint",
+                "thread": "main",
+                "threadId": "1",
+                "location": {
+                    "class": "StructuredInspectTest",
+                    "method": "main",
+                    "file": "StructuredInspectTest.java",
+                    "line": 35
+                }
+            }),
+        };
+        let mut inner = JdiSessionInner {
+            state: RunState::Suspended,
+            last_event: Some(delivered.clone()),
+            delivered_stop: Some(delivered),
+        };
+
+        let payload = apply_sidecar_events(&mut inner, vec![event], "s1", true);
+
+        assert!(
+            payload.is_none(),
+            "already delivered async stop should be treated as a duplicate"
+        );
+        assert_eq!(inner.state, RunState::Suspended);
+        assert!(matches!(
+            inner.last_event,
+            Some(Event::Breakpoint { ref thread, .. }) if thread == "main"
         ));
     }
 
@@ -1525,6 +1582,7 @@ mod tests {
                 },
                 thread: "main".into(),
             }),
+            delivered_stop: None,
         };
 
         apply_sidecar_event(
@@ -1564,6 +1622,7 @@ mod tests {
         let mut inner = JdiSessionInner {
             state: RunState::Running,
             last_event: None,
+            delivered_stop: None,
         };
 
         apply_sidecar_event(
