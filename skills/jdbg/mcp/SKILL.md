@@ -4,7 +4,7 @@ description: "Use when you need a Java program's real runtime state instead of r
 compatibility: "Requires a JDK 8+ (provides the `jdb` command). Debugging is driven through the `jdbg` MCP server (tools named `launch`, `break_at`, `run`, `locals`, …). Native on Windows, Linux, macOS."
 allowed-tools: "mcp__jdbg__launch, mcp__jdbg__attach, mcp__jdbg__status, mcp__jdbg__list, mcp__jdbg__kill, mcp__jdbg__break_at, mcp__jdbg__break_in, mcp__jdbg__catch, mcp__jdbg__watch, mcp__jdbg__unwatch, mcp__jdbg__breakpoints, mcp__jdbg__clear, mcp__jdbg__run, mcp__jdbg__cont, mcp__jdbg__step, mcp__jdbg__next, mcp__jdbg__step_out, mcp__jdbg__where, mcp__jdbg__locals, mcp__jdbg__print, mcp__jdbg__dump, mcp__jdbg__eval, mcp__jdbg__threads, mcp__jdbg__classes, mcp__jdbg__methods, mcp__jdbg__thread, mcp__jdbg__frame, mcp__jdbg__list_source, mcp__jdbg__inspect, mcp__jdbg__raw, mcp__jdbg__suspend, mcp__jdbg__resume, mcp__jdbg__set, mcp__jdbg__force_return, mcp__jdbg__ignore, mcp__jdbg__lock, mcp__jdbg__threadlocks, Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "2.16"
+  version: "2.17"
 ---
 
 # jdbg — interactive Java debugging for agents
@@ -35,7 +35,7 @@ running JVM and nothing launchable.
 ## Start a session — two ways
 
 **Launch** a program under the debugger (you have the main class + classpath) — call `launch` with
-`main_class` (and usually `classpath` / `sourcepath`; pass program args via `app_args`):
+`main_class` (and usually `classpath`; pass program args via `app_args`):
 ```
 launch { "main_class": "com.example.Main", "classpath": "out", "sourcepath": "src", "app_args": ["arg1", "arg2"] }
 ```
@@ -47,6 +47,9 @@ attach { "host": "localhost", "port": 5005, "sourcepath": "src" }
 ```
 The default `jdb` backend returns state `suspended`. Set breakpoints, then call `cont` (attach has no `run`).
 For the JDI sidecar, pass `backend: "jdi"` on `launch` or `attach`; launched sessions use `run`, attached sessions use `cont`.
+
+If `sourcepath` is omitted, jdbg uses the MCP server's current working directory as the source root and sends it
+to the daemon as an absolute path. Pass `sourcepath` explicitly when sources live outside the workspace root.
 
 > **`localhost` is auto-normalized to `127.0.0.1`.** On dual-stack machines `localhost` often
 > resolves to IPv6 `[::1]`, but JDWP usually listens only on IPv4 `0.0.0.0` → connection refused.

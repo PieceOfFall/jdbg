@@ -24,6 +24,7 @@ pub mod jdi;
 pub mod jdkpath;
 pub mod mcp;
 pub mod output;
+pub mod path_args;
 pub mod protocol;
 pub mod registry;
 pub mod session;

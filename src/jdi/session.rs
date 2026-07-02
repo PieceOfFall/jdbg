@@ -15,6 +15,8 @@ use crate::protocol::*;
 const SIDECAR_START_TIMEOUT: Duration = Duration::from_secs(10);
 const SIDECAR_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const SIDECAR_BLOCKING_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_STACK_FRAMES: u32 = 24;
+const ALL_STACK_FRAMES: u32 = 64;
 
 #[derive(Debug, Clone)]
 pub struct JdiSessionMeta {
@@ -193,7 +195,7 @@ impl JdiSession {
             let value = request(
                 &self.sidecar,
                 "stacks",
-                json!({ "session": self.meta.id, "maxFrames": 64 }),
+                json!({ "session": self.meta.id, "maxFrames": ALL_STACK_FRAMES }),
                 SIDECAR_REQUEST_TIMEOUT,
             )?;
             let payload: StacksPayload = serde_json::from_value(value)
@@ -210,7 +212,7 @@ impl JdiSession {
         let value = request(
             &self.sidecar,
             "stack",
-            json!({ "session": self.meta.id, "maxFrames": 64 }),
+            json!({ "session": self.meta.id, "maxFrames": DEFAULT_STACK_FRAMES }),
             SIDECAR_REQUEST_TIMEOUT,
         )?;
         let payload: StackPayload = serde_json::from_value(value)
@@ -1044,8 +1046,13 @@ impl JdiSession {
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
-            let mut inner = self.inner.lock().expect("jdi session mutex poisoned");
-            inner.state = RunState::Running;
+            if let Some(payload) = self.drain_events_and_take_stop_payload() {
+                return self.command_response_from_stop_payload(payload);
+            }
+            {
+                let mut inner = self.inner.lock().expect("jdi session mutex poisoned");
+                inner.state = RunState::Running;
+            }
             return Ok(CommandResponse {
                 result: CommandResult::Timeout {
                     partial_output: value
@@ -1062,6 +1069,10 @@ impl JdiSession {
 
         let payload: StopPayload = serde_json::from_value(value)
             .map_err(|e| Error::Connection(format!("invalid JDI stop response: {e}")))?;
+        self.command_response_from_stop_payload(payload)
+    }
+
+    fn command_response_from_stop_payload(&self, payload: StopPayload) -> Result<CommandResponse> {
         let (event, state) = event_from_stop_payload(&payload)?;
         {
             let mut inner = self.inner.lock().expect("jdi session mutex poisoned");
@@ -1112,18 +1123,17 @@ impl JdiSession {
     }
 
     fn drain_events(&self) {
+        let _ = self.drain_events_and_take_stop_payload();
+    }
+
+    fn drain_events_and_take_stop_payload(&self) -> Option<StopPayload> {
         let events = self.sidecar.transport().drain_events();
         let sidecar_alive = self.sidecar.is_alive();
         if events.is_empty() && sidecar_alive {
-            return;
+            return None;
         }
         let mut inner = self.inner.lock().expect("jdi session mutex poisoned");
-        for event in events {
-            apply_sidecar_event(&mut inner, event, &self.meta.id);
-        }
-        if !sidecar_alive && !matches!(inner.state, RunState::Dead | RunState::Exited) {
-            inner.state = RunState::Dead;
-        }
+        apply_sidecar_events(&mut inner, events, &self.meta.id, sidecar_alive)
     }
 }
 
@@ -1225,7 +1235,7 @@ struct ForceReturnPayload {
     value: String,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StopPayload {
     event: String,
@@ -1333,6 +1343,27 @@ fn apply_sidecar_event(inner: &mut JdiSessionInner, event: SidecarEvent, session
     inner.last_event = Some(next_event);
 }
 
+fn apply_sidecar_events(
+    inner: &mut JdiSessionInner,
+    events: Vec<SidecarEvent>,
+    session_id: &str,
+    sidecar_alive: bool,
+) -> Option<StopPayload> {
+    let mut stop_payload = None;
+    for event in events {
+        if event.session == session_id && is_stop_event(&event.event) {
+            if let Ok(payload) = serde_json::from_value::<StopPayload>(event.payload.clone()) {
+                stop_payload = Some(payload);
+            }
+        }
+        apply_sidecar_event(inner, event, session_id);
+    }
+    if !sidecar_alive && !matches!(inner.state, RunState::Dead | RunState::Exited) {
+        inner.state = RunState::Dead;
+    }
+    stop_payload
+}
+
 fn is_stop_event(event: &str) -> bool {
     matches!(
         event,
@@ -1412,6 +1443,41 @@ mod tests {
         assert_eq!(payload.thread_id.as_deref(), Some("1"));
         assert_eq!(payload.location.line, 12);
         assert!(payload.frame.is_some());
+    }
+
+    #[test]
+    fn drained_sidecar_stop_event_is_returned_and_updates_state() {
+        let event = SidecarEvent {
+            session: "s1".into(),
+            seq: 1,
+            event: "breakpoint".into(),
+            payload: json!({
+                "event": "breakpoint",
+                "thread": "http-nio-8085-exec-1",
+                "threadId": "42",
+                "location": {
+                    "class": "com.example.HomeController",
+                    "method": "content",
+                    "file": "HomeController.java",
+                    "line": 32
+                }
+            }),
+        };
+        let mut inner = JdiSessionInner {
+            state: RunState::Running,
+            last_event: None,
+        };
+
+        let payload = apply_sidecar_events(&mut inner, vec![event], "s1", true)
+            .expect("stop payload should be returned");
+
+        assert_eq!(inner.state, RunState::Suspended);
+        assert_eq!(payload.thread, "http-nio-8085-exec-1");
+        assert_eq!(payload.thread_id.as_deref(), Some("42"));
+        assert!(matches!(
+            inner.last_event,
+            Some(Event::Breakpoint { ref thread, .. }) if thread == "http-nio-8085-exec-1"
+        ));
     }
 
     #[test]

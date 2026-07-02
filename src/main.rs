@@ -9,6 +9,7 @@ use java_agent_debugger::client;
 use java_agent_debugger::daemon;
 use java_agent_debugger::mcp;
 use java_agent_debugger::output;
+use java_agent_debugger::path_args::sourcepath_or_current;
 use java_agent_debugger::protocol::*;
 use java_agent_debugger::setup;
 use java_agent_debugger::update;
@@ -122,10 +123,7 @@ fn build_command(cli: &Cli) -> anyhow::Result<Command> {
                 .as_deref()
                 .map(|s| vec![s.to_string()])
                 .unwrap_or_default(),
-            sourcepath: sourcepath
-                .as_deref()
-                .map(|s| vec![s.to_string()])
-                .unwrap_or_default(),
+            sourcepath: sourcepath_or_current(sourcepath.as_deref()),
             app_args: app_args.clone(),
             jdb_args: jdb_args.clone(),
             name: name.clone(),
@@ -141,10 +139,7 @@ fn build_command(cli: &Cli) -> anyhow::Result<Command> {
             backend: backend.parse().map_err(|e: String| anyhow::anyhow!(e))?,
             host: host.clone(),
             port: *port,
-            sourcepath: sourcepath
-                .as_deref()
-                .map(|s| vec![s.to_string()])
-                .unwrap_or_default(),
+            sourcepath: sourcepath_or_current(sourcepath.as_deref()),
             name: name.clone(),
             jdb_path: cli.jdb_path.clone(),
         },

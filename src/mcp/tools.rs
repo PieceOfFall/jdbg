@@ -9,6 +9,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::jsonrpc::{INVALID_PARAMS, JsonRpcError, METHOD_NOT_FOUND};
+use crate::path_args::sourcepath_or_current;
 use crate::protocol::{BackendKind, Command, MethodEventKind, Request};
 
 /// Public description of a tool, serialized into `tools/list`.
@@ -423,7 +424,7 @@ pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> 
             main_class: require_str(args, "main_class")?,
             backend: optional_backend(args)?,
             classpath: str_to_vec(optional_str(args, "classpath")),
-            sourcepath: str_to_vec(optional_str(args, "sourcepath")),
+            sourcepath: sourcepath_or_current(optional_str(args, "sourcepath").as_deref()),
             app_args: optional_str_array(args, "app_args"),
             jdb_args: optional_str_array(args, "jdb_args"),
             name: optional_str(args, "name"),
@@ -433,7 +434,7 @@ pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> 
             backend: optional_backend(args)?,
             host: optional_str(args, "host").unwrap_or_else(|| "localhost".to_string()),
             port: optional_u16(args, "port").unwrap_or(5005),
-            sourcepath: str_to_vec(optional_str(args, "sourcepath")),
+            sourcepath: sourcepath_or_current(optional_str(args, "sourcepath").as_deref()),
             name: optional_str(args, "name"),
             jdb_path: optional_str(args, "jdb_path"),
         },
@@ -666,7 +667,7 @@ fn optional_str_array(args: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// classpath/sourcepath: MCP accepts a single string and wraps it in a Vec of length <= 1, matching `main.rs`.
+/// classpath: MCP accepts a single string and wraps it in a Vec of length <= 1, matching `main.rs`.
 fn str_to_vec(opt: Option<String>) -> Vec<String> {
     opt.map(|s| vec![s]).unwrap_or_default()
 }
@@ -806,9 +807,46 @@ mod tests {
     fn attach_uses_defaults_when_absent() {
         let req = dispatch_tool("attach", &json!({})).unwrap();
         match req.cmd {
-            Command::Attach { host, port, .. } => {
+            Command::Attach {
+                host,
+                port,
+                sourcepath,
+                ..
+            } => {
                 assert_eq!(host, "localhost");
                 assert_eq!(port, 5005);
+                assert_eq!(
+                    sourcepath,
+                    vec![
+                        std::env::current_dir()
+                            .unwrap()
+                            .canonicalize()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned()
+                    ]
+                );
+            }
+            other => panic!("expected Attach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_sourcepath_is_absolutized() {
+        let req = dispatch_tool("attach", &json!({"sourcepath": "."})).unwrap();
+        match req.cmd {
+            Command::Attach { sourcepath, .. } => {
+                assert_eq!(
+                    sourcepath,
+                    vec![
+                        std::env::current_dir()
+                            .unwrap()
+                            .canonicalize()
+                            .unwrap()
+                            .to_string_lossy()
+                            .into_owned()
+                    ]
+                );
             }
             other => panic!("expected Attach, got {other:?}"),
         }

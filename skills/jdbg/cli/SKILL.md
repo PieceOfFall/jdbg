@@ -4,7 +4,7 @@ description: "Use the jdbg CLI to debug Java programs interactively from Pi when
 compatibility: "Requires a JDK 8+ with jdb available through JAVA_HOME, PATH, or --jdb-path. Requires the jdbg CLI on PATH. Native on Windows, Linux, and macOS."
 allowed-tools: "Bash(jdbg:*), Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "1.9"
+  version: "1.10"
 ---
 
 # jdbg CLI - interactive Java debugging for Pi
@@ -64,6 +64,10 @@ Use the JDI sidecar for structured attach debugging:
 ```bash
 jdbg attach --backend jdi --host localhost --port 5005 --sourcepath src/main/java
 ```
+
+If `--sourcepath` is omitted, jdbg uses the shell's current working directory as the source root and sends it
+to the daemon as an absolute path. Relative `--sourcepath` values are also absolutized before the daemon sees
+them, so source lookup is stable even when the daemon was started from another directory.
 
 The default backend is `jdb`. The JDI backend supports the normal debugging surface too: breakpoints,
 exception catchpoints, watchpoints, stepping, stack frames, classes/methods, source listing, thread control,
