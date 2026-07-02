@@ -7,22 +7,28 @@
 ## What this project is (one paragraph)
 
 `jdbg` is a cross-platform **Rust CLI** (binary `jdbg`, crate `java-agent-debugger`, edition 2024) that lets an
-AI agent **debug Java interactively** by wrapping the JDK's `jdb` — prompt-aware (never sleep-based), stateful
-(a background daemon keeps sessions alive across calls), Windows-first. It is consumed two ways: the **CLI** and
-an **MCP server** (`jdbg __mcp`, native tool calls for Claude Code, Codex, and OpenCode). Full detail in `DESIGN.md`.
+AI agent **debug Java interactively** through the JDK's `jdb` compatibility backend plus an optional Java JDI
+sidecar backend — prompt-aware (never sleep-based), stateful (a background daemon keeps sessions alive across
+calls), Windows-first. It is consumed two ways: the **CLI** and an **MCP server** (`jdbg __mcp`, native tool calls
+for Claude Code, Codex, and OpenCode). Full detail in `DESIGN.md`.
 
 ## Binding constraints (do not violate without asking)
 
 These are settled decisions. Changing them needs explicit user sign-off.
 
-- **Threads, NOT tokio.** Concurrency is `std::thread` + channels + blocking IO. The concurrency is tiny and
-  bounded; an async runtime is unjustified. This applies to the MCP server too (hand-written stdio JSON-RPC).
+- **Keep blocking boundaries where they are settled.** The existing `jdb` engine, daemon registry, daemon IPC,
+  and per-session command locking remain `std::thread` + channels + blocking IO unless explicitly redesigned.
+  `tokio` is allowed for `rmcp` MCP serving and the JDI sidecar transport/lifecycle subsystem.
 - **No temp files, no shell, no sleeps.** Commands are written straight to `jdb`'s stdin. Readiness is detected
   by reading until the prompt, never by sleeping. There is no shell involved anywhere (no injection surface).
-- **Minimal dependencies.** Do not add a crate when `std` suffices. Deliberately excluded: `tokio`, `rmcp`
-  (pulls tokio), `once_cell`, `nix`, `daemonize`, `portable-pty`/`conpty`, any TCP/RPC framework, any
-  windows/winapi crate (use `std` raw FFI for the few Win32 calls). Use `std::sync::LazyLock` for one-time
-  regex compilation and `std::os::*` for platform bits.
+- **Minimal dependencies.** Do not add a crate when `std` suffices. `rmcp` is allowed only for MCP
+  protocol/tool serving, not daemon IPC or debugger backend RPC. Deliberately excluded: `once_cell`, `nix`,
+  `daemonize`, `portable-pty`/`conpty`, any broad TCP/RPC framework, any windows/winapi crate (use `std` raw
+  FFI for the few Win32 calls). Use `std::sync::LazyLock` for one-time regex compilation and `std::os::*`
+  for platform bits.
+- **Keep Java sidecar dependencies isolated.** Java-only expression/evaluation dependencies belong in
+  `sidecar/jdi` and are packaged into the Gradle fat jar `jdbg-jdi-sidecar.jar`. Do not add a Rust RPC
+  framework or Rust JDWP stack for sidecar work unless the user explicitly approves that redesign.
 - **One daemon per user; one in-flight command per session.** The per-session command `Mutex` is held across
   write+wait — `jdb` is line-oriented and cannot interleave commands. Different sessions run in parallel.
 - **The daemon is the single writer** of the on-disk registry (atomic temp-in-same-dir + rename). The CLI only
@@ -80,6 +86,19 @@ These are settled decisions. Changing them needs explicit user sign-off.
   must not reach around them into session/jdb internals. Keep `src/mcp/tools.rs` the single MCP↔`Command`
   mapping point.
 
+## JDI sidecar rules
+
+- **JDI session creation is attach-only for now.** `jdb` remains the default and supports launch. JDI launch mode
+  is still future work; `launch --backend jdi` must fail explicitly rather than silently falling back.
+- **Sidecar protocol stays length-prefixed JSON over platform-local transport.** Windows uses two one-way Named
+  Pipes; Linux/macOS use an AF_UNIX socketpair. Do not put protocol messages on stdout and do not replace this
+  with gRPC/protobuf/direct Rust JDWP without explicit user sign-off.
+- **Safe inspect vs executable evaluation is a hard semantic split.** JDI `inspect` reads fields/collections
+  without invoking getters. JDI `print`, `eval`, `dump`, `set`, and `force_return` may execute target code and
+  can have side effects; keep docs, skills, and errors explicit about this.
+- **Mutation requires a suspended stop site.** JDI eval/set/force-return must fail clearly for running, dead, or
+  exited sessions. `force_return` currently supports non-void values only; void force return is unsupported.
+
 ## Setup / agent registration rules
 
 - **`jdbg setup` is multi-agent.** First-class setup targets are `claude`, `codex`, `opencode`, and `pi`; `--target`
@@ -100,9 +119,14 @@ These are settled decisions. Changing them needs explicit user sign-off.
 
 ## Environment gotchas (affect correctness on this machine)
 
-- **Minimum JDK 8** (must also work on 9–21+). User `JAVA_HOME` = `C:\Users\luyiwen\.jdks\azul-1.8.0_492`.
-- **Prefer `JAVA_HOME` over PATH** when locating `jdb` — on this machine PATH resolves to JDK 21 but the target
-  is the JDK 8 at `JAVA_HOME`. Discovery order: `--jdb-path` → `JAVA_HOME/bin` → PATH → common install dirs.
+- **Debug target minimum JDK 8** (must also work on 9–21+). When reproducing JDK 8 behavior locally, point
+  `JAVA_HOME` at a JDK 8 install rather than relying on `PATH`.
+- **Prefer `JAVA_HOME` over PATH** when locating `jdb` — `PATH` may resolve to a newer JDK while the intended
+  target/debugger JDK is the one at `JAVA_HOME`. Discovery order: `--jdb-path` → `JAVA_HOME/bin` → PATH →
+  common install dirs.
+- **Source builds need JDK 17+ for Gradle sidecar packaging.** Use `JDBG_GRADLE_JAVA_HOME` to point at a JDK 17+
+  build JVM while leaving `JAVA_HOME` on a JDK 8 target if needed. Use `JDBG_SKIP_JDI_SIDECAR_BUILD` only when a
+  suitable `jdbg-jdi-sidecar.jar` is already available via `JDBG_JDI_SIDECAR_JAR` or next to the `jdbg` binary.
 - **`-g` for locals/line breakpoints.** If the parser sees "Local variable information not available", set a
   `note` advising `javac -g` — still succeed.
 - **JDWP attach syntax is JDK-version-aware.** `address=*:5005` is **JDK 9+ only**; on **JDK 8** use
@@ -137,10 +161,19 @@ push does NOT trigger a release build. PRs trigger a plan-only dry-run (no publi
 GitHub Release page. The `jdbg update` command downloads the latest release artifact for the current
 platform, self-updates, and re-registers every coding agent that had already been configured by `jdbg setup`.
 
+CI (`.github/workflows/ci.yml`) runs `cargo test` on Windows, Linux, and macOS across JDK 8, 11, 17, and 21. It
+installs JDK 17 first for the Gradle sidecar build, records that as `JDBG_GRADLE_JAVA_HOME`, then switches
+`JAVA_HOME` to the matrix JDK. Windows runs `cargo test -- --test-threads=1` to avoid JDWP/JDI fixture process
+contention; keep this when reproducing Windows-only CI failures.
+
 ## Build & test conventions
 
 - Build `cargo build` · test `cargo test`. The environment is Windows; this session drives builds/tests via
   **PowerShell** (the Bash tool is unavailable here).
+- For a full source build with JDI support, make sure a JDK 17+ is discoverable or set `JDBG_GRADLE_JAVA_HOME`.
+  The debuggee/target JVM can still be JDK 8+.
+- When diagnosing Windows CI-only integration failures, also run `cargo test -- --test-threads=1`; Linux/macOS CI
+  use normal parallel `cargo test`.
 - **TDD for pure logic** (parser, protocol mapping, jsonrpc/tools): write the failing test first, watch it fail,
   then implement. Platform side-effects (handle inheritance, real-jdb behavior) are the documented TDD
   exception — verify them with an end-to-end run instead.

@@ -2,17 +2,24 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use interprocess::local_socket::Stream;
 
 use super::manager::SessionManager;
-use crate::error::Result;
+use crate::backend::DebugSession;
+use crate::error::{Error, Result};
 use crate::jdb::parser::CommandHint;
+use crate::jdi::session::JdiSession;
 use crate::protocol::*;
 use crate::session::{CommandKind, Session};
 
 /// Handle one connection: one request → one response.
-pub fn handle_connection(stream: Stream, mgr: &Arc<SessionManager>) -> anyhow::Result<()> {
+pub fn handle_connection(
+    stream: Stream,
+    mgr: &Arc<SessionManager>,
+    shutdown: &Arc<AtomicBool>,
+) -> anyhow::Result<()> {
     let mut reader = BufReader::new(&stream);
     let mut line = String::new();
     reader.read_line(&mut line)?;
@@ -30,18 +37,19 @@ pub fn handle_connection(stream: Stream, mgr: &Arc<SessionManager>) -> anyhow::R
         }
     };
 
-    let resp = dispatch(&req, mgr);
+    let resp = dispatch(&req, mgr, shutdown);
     write_response(&stream, &resp)?;
     Ok(())
 }
 
 /// Route a command to concrete handling logic.
-fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
+fn dispatch(req: &Request, mgr: &Arc<SessionManager>, shutdown: &AtomicBool) -> Response {
     let id = &req.id;
     match &req.cmd {
         // ── Session lifecycle ──
         Command::Launch {
             main_class,
+            backend,
             classpath,
             sourcepath,
             app_args,
@@ -51,6 +59,7 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
         } => {
             match mgr.create_launch(super::manager::LaunchParams {
                 main_class: main_class.clone(),
+                backend: *backend,
                 classpath: classpath.clone(),
                 sourcepath: sourcepath.clone(),
                 app_args: app_args.clone(),
@@ -60,9 +69,10 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
             }) {
                 Ok(session) => {
                     let result = CommandResult::SessionCreated {
-                        session: session.meta.id.clone(),
-                        mode: session.meta.mode,
-                        target: session.meta.target.clone(),
+                        session: session.id().to_string(),
+                        mode: session.mode(),
+                        backend: session.backend(),
+                        target: session.target().to_string(),
                         state: session.state(),
                     };
                     Response::ok(
@@ -78,6 +88,7 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
             }
         }
         Command::Attach {
+            backend,
             host,
             port,
             sourcepath,
@@ -85,6 +96,7 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
             jdb_path,
         } => {
             match mgr.create_attach(super::manager::AttachParams {
+                backend: *backend,
                 host: host.clone(),
                 port: *port,
                 sourcepath: sourcepath.clone(),
@@ -93,9 +105,10 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
             }) {
                 Ok(session) => {
                     let result = CommandResult::SessionCreated {
-                        session: session.meta.id.clone(),
-                        mode: session.meta.mode,
-                        target: session.meta.target.clone(),
+                        session: session.id().to_string(),
+                        mode: session.mode(),
+                        backend: session.backend(),
+                        target: session.target().to_string(),
                         state: session.state(),
                     };
                     // If the entry point normalized localhost to 127.0.0.1, say so explicitly.
@@ -134,7 +147,7 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
             // Resolve target session (None = unique live session), consistent with other commands' --session default.
             match mgr.get(req.session.as_deref()) {
                 Ok(session) => {
-                    let sid = session.meta.id.clone();
+                    let sid = session.id().to_string();
                     match mgr.kill(&sid) {
                         Ok(()) => Response::ok(
                             id,
@@ -181,26 +194,7 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>) -> Response {
                 },
             )
         }
-        Command::DaemonStop => {
-            // Respond ok first, then the daemon exits after this connection closes.
-            let result = CommandResult::Raw {
-                text: "daemon stopping".into(),
-            };
-            let resp = Response::ok(
-                id,
-                CommandResponse {
-                    result,
-                    stderr: None,
-                    note: None,
-                },
-            );
-            // Exit after flushing the response. Crude but effective; can later become a graceful shutdown flag.
-            std::thread::spawn(|| {
-                std::thread::sleep(std::time::Duration::from_millis(100));
-                std::process::exit(0);
-            });
-            resp
-        }
+        Command::DaemonStop => daemon_stop_response(id, shutdown),
 
         // ── All session-bound commands ──
         _ => dispatch_session_cmd(req, mgr),
@@ -214,7 +208,28 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
         Ok(s) => s,
         Err(e) => return Response::err(id, e.exit_code(), e.to_string()),
     };
+    match session {
+        DebugSession::Jdb(session) => dispatch_jdb_session_cmd(req, session),
+        DebugSession::Jdi(session) => dispatch_jdi_session_cmd(req, session),
+    }
+}
 
+fn daemon_stop_response(id: &str, shutdown: &AtomicBool) -> Response {
+    shutdown.store(true, Ordering::SeqCst);
+    Response::ok(
+        id,
+        CommandResponse {
+            result: CommandResult::Raw {
+                text: "daemon stopping".into(),
+            },
+            stderr: None,
+            note: None,
+        },
+    )
+}
+
+fn dispatch_jdb_session_cmd(req: &Request, session: Arc<Session>) -> Response {
+    let id = &req.id;
     // Timeout override for this request (CLI `--timeout`); None means each command's default.
     let t = req.timeout;
     let precondition_note = match settle_async_condition_breakpoint(&session, &req.cmd, t) {
@@ -244,10 +259,18 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
         Command::BreakIn {
             class,
             method,
+            event,
             args,
             condition,
             suspend,
         } => {
+            if *event != MethodEventKind::Entry {
+                let error = Error::UnsupportedBackend {
+                    backend: "jdb".into(),
+                    operation: format!("break_in --event {event:?}").to_lowercase(),
+                };
+                return Response::err(id, error.exit_code(), error.to_string());
+            }
             let r = session.stop_in(class, method, args.as_deref(), suspend.as_deref(), t);
             if r.is_ok() {
                 let spec = match args {
@@ -466,6 +489,10 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
             }
             first_try
         }
+        Command::ForceReturn { .. } => Err(Error::UnsupportedBackend {
+            backend: "jdb".into(),
+            operation: "force_return".into(),
+        }),
         Command::Ignore { exception, mode } => {
             // Mirror Catch's mode dispatch for symmetric exception breakpoint removal.
             let cmd = match mode.as_str() {
@@ -507,6 +534,73 @@ fn dispatch_session_cmd(req: &Request, mgr: &Arc<SessionManager>) -> Response {
 }
 
 // ─── Enrichment helpers ─────────────────────────────────────────────────────────
+
+fn dispatch_jdi_session_cmd(req: &Request, session: Arc<JdiSession>) -> Response {
+    let id = &req.id;
+    let result = match &req.cmd {
+        Command::BreakAt {
+            class,
+            line,
+            condition,
+            suspend,
+        } => {
+            if condition.is_some() {
+                Err(session.unsupported("conditional break_at"))
+            } else {
+                session.stop_at(class, *line, suspend.as_deref())
+            }
+        }
+        Command::BreakIn {
+            class,
+            method,
+            event,
+            args,
+            condition,
+            suspend,
+        } => {
+            if condition.is_some() {
+                Err(session.unsupported("conditional break_in"))
+            } else {
+                session.break_in(class, method, args.as_deref(), *event, suspend.as_deref())
+            }
+        }
+        Command::Run => session.run(req.timeout),
+        Command::Cont => session.cont(req.timeout),
+        Command::Next => session.next(req.timeout),
+        Command::Where { all } => session.stack(*all),
+        Command::Locals => session.locals(),
+        Command::Threads { filter } => session.threads(filter.as_deref()),
+        Command::Thread { id } => session.select_thread(id),
+        Command::Inspect { expr, max_elements } => session.inspect(expr, *max_elements),
+        Command::Print { expr } | Command::Eval { expr } => session.evaluate(expr),
+        Command::Dump { expr } => session.dump(expr, 10),
+        Command::Step => Err(session.unsupported("step")),
+        Command::StepOut => Err(session.unsupported("step_out")),
+        Command::Catch { .. } => Err(session.unsupported("catch")),
+        Command::Watch { field, mode } => session.watch(field, mode),
+        Command::Unwatch { field, mode } => session.unwatch(field, mode),
+        Command::Breakpoints => Err(session.unsupported("breakpoints")),
+        Command::Clear { .. } => Err(session.unsupported("clear")),
+        Command::Classes { .. } => Err(session.unsupported("classes")),
+        Command::Methods { .. } => Err(session.unsupported("methods")),
+        Command::Frame { .. } => Err(session.unsupported("frame")),
+        Command::ListSource { .. } => Err(session.unsupported("list_source")),
+        Command::Raw { .. } => Err(session.unsupported("raw")),
+        Command::Suspend { .. } => Err(session.unsupported("suspend")),
+        Command::Resume { .. } => Err(session.unsupported("resume")),
+        Command::Set { lvalue, value } => session.set_value(lvalue, value),
+        Command::ForceReturn { value } => session.force_return(value),
+        Command::Ignore { .. } => Err(session.unsupported("ignore")),
+        Command::Lock { .. } => Err(session.unsupported("lock")),
+        Command::ThreadLocks { .. } => Err(session.unsupported("threadlocks")),
+        _ => return Response::err(id, 400, "unexpected command in JDI session dispatch"),
+    };
+
+    match result {
+        Ok(resp) => Response::ok(id, resp),
+        Err(e) => Response::err(id, e.exit_code(), e.to_string()),
+    }
+}
 
 /// Append one message to resp.note, separating multiple messages with newlines.
 fn append_note(resp: &mut CommandResponse, msg: &str) {
@@ -630,6 +724,7 @@ fn should_settle_async_conditions(cmd: &Command) -> bool {
             | Command::ListSource { .. }
             | Command::Inspect { .. }
             | Command::Set { .. }
+            | Command::ForceReturn { .. }
             | Command::Lock { .. }
             | Command::ThreadLocks { .. }
     )
@@ -1073,6 +1168,7 @@ fn needs_string_quoting(value: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
 
     fn ti(id: &str, name: &str, state: &str) -> ThreadInfo {
         ThreadInfo {
@@ -1081,6 +1177,16 @@ mod tests {
             group: None,
             state: state.into(),
         }
+    }
+
+    #[test]
+    fn daemon_stop_response_sets_shutdown_flag() {
+        let shutdown = AtomicBool::new(false);
+
+        let resp = daemon_stop_response("r1", &shutdown);
+
+        assert!(resp.ok);
+        assert!(shutdown.load(Ordering::SeqCst));
     }
 
     #[test]

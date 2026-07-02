@@ -67,6 +67,52 @@ pub fn multi_select(
     Ok(result)
 }
 
+/// Render a single-choice list and return the selected item index.
+///
+/// `selected` is the initial row. Enter confirms the highlighted row, Space
+/// selects the highlighted row without leaving the prompt, and Esc / `q` /
+/// Ctrl-C cancels. Returns `Err` when raw mode is unavailable so callers can
+/// fall back to a plain line-based prompt.
+pub fn single_select(title: &str, labels: &[String], selected: usize) -> io::Result<Option<usize>> {
+    if labels.is_empty() {
+        return Ok(None);
+    }
+
+    let _raw = RawMode::enter()?;
+    let mut cursor = selected.min(labels.len() - 1);
+    let mut chosen = cursor;
+    let mut stdout = io::stdout();
+
+    writeln!(
+        stdout,
+        "{title}\r\n  (\u{2191}/\u{2193} move \u{00b7} space select \u{00b7} enter confirm \u{00b7} esc cancel)\r"
+    )?;
+    render_single(&mut stdout, labels, chosen, cursor, true)?;
+
+    let mut input = io::stdin();
+    let result = loop {
+        match read_key(&mut input)? {
+            Key::Up => {
+                cursor = (cursor + labels.len() - 1) % labels.len();
+                chosen = cursor;
+            }
+            Key::Down => {
+                cursor = (cursor + 1) % labels.len();
+                chosen = cursor;
+            }
+            Key::Space => chosen = cursor,
+            Key::Enter => break Some(chosen),
+            Key::Cancel => break None,
+            Key::Other => continue,
+        }
+        render_single(&mut stdout, labels, chosen, cursor, false)?;
+    };
+
+    writeln!(stdout, "\r")?;
+    stdout.flush()?;
+    Ok(result)
+}
+
 /// Draw (or redraw) the list. After the first draw we move the cursor back up
 /// over the previously drawn rows and overwrite them in place.
 fn render(
@@ -85,6 +131,24 @@ fn render(
         let mark = if state[idx] { "\u{2714}" } else { " " };
         // \r + clear-to-end so leftover characters from a longer prior line vanish.
         write!(out, "\r\x1b[K {pointer} [{mark}] {label}\r\n")?;
+    }
+    out.flush()
+}
+
+fn render_single(
+    out: &mut io::Stdout,
+    labels: &[String],
+    selected: usize,
+    cursor: usize,
+    first: bool,
+) -> io::Result<()> {
+    if !first {
+        write!(out, "\x1b[{}A", labels.len())?;
+    }
+    for (idx, label) in labels.iter().enumerate() {
+        let pointer = if idx == cursor { ">" } else { " " };
+        let mark = if idx == selected { "*" } else { " " };
+        write!(out, "\r\x1b[K {pointer} ({mark}) {label}\r\n")?;
     }
     out.flush()
 }
@@ -226,8 +290,7 @@ mod imp {
             raw.c_lflag &= !(sys::ICANON | sys::ECHO | sys::ISIG);
             raw.c_cc[sys::VMIN] = 1;
             raw.c_cc[sys::VTIME] = 0;
-            let rc =
-                unsafe { tcsetattr(STDIN_FILENO, TCSANOW, &raw as *const _ as *const c_void) };
+            let rc = unsafe { tcsetattr(STDIN_FILENO, TCSANOW, &raw as *const _ as *const c_void) };
             if rc != 0 {
                 return Err(io::Error::last_os_error());
             }

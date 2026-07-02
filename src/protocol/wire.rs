@@ -2,7 +2,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use super::result::CommandResponse;
+use super::result::{BackendKind, CommandResponse, MethodEventKind};
 
 // ─── Request ────────────────────────────────────────────────────────────────────
 
@@ -56,6 +56,8 @@ pub enum Command {
     Launch {
         main_class: String,
         #[serde(default)]
+        backend: BackendKind,
+        #[serde(default)]
         classpath: Vec<String>,
         #[serde(default)]
         sourcepath: Vec<String>,
@@ -69,6 +71,8 @@ pub enum Command {
         jdb_path: Option<String>,
     },
     Attach {
+        #[serde(default)]
+        backend: BackendKind,
         #[serde(default = "default_host")]
         host: String,
         #[serde(default = "default_port")]
@@ -96,6 +100,8 @@ pub enum Command {
     BreakIn {
         class: String,
         method: String,
+        #[serde(default)]
+        event: MethodEventKind,
         #[serde(skip_serializing_if = "Option::is_none")]
         args: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -192,6 +198,9 @@ pub enum Command {
         lvalue: String,
         value: String,
     },
+    ForceReturn {
+        value: String,
+    },
     Ignore {
         exception: String,
         #[serde(default = "default_catch_mode")]
@@ -279,6 +288,49 @@ impl Response {
                 code,
                 message: message.into(),
             }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::protocol::MethodEventKind;
+    use serde_json::json;
+
+    #[test]
+    fn break_in_event_defaults_to_entry() {
+        let cmd: Command = serde_json::from_value(json!({
+            "type": "break_in",
+            "class": "Main",
+            "method": "work"
+        }))
+        .unwrap();
+
+        match cmd {
+            Command::BreakIn { event, .. } => assert_eq!(event, MethodEventKind::Entry),
+            other => panic!("expected BreakIn, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn break_in_event_accepts_exit_and_both() {
+        for (raw, expected) in [
+            ("exit", MethodEventKind::Exit),
+            ("both", MethodEventKind::Both),
+        ] {
+            let cmd: Command = serde_json::from_value(json!({
+                "type": "break_in",
+                "class": "Main",
+                "method": "work",
+                "event": raw
+            }))
+            .unwrap();
+
+            match cmd {
+                Command::BreakIn { event, .. } => assert_eq!(event, expected),
+                other => panic!("expected BreakIn, got {other:?}"),
+            }
         }
     }
 }

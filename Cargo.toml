@@ -1,6 +1,6 @@
 [package]
 name = "java-agent-debugger"
-version = "1.0.7"
+version = "2.0.0"
 edition = "2024"
 repository = "https://github.com/PieceOfFall/jdbg"
 description = "Cross-platform CLI debugger for Java, wrapping jdb with prompt-aware control"
@@ -22,9 +22,11 @@ interprocess = "2"
 jiff = "0.2"
 rand = "0.9"
 regex = "1"
+rmcp = { version = "2.0.0", default-features = false, features = ["server", "transport-io"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
+tokio = { version = "1", default-features = false, features = ["rt-multi-thread"] }
 
 # The profile that 'dist' will build with
 [profile.dist]

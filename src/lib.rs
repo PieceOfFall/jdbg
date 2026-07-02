@@ -14,11 +14,13 @@
 //! - [`client`]: CLI-side RPC client for connecting to the daemon.
 //! - bin (`src/main.rs`): CLI / daemon entry point, depending only on the library's public API.
 
+pub mod backend;
 pub mod cli;
 pub mod client;
 pub mod daemon;
 pub mod error;
 pub mod jdb;
+pub mod jdi;
 pub mod jdkpath;
 pub mod mcp;
 pub mod output;

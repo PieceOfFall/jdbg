@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::jsonrpc::{INVALID_PARAMS, JsonRpcError, METHOD_NOT_FOUND};
-use crate::protocol::{Command, Request};
+use crate::protocol::{BackendKind, Command, MethodEventKind, Request};
 
 /// Public description of a tool, serialized into `tools/list`.
 #[derive(Debug, Clone, Serialize)]
@@ -20,7 +20,7 @@ pub struct ToolSpec {
     pub input_schema: Value,
 }
 
-/// Specs for all 36 tools, used by `tools/list`.
+/// Specs for all 37 tools, used by `tools/list`.
 pub fn tool_specs() -> Vec<ToolSpec> {
     vec![
         // ── Sessions ──
@@ -30,6 +30,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
              (JVM not started yet) — set breakpoints, then call `run`.",
             json!({
                 "main_class": {"type": "string", "description": "Fully-qualified main class, e.g. com.example.Main."},
+                "backend": {"type": "string", "enum": ["jdb", "jdi"], "description": "Debug backend (default jdb). JDI support is selected only at session creation."},
                 "classpath": {"type": "string", "description": "Classpath (OS-separated entries)."},
                 "sourcepath": {"type": "string", "description": "Source path; enables `list_source`/`locals` line info."},
                 "app_args": {"type": "array", "items": {"type": "string"}, "description": "Arguments passed to the program's main()."},
@@ -48,6 +49,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             json!({
                 "host": {"type": "string", "description": "Target host (default localhost). 'localhost' is auto-normalized to 127.0.0.1 (IPv4 loopback) because on dual-stack hosts it may resolve to IPv6 [::1] while JDWP listens only on IPv4; pass '::1' to force IPv6."},
                 "port": {"type": "integer", "description": "Target JDWP port (default 5005)."},
+                "backend": {"type": "string", "enum": ["jdb", "jdi"], "description": "Debug backend (default jdb). JDI support is selected only at session creation."},
                 "sourcepath": {"type": "string", "description": "Source path for line info."},
                 "name": {"type": "string", "description": "Optional session display name."},
                 "jdb_path": {"type": "string", "description": "Override path to the jdb executable."}
@@ -101,12 +103,13 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         tool(
             "break_in",
-            "Set a method-entry breakpoint at Class.method. Use `args` (comma-separated param types) to \
-             disambiguate overloads. Use `condition` to only stop when a boolean expression is true. \
+            "Set a method breakpoint at Class.method. Use event='entry' (default), 'exit', or 'both'. \
+             Use `args` (comma-separated param types) to disambiguate overloads. Use `condition` to only stop when a boolean expression is true. \
              Use `suspend: \"thread\"` to only suspend the hit thread (keeps heartbeat threads alive).",
             json!({
                 "class": {"type": "string", "description": "Class name."},
                 "method": {"type": "string", "description": "Method name."},
+                "event": {"type": "string", "enum": ["entry", "exit", "both"], "description": "Method event to stop on (default entry). JDI supports entry, exit, and both; jdb supports entry only."},
                 "args": {"type": "string", "description": "Parameter types for overload disambiguation, e.g. 'int,java.lang.String'."},
                 "condition": {"type": "string", "description": "Optional boolean expression — breakpoint only fires when true."},
                 "suspend": {"type": "string", "enum": ["all", "thread"], "description": "Suspend policy: 'all' freezes the entire JVM (default), 'thread' only suspends the hit thread."}
@@ -367,6 +370,17 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             false,
         ),
         tool(
+            "force_return",
+            "Force the current method to return a value in a JDI session. MUTATES control flow; \
+             use only when intentionally testing a branch or bypassing a failing method.",
+            json!({
+                "value": {"type": "string", "description": "Return expression to evaluate in the current suspended frame."}
+            }),
+            &["value"],
+            true,
+            false,
+        ),
+        tool(
             "ignore",
             "Stop catching an exception — removes a breakpoint previously set with `catch`. \
              The mode must match how it was caught.",
@@ -407,6 +421,7 @@ pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> 
     let cmd = match name {
         "launch" => Command::Launch {
             main_class: require_str(args, "main_class")?,
+            backend: optional_backend(args)?,
             classpath: str_to_vec(optional_str(args, "classpath")),
             sourcepath: str_to_vec(optional_str(args, "sourcepath")),
             app_args: optional_str_array(args, "app_args"),
@@ -415,6 +430,7 @@ pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> 
             jdb_path: optional_str(args, "jdb_path"),
         },
         "attach" => Command::Attach {
+            backend: optional_backend(args)?,
             host: optional_str(args, "host").unwrap_or_else(|| "localhost".to_string()),
             port: optional_u16(args, "port").unwrap_or(5005),
             sourcepath: str_to_vec(optional_str(args, "sourcepath")),
@@ -433,6 +449,7 @@ pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> 
         "break_in" => Command::BreakIn {
             class: require_str(args, "class")?,
             method: require_str(args, "method")?,
+            event: optional_method_event(args)?,
             args: optional_str(args, "args"),
             condition: optional_str(args, "condition"),
             suspend: optional_str(args, "suspend"),
@@ -505,6 +522,9 @@ pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> 
         },
         "set" => Command::Set {
             lvalue: require_str(args, "lvalue")?,
+            value: require_str(args, "value")?,
+        },
+        "force_return" => Command::ForceReturn {
             value: require_str(args, "value")?,
         },
         "ignore" => Command::Ignore {
@@ -616,6 +636,24 @@ fn optional_bool(args: &Value, key: &str) -> bool {
     args.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
+fn optional_backend(args: &Value) -> Result<BackendKind, JsonRpcError> {
+    match optional_str(args, "backend") {
+        Some(raw) => raw.parse().map_err(|e: String| {
+            JsonRpcError::new(INVALID_PARAMS, format!("invalid backend: {e}"))
+        }),
+        None => Ok(BackendKind::Jdb),
+    }
+}
+
+fn optional_method_event(args: &Value) -> Result<MethodEventKind, JsonRpcError> {
+    match optional_str(args, "event") {
+        Some(raw) => raw.parse().map_err(|e: String| {
+            JsonRpcError::new(INVALID_PARAMS, format!("invalid method event: {e}"))
+        }),
+        None => Ok(MethodEventKind::Entry),
+    }
+}
+
 fn optional_str_array(args: &Value, key: &str) -> Vec<String> {
     args.get(key)
         .and_then(Value::as_array)
@@ -636,12 +674,12 @@ fn str_to_vec(opt: Option<String>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::protocol::Command;
+    use crate::protocol::{BackendKind, Command};
     use serde_json::json;
 
     #[test]
-    fn exposes_36_tools() {
-        assert_eq!(tool_specs().len(), 36);
+    fn exposes_37_tools() {
+        assert_eq!(tool_specs().len(), 37);
     }
 
     #[test]
@@ -688,6 +726,25 @@ mod tests {
                 assert_eq!(app_args, vec!["a".to_string(), "b".to_string()])
             }
             other => panic!("expected Launch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn launch_backend_maps_to_command() {
+        let req =
+            dispatch_tool("launch", &json!({"main_class": "Main", "backend": "jdi"})).unwrap();
+        match req.cmd {
+            Command::Launch { backend, .. } => assert_eq!(backend, BackendKind::Jdi),
+            other => panic!("expected Launch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_backend_defaults_to_jdb() {
+        let req = dispatch_tool("attach", &json!({})).unwrap();
+        match req.cmd {
+            Command::Attach { backend, .. } => assert_eq!(backend, BackendKind::Jdb),
+            other => panic!("expected Attach, got {other:?}"),
         }
     }
 
@@ -934,9 +991,36 @@ mod tests {
     fn break_in_suspend_absent_is_none() {
         let req = dispatch_tool("break_in", &json!({"class": "Main", "method": "foo"})).unwrap();
         match req.cmd {
-            Command::BreakIn { suspend, .. } => assert_eq!(suspend, None),
+            Command::BreakIn { suspend, event, .. } => {
+                assert_eq!(suspend, None);
+                assert_eq!(event, crate::protocol::MethodEventKind::Entry);
+            }
             other => panic!("expected BreakIn, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn break_in_event_maps_and_schema_lists_choices() {
+        let req = dispatch_tool(
+            "break_in",
+            &json!({"class": "Main", "method": "foo", "event": "exit"}),
+        )
+        .unwrap();
+        match req.cmd {
+            Command::BreakIn { event, .. } => {
+                assert_eq!(event, crate::protocol::MethodEventKind::Exit)
+            }
+            other => panic!("expected BreakIn, got {other:?}"),
+        }
+
+        let spec = tool_specs()
+            .into_iter()
+            .find(|tool| tool.name == "break_in")
+            .expect("break_in tool spec");
+        assert_eq!(
+            spec.input_schema["properties"]["event"]["enum"],
+            json!(["entry", "exit", "both"])
+        );
     }
 
     #[test]
@@ -1024,6 +1108,17 @@ mod tests {
     }
 
     #[test]
+    fn force_return_maps_value() {
+        match dispatch_tool("force_return", &json!({"value": "123"}))
+            .unwrap()
+            .cmd
+        {
+            Command::ForceReturn { value } => assert_eq!(value, "123"),
+            other => panic!("expected ForceReturn, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn thread_id_accepts_numeric_json() {
         // LLM clients frequently emit a numeric thread id (e.g. {"id": 582})
         // instead of a string. require_str must coerce it, not reject it.
@@ -1031,7 +1126,10 @@ mod tests {
             Command::Thread { id } => assert_eq!(id, "582"),
             other => panic!("expected Thread, got {other:?}"),
         }
-        match dispatch_tool("thread", &json!({"id": "0x37f2"})).unwrap().cmd {
+        match dispatch_tool("thread", &json!({"id": "0x37f2"}))
+            .unwrap()
+            .cmd
+        {
             Command::Thread { id } => assert_eq!(id, "0x37f2"),
             other => panic!("expected Thread, got {other:?}"),
         }

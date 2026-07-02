@@ -34,13 +34,10 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    match run_client(cli) {
-        Ok(code) => code,
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::from(1)
-        }
-    }
+    run_client(cli).unwrap_or_else(|e| {
+        eprintln!("error: {e}");
+        ExitCode::from(1)
+    })
 }
 
 fn run_client(cli: Cli) -> anyhow::Result<ExitCode> {
@@ -72,10 +69,11 @@ fn run_client(cli: Cli) -> anyhow::Result<ExitCode> {
         remove,
         print,
         target,
+        backend,
         yes,
     } = &cli.command
     {
-        setup::run_setup(*remove, *print, target.as_deref(), *yes)?;
+        setup::run_setup(*remove, *print, target.as_deref(), *yes, backend.as_deref())?;
         return Ok(ExitCode::SUCCESS);
     }
 
@@ -92,7 +90,7 @@ fn run_client(cli: Cli) -> anyhow::Result<ExitCode> {
     if resp.ok {
         if let Some(result) = &resp.result {
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(result).unwrap());
+                println!("{}", serde_json::to_string_pretty(result)?);
             } else {
                 println!("{}", output::render(result, false));
             }
@@ -111,6 +109,7 @@ fn build_command(cli: &Cli) -> anyhow::Result<Command> {
     let cmd = match &cli.command {
         Commands::Launch {
             main_class,
+            backend,
             classpath,
             sourcepath,
             app_args,
@@ -118,6 +117,7 @@ fn build_command(cli: &Cli) -> anyhow::Result<Command> {
             name,
         } => Command::Launch {
             main_class: main_class.clone(),
+            backend: backend.parse().map_err(|e: String| anyhow::anyhow!(e))?,
             classpath: classpath
                 .as_deref()
                 .map(|s| vec![s.to_string()])
@@ -132,11 +132,13 @@ fn build_command(cli: &Cli) -> anyhow::Result<Command> {
             jdb_path: cli.jdb_path.clone(),
         },
         Commands::Attach {
+            backend,
             host,
             port,
             sourcepath,
             name,
         } => Command::Attach {
+            backend: backend.parse().map_err(|e: String| anyhow::anyhow!(e))?,
             host: host.clone(),
             port: *port,
             sourcepath: sourcepath
@@ -163,12 +165,14 @@ fn build_command(cli: &Cli) -> anyhow::Result<Command> {
         Commands::BreakIn {
             class,
             method,
+            event,
             args,
             condition,
             suspend,
         } => Command::BreakIn {
             class: class.clone(),
             method: method.clone(),
+            event: event.parse().map_err(|e: String| anyhow::anyhow!(e))?,
             args: args.clone(),
             condition: condition.clone(),
             suspend: suspend.clone(),
@@ -223,6 +227,9 @@ fn build_command(cli: &Cli) -> anyhow::Result<Command> {
         Commands::Resume { id } => Command::Resume { id: id.clone() },
         Commands::Set { lvalue, value } => Command::Set {
             lvalue: lvalue.clone(),
+            value: value.clone(),
+        },
+        Commands::ForceReturn { value } => Command::ForceReturn {
             value: value.clone(),
         },
         Commands::Ignore { exception, mode } => Command::Ignore {
