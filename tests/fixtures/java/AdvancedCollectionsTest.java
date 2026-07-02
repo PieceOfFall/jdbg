@@ -20,6 +20,7 @@ public class AdvancedCollectionsTest {
         TreeSet<String> treeSet = new TreeSet<>();
         List<String> unmodifiableList;
         Map<String, Integer> unmodifiableMap;
+        String ready;
     }
 
     public static void main(String[] args) throws Exception {
@@ -34,6 +35,7 @@ public class AdvancedCollectionsTest {
         holder.treeSet.add("tree-b");
         holder.unmodifiableList = Collections.unmodifiableList(holder.linkedList);
         holder.unmodifiableMap = Collections.unmodifiableMap(new LinkedHashMap<String, Integer>(holder.treeMap));
+        holder.ready = "ready";
         System.out.println(holder.linkedList.size());
         Thread.sleep(300000);
     }

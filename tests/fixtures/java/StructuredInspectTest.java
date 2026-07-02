@@ -16,6 +16,7 @@ public class StructuredInspectTest {
         Map<String, Integer> counts;
         Mode mode;
         int[] numbers;
+        String ready;
     }
 
     public static void main(String[] args) throws Exception {
@@ -32,6 +33,7 @@ public class StructuredInspectTest {
         root.counts.put("three", 3);
         root.mode = Mode.ACTIVE;
         root.numbers = new int[] {1, 2, 3, 4};
+        root.ready = "ready";
         System.out.println(root.name);
         Thread.sleep(300000);
     }

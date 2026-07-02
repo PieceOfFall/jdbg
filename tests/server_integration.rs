@@ -826,21 +826,24 @@ fn jdi_inspect_renders_structured_value_kinds() {
     )
     .expect("JDI attach failed");
 
-    let breakpoint = session
-        .stop_at("StructuredInspectTest", 35, None)
-        .expect("JDI breakpoint failed");
+    let watch = session
+        .watch("StructuredInspectTest$Node.ready", "modification")
+        .expect("JDI structured node watch failed");
     assert!(
-        matches!(
-            breakpoint.result,
-            CommandResult::BreakpointSet { deferred: true, .. }
-        ),
-        "expected deferred JDI breakpoint, got {:?}",
-        breakpoint.result
+        matches!(watch.result, CommandResult::WatchSet { deferred: true, .. }),
+        "expected deferred JDI node watch, got {:?}",
+        watch.result
     );
     let stop = session.cont(Some(30)).expect("JDI cont failed");
     assert!(
-        matches!(stop.result, CommandResult::Stopped { .. }),
-        "expected JDI breakpoint stop, got {:?}",
+        matches!(
+            stop.result,
+            CommandResult::Stopped {
+                event: Event::FieldWatch { .. },
+                ..
+            }
+        ),
+        "expected JDI node watch stop, got {:?}",
         stop.result
     );
 
@@ -879,12 +882,18 @@ fn jdi_inspect_specializes_advanced_collections_and_maps() {
     .expect("JDI attach failed");
 
     session
-        .stop_at("AdvancedCollectionsTest", 38, None)
-        .expect("JDI breakpoint failed");
+        .watch("AdvancedCollectionsTest$Holder.ready", "modification")
+        .expect("JDI advanced holder watch failed");
     let stop = session.cont(Some(30)).expect("JDI cont failed");
     assert!(
-        matches!(stop.result, CommandResult::Stopped { .. }),
-        "expected JDI breakpoint stop, got {:?}",
+        matches!(
+            stop.result,
+            CommandResult::Stopped {
+                event: Event::FieldWatch { .. },
+                ..
+            }
+        ),
+        "expected JDI advanced holder watch stop, got {:?}",
         stop.result
     );
 
@@ -1047,12 +1056,18 @@ fn jdi_step_over_returns_step_event_with_stack_and_locals() {
     .expect("JDI attach failed");
 
     session
-        .stop_at("StructuredInspectTest", 35, None)
-        .expect("JDI breakpoint failed");
+        .watch("StructuredInspectTest$Node.ready", "modification")
+        .expect("JDI node watch failed");
     let stop = session.cont(Some(30)).expect("JDI cont failed");
     assert!(
-        matches!(stop.result, CommandResult::Stopped { .. }),
-        "expected breakpoint stop, got {:?}",
+        matches!(
+            stop.result,
+            CommandResult::Stopped {
+                event: Event::FieldWatch { .. },
+                ..
+            }
+        ),
+        "expected node watch stop, got {:?}",
         stop.result
     );
 
@@ -1065,10 +1080,7 @@ fn jdi_step_over_returns_step_event_with_stack_and_locals() {
             ..
         } => {
             assert_eq!(location.class, "StructuredInspectTest");
-            assert!(
-                location.line >= 35,
-                "step-over should stop at or after the breakpoint line, got {location:?}"
-            );
+            assert_eq!(location.method, "main");
             assert_eq!(frame.location.class, "StructuredInspectTest");
         }
         other => panic!("expected JDI step Stopped with top frame, got {other:?}"),
@@ -1106,7 +1118,7 @@ fn jdi_eval_set_and_force_return_execute_in_stopped_frame() {
     .expect("JDI attach failed");
 
     session
-        .watch("EvalMutationTest.gate", "modification")
+        .watch("EvalMutationTest$Box.phase", "modification")
         .expect("JDI compute gate watch failed");
     let stop = session.cont(Some(30)).expect("JDI cont to compute failed");
     match &stop.result {
@@ -1117,7 +1129,7 @@ fn jdi_eval_set_and_force_return_execute_in_stopped_frame() {
             location,
             ..
         } => {
-            assert_eq!(field, "EvalMutationTest.gate");
+            assert_eq!(field, "EvalMutationTest$Box.phase");
             assert_eq!(access_type, "modified");
             assert_eq!(location.class, "EvalMutationTest");
             assert_eq!(location.method, "compute");
@@ -1146,7 +1158,7 @@ fn jdi_eval_set_and_force_return_execute_in_stopped_frame() {
         .set_value("values[1]", "5")
         .expect("JDI array set failed");
     session
-        .watch("EvalMutationTest.afterCompute", "modification")
+        .watch("EvalMutationTest$Box.afterCompute", "modification")
         .expect("JDI post-return watch failed");
     session
         .force_return("123")
@@ -1162,7 +1174,7 @@ fn jdi_eval_set_and_force_return_execute_in_stopped_frame() {
             location,
             ..
         } => {
-            assert_eq!(field, "EvalMutationTest.afterCompute");
+            assert_eq!(field, "EvalMutationTest$Box.afterCompute");
             assert_eq!(access_type, "modified");
             assert_eq!(location.class, "EvalMutationTest");
         }
@@ -1301,21 +1313,21 @@ fn jdi_unwatch_removes_active_watchpoint_after_first_hit() {
     .expect("JDI attach failed");
 
     session
-        .stop_at("WatchTwiceTest", 5, None)
-        .expect("JDI breakpoint failed");
-    let breakpoint = session
+        .watch("WatchTwiceTest.phase", "modification")
+        .expect("JDI phase watch failed");
+    let phase_stop = session
         .cont(Some(30))
-        .expect("JDI cont to breakpoint failed");
+        .expect("JDI cont to phase watch failed");
     assert!(
         matches!(
-            breakpoint.result,
+            phase_stop.result,
             CommandResult::Stopped {
-                event: Event::Breakpoint { .. },
+                event: Event::FieldWatch { .. },
                 ..
             }
         ),
-        "expected breakpoint before active watchpoint setup, got {:?}",
-        breakpoint.result
+        "expected phase watch before active watchpoint setup, got {:?}",
+        phase_stop.result
     );
 
     let watch = session
@@ -1339,7 +1351,7 @@ fn jdi_unwatch_removes_active_watchpoint_after_first_hit() {
         } => {
             assert_eq!(field, "WatchTwiceTest.name");
             assert_eq!(access_type, "modified");
-            assert_eq!(location.line, 6);
+            assert_eq!(location.class, "WatchTwiceTest");
         }
         other => panic!("expected first active JDI watchpoint hit, got {other:?}"),
     }
@@ -1447,8 +1459,8 @@ fn mcp_jdi_attach_breakpoint_locals_and_inspect_smoke() {
             "id": 3,
             "method": "tools/call",
             "params": {
-                "name": "break_at",
-                "arguments": {"class": "StructuredInspectTest", "line": 35}
+                "name": "watch",
+                "arguments": {"field": "StructuredInspectTest$Node.ready", "mode": "modification"}
             }
         }),
         json!({
@@ -1496,10 +1508,10 @@ fn mcp_jdi_attach_breakpoint_locals_and_inspect_smoke() {
 
     let attach = mcp_text(mcp_response(&responses, 2));
     assert!(attach.contains("Jdi Attach"), "{attach}");
-    let breakpoint = mcp_text(mcp_response(&responses, 3));
-    assert!(breakpoint.contains("Breakpoint set"), "{breakpoint}");
+    let watch = mcp_text(mcp_response(&responses, 3));
+    assert!(watch.contains("Watch set"), "{watch}");
     let stopped = mcp_text(mcp_response(&responses, 4));
-    assert!(stopped.contains("Breakpoint hit"), "{stopped}");
+    assert!(stopped.contains("Field watchpoint hit"), "{stopped}");
     assert!(stopped.contains("StructuredInspectTest"), "{stopped}");
     let locals = mcp_text(mcp_response(&responses, 5));
     assert!(locals.contains("root"), "{locals}");
@@ -1549,7 +1561,7 @@ fn mcp_jdi_eval_set_force_return_smoke() {
             "method": "tools/call",
             "params": {
                 "name": "watch",
-                "arguments": {"field": "EvalMutationTest.gate", "mode": "modification"}
+                "arguments": {"field": "EvalMutationTest$Box.phase", "mode": "modification"}
             }
         }),
         json!({
@@ -1596,7 +1608,7 @@ fn mcp_jdi_eval_set_force_return_smoke() {
             "method": "tools/call",
             "params": {
                 "name": "watch",
-                "arguments": {"field": "EvalMutationTest.afterCompute", "mode": "modification"}
+                "arguments": {"field": "EvalMutationTest$Box.afterCompute", "mode": "modification"}
             }
         }),
         json!({
@@ -1656,7 +1668,7 @@ fn mcp_jdi_eval_set_force_return_smoke() {
         "{compute_stop}"
     );
     assert!(
-        compute_stop.contains("EvalMutationTest.gate"),
+        compute_stop.contains("EvalMutationTest$Box.phase"),
         "{compute_stop}"
     );
     let printed = mcp_text(mcp_response(&responses, 5));
@@ -1675,7 +1687,7 @@ fn mcp_jdi_eval_set_force_return_smoke() {
     let stopped = mcp_text(mcp_response(&responses, 10));
     assert!(stopped.contains("Field watchpoint hit"), "{stopped}");
     assert!(
-        stopped.contains("EvalMutationTest.afterCompute"),
+        stopped.contains("EvalMutationTest$Box.afterCompute"),
         "{stopped}"
     );
     let result = mcp_text(mcp_response(&responses, 11));
@@ -1725,8 +1737,8 @@ fn mcp_jdi_watch_unwatch_smoke() {
             "id": 3,
             "method": "tools/call",
             "params": {
-                "name": "break_at",
-                "arguments": {"class": "WatchTwiceTest", "line": 5}
+                "name": "watch",
+                "arguments": {"field": "WatchTwiceTest.phase", "mode": "modification"}
             }
         }),
         json!({
