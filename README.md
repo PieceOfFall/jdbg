@@ -328,14 +328,14 @@ OpenCode config:
 
 ```text
 # Session lifecycle
-jdbg launch <MainClass> [--backend jdb] [--classpath CP] [--sourcepath SP] [--name N] [-- app-args...]
+jdbg launch <MainClass> [--backend jdb|jdi] [--classpath CP] [--sourcepath SP] [--name N] [-- app-args...]
 jdbg attach [--backend jdb|jdi] [--host H] [--port P] [--sourcepath SP] [--name N]
 jdbg status | list | kill [--session ID]
 jdbg daemon start | stop | status
 
 # Breakpoints and watchpoints
 jdbg break-at <Class> <line> [-c <condition>] [-s thread|all]
-jdbg break-in <Class> <method> [--args types] [-c <condition>] [-s thread|all]
+jdbg break-in <Class> <method> [--event entry|exit|both] [--args types] [-c <condition>] [-s thread|all]
 jdbg catch <Exception> [--mode caught|uncaught|all]
 jdbg watch <Class.field> [--mode access|modification|all]
 jdbg unwatch <Class.field> [--mode access|modification|all]
@@ -376,11 +376,15 @@ Global flags:
 | `--jdb-path <path>` | Use an explicit `jdb` executable. |
 
 Backend selection is made only when creating a session. The default `jdb` backend is the compatibility path
-and supports the full command surface. The `jdi` backend is currently attach-only for session creation
-(`launch --backend jdi` returns an explicit unsupported error) and uses a local Java sidecar for structured
-runtime data; it supports `attach`, `threads`, line `break-at`, `cont`, `next`, `where`, `locals`, `thread`,
-`watch`, `unwatch`, safe JSON `inspect`, expression `print`/`eval`/`dump`, `set`, and non-void
-`force-return`. Unsupported JDI commands fail explicitly instead of falling back to `jdb`.
+and supports the full command surface. The `jdi` backend can `launch` or `attach` through a local Java sidecar
+for structured runtime data; it supports `threads`, line `break-at`, method `break-in` entry/exit events,
+field `watch`/`unwatch`, `run` for launched sessions, `cont`, `next`, `where`, `locals`, `thread`, safe JSON
+`inspect`, expression `print`/`eval`/`dump`, `set`, and non-void `force-return`. Unsupported JDI commands fail
+explicitly instead of falling back to `jdb`.
+
+JDI method breakpoints accept `--event entry|exit|both`. Method exit stops include the rendered return value
+when the target VM provides it. The `jdb` backend keeps method-entry behavior; `--event exit` and `both` fail
+with an explicit unsupported-backend error.
 
 On JDI sessions, `inspect` is intentionally safe and reads fields directly without invoking getters. JDI
 `print`, `eval`, `dump`, `set`, and `force-return` are executable capabilities: method calls may run in the
@@ -388,6 +392,9 @@ target JVM and can have side effects. `set` assigns locals, fields, or array ele
 hand side as a Java expression. `force-return` evaluates its value expression and forces the current non-void
 method to return it; void force-return is reported as unsupported. These executable JDI operations require a
 suspended stop site; running, dead, or exited sessions fail explicitly.
+
+The daemon can hold multiple JDI sessions at once. Each session serializes its own in-flight command, while
+separate sessions continue independently so multiple agents can debug different Java projects concurrently.
 
 The JDI sidecar message protocol is length-prefixed JSON over platform-local byte streams: two one-way
 Named Pipes on Windows, or an AF_UNIX socketpair on Linux/macOS. The Unix socket is handed to the Java 8

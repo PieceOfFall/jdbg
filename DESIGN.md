@@ -154,13 +154,13 @@ protocol 零改动**。
 ## 4. CLI 命令面
 
 ```
-jdbg launch <MainClass> [--classpath CP] [--sourcepath SP] [--name N] [-- app-args...]
+jdbg launch <MainClass> [--backend jdb|jdi] [--classpath CP] [--sourcepath SP] [--name N] [-- app-args...]
 jdbg attach [--host H] [--port P] [--sourcepath SP] [--name N]
 jdbg status | list | kill [--session ID]
 jdbg daemon start|stop|status
 
 jdbg break-at <Class> <line>
-jdbg break-in <Class> <method> [--args types]
+jdbg break-in <Class> <method> [--event entry|exit|both] [--args types]
 jdbg catch <Exception> [--mode caught|uncaught|all]
 jdbg breakpoints | clear <spec>
 
@@ -321,7 +321,7 @@ tools/call cont                           → The application exited
 jdbg setup --target codex --print               # prints [mcp_servers.jdbg] + Codex skill path, no writes
 jdbg setup --target opencode --print            # prints OpenCode mcp.jdbg JSON + skill path, no writes
 jdbg setup --target claude,codex,opencode,pi --yes  # installs all targets
-jdbg setup --target codex --backend jdi --yes   # installs Codex skill with JDI attach preference
+jdbg setup --target codex --backend jdi --yes   # installs Codex skill with JDI backend preference
 jdbg setup --remove --target codex --yes   # removes only Codex jdbg config + skill
 jdbg setup --remove --target pi --yes      # removes only Pi CLI skill
 ```
@@ -336,13 +336,15 @@ jdbg setup --remove --target pi --yes      # removes only Pi CLI skill
 
 ## Current Addendum: rmcp + JDI Sidecar Backend
 
-This branch now keeps the existing prompt-aware `jdb` backend as the compatibility default and adds a backend boundary for an attach-only JDI sidecar path.
+This branch now keeps the existing prompt-aware `jdb` backend as the compatibility default and adds a backend boundary for a launch/attach JDI sidecar path.
 
 - `jdbg __mcp` is served through `rmcp` over stdio while preserving the same 37 tool names and routing every tool call through `client::send_request` plus `output::render`.
-- Session creation accepts `backend: jdb|jdi` on both CLI and MCP. `jdb` remains the default and supports the full command surface. `jdi` currently supports attach, threads, line breakpoints, field watchpoints, cont, next, where, locals, thread selection, safe JSON inspect, expression print/eval/dump, setValue, and non-void force return. Unsupported JDI commands return explicit backend errors.
+- Session creation accepts `backend: jdb|jdi` on both CLI and MCP. `jdb` remains the default and supports the full command surface. `jdi` supports launch, attach, threads, line breakpoints, method entry/exit events, field watchpoints, run for launched sessions, cont, next, where, locals, thread selection, safe JSON inspect, expression print/eval/dump, setValue, and non-void force return. Unsupported JDI commands return explicit backend errors.
 - `SessionManager` stores backend-neutral `DebugSession` handles. The existing `Session` type still owns only the `jdb` process/reader state; JDI state lives under `src/jdi/`.
 - The JDI sidecar message protocol is length-prefixed JSON over platform-local transport: two one-way Named Pipes on Windows, or an AF_UNIX socketpair on Linux/macOS. The Unix child fd is inherited only because Java 8 has no pathname UDS client API. Rust owns sidecar lifecycle, auth token, handshake, request/response correlation, event queueing, and no-window process launch on Windows. gRPC, protobuf, and direct Rust JDWP are not planned.
 - JDI session state is refreshed on every status/command path. A target `vmDisconnected` event marks the session `Exited`; if the sidecar process exits unexpectedly while the daemon still has the session handle, the session is marked `Dead` and `status` reports `jdb_alive=false`. Follow-up commands return explicit sidecar/session failures; they never fall back to `jdb`.
 - The Java sidecar source lives under `sidecar/jdi/src/main/java/dev/jdbg/sidecar/`. It is a Gradle fat-jar project built by `sidecar/jdi/gradlew` with a JDK 17+ build JVM, compiles the sidecar for Java 8 bytecode, and includes JavaParser for sidecar-side Java expression parsing. `build.rs` copies `jdbg-jdi-sidecar.jar` next to the `jdbg` binary; `JDBG_GRADLE_JAVA_HOME` selects the Gradle build JDK when it differs from the debug target JDK.
 - JDI `inspect` keeps safe field-reading semantics and does not invoke getters. JDI `print`, `eval`, `dump`, `set`, and `force-return` are executable capabilities: they may invoke target methods and mutate state. `setValue` evaluates `<lvalue> = <value>` semantics for locals, fields, and array elements. `force-return` evaluates the value expression and calls `ThreadReference.forceEarlyReturn`; void force return is explicitly unsupported for now.
+- JDI `break-in` supports method `entry`, `exit`, and `both` events. Method exit results include a rendered return value when JDI exposes it. The `jdb` backend preserves method-entry behavior and rejects `--event exit|both` explicitly.
+- JDI sessions hold a per-session command lock, so one debug session cannot interleave sidecar commands while separate sessions continue in parallel for multiple agents/projects.
 - Automated fixture coverage includes JDI target exit, detach/kill, step-over stack/locals, sidecar-process death, JDI watch/unwatch flows, JDI expression/mutation/force-return flows, MCP JDI smoke tests, advanced collection/map inspect coverage, and Java sidecar self-tests for JSON/config/RPC/value limits.

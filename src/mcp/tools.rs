@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::jsonrpc::{INVALID_PARAMS, JsonRpcError, METHOD_NOT_FOUND};
-use crate::protocol::{BackendKind, Command, Request};
+use crate::protocol::{BackendKind, Command, MethodEventKind, Request};
 
 /// Public description of a tool, serialized into `tools/list`.
 #[derive(Debug, Clone, Serialize)]
@@ -103,12 +103,13 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         tool(
             "break_in",
-            "Set a method-entry breakpoint at Class.method. Use `args` (comma-separated param types) to \
-             disambiguate overloads. Use `condition` to only stop when a boolean expression is true. \
+            "Set a method breakpoint at Class.method. Use event='entry' (default), 'exit', or 'both'. \
+             Use `args` (comma-separated param types) to disambiguate overloads. Use `condition` to only stop when a boolean expression is true. \
              Use `suspend: \"thread\"` to only suspend the hit thread (keeps heartbeat threads alive).",
             json!({
                 "class": {"type": "string", "description": "Class name."},
                 "method": {"type": "string", "description": "Method name."},
+                "event": {"type": "string", "enum": ["entry", "exit", "both"], "description": "Method event to stop on (default entry). JDI supports entry, exit, and both; jdb supports entry only."},
                 "args": {"type": "string", "description": "Parameter types for overload disambiguation, e.g. 'int,java.lang.String'."},
                 "condition": {"type": "string", "description": "Optional boolean expression — breakpoint only fires when true."},
                 "suspend": {"type": "string", "enum": ["all", "thread"], "description": "Suspend policy: 'all' freezes the entire JVM (default), 'thread' only suspends the hit thread."}
@@ -448,6 +449,7 @@ pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> 
         "break_in" => Command::BreakIn {
             class: require_str(args, "class")?,
             method: require_str(args, "method")?,
+            event: optional_method_event(args)?,
             args: optional_str(args, "args"),
             condition: optional_str(args, "condition"),
             suspend: optional_str(args, "suspend"),
@@ -640,6 +642,15 @@ fn optional_backend(args: &Value) -> Result<BackendKind, JsonRpcError> {
             JsonRpcError::new(INVALID_PARAMS, format!("invalid backend: {e}"))
         }),
         None => Ok(BackendKind::Jdb),
+    }
+}
+
+fn optional_method_event(args: &Value) -> Result<MethodEventKind, JsonRpcError> {
+    match optional_str(args, "event") {
+        Some(raw) => raw.parse().map_err(|e: String| {
+            JsonRpcError::new(INVALID_PARAMS, format!("invalid method event: {e}"))
+        }),
+        None => Ok(MethodEventKind::Entry),
     }
 }
 
@@ -980,9 +991,36 @@ mod tests {
     fn break_in_suspend_absent_is_none() {
         let req = dispatch_tool("break_in", &json!({"class": "Main", "method": "foo"})).unwrap();
         match req.cmd {
-            Command::BreakIn { suspend, .. } => assert_eq!(suspend, None),
+            Command::BreakIn { suspend, event, .. } => {
+                assert_eq!(suspend, None);
+                assert_eq!(event, crate::protocol::MethodEventKind::Entry);
+            }
             other => panic!("expected BreakIn, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn break_in_event_maps_and_schema_lists_choices() {
+        let req = dispatch_tool(
+            "break_in",
+            &json!({"class": "Main", "method": "foo", "event": "exit"}),
+        )
+        .unwrap();
+        match req.cmd {
+            Command::BreakIn { event, .. } => {
+                assert_eq!(event, crate::protocol::MethodEventKind::Exit)
+            }
+            other => panic!("expected BreakIn, got {other:?}"),
+        }
+
+        let spec = tool_specs()
+            .into_iter()
+            .find(|tool| tool.name == "break_in")
+            .expect("break_in tool spec");
+        assert_eq!(
+            spec.input_schema["properties"]["event"]["enum"],
+            json!(["entry", "exit", "both"])
+        );
     }
 
     #[test]

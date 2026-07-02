@@ -83,6 +83,18 @@ pub enum Event {
         location: Location,
         thread: String,
     },
+    MethodEntry {
+        location: Location,
+        thread: String,
+    },
+    MethodExit {
+        location: Location,
+        thread: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        return_value: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        return_type: Option<String>,
+    },
     Step {
         location: Location,
         thread: String,
@@ -264,6 +276,35 @@ impl std::str::FromStr for BackendKind {
             "jdi" => Ok(Self::Jdi),
             other => Err(format!(
                 "unsupported backend '{other}' (expected 'jdb' or 'jdi')"
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MethodEventKind {
+    Entry,
+    Exit,
+    Both,
+}
+
+impl Default for MethodEventKind {
+    fn default() -> Self {
+        Self::Entry
+    }
+}
+
+impl std::str::FromStr for MethodEventKind {
+    type Err = String;
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s {
+            "entry" => Ok(Self::Entry),
+            "exit" => Ok(Self::Exit),
+            "both" => Ok(Self::Both),
+            other => Err(format!(
+                "unsupported method event '{other}' (expected 'entry', 'exit', or 'both')"
             )),
         }
     }

@@ -1220,6 +1220,435 @@ fn jdi_eval_set_and_force_return_execute_in_stopped_frame() {
 }
 
 #[test]
+fn jdi_launch_breakpoint_run_locals_and_cont() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("Main.java");
+    let classpath = vec![fixture_dir().display().to_string()];
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::launch(
+        "Main",
+        &classpath,
+        &sourcepath,
+        &[],
+        "jdi-launch-main".into(),
+        None,
+    )
+    .expect("JDI launch failed");
+    assert_eq!(session.state(), RunState::Loaded);
+
+    let line = fixture_line("Main.java", "System.out.println(label");
+    session
+        .stop_at("Main", line, None)
+        .expect("JDI launch breakpoint failed");
+
+    let stop = session.run(Some(30)).expect("JDI launch run failed");
+    match &stop.result {
+        CommandResult::Stopped {
+            event: Event::Breakpoint { .. },
+            location,
+            ..
+        } => {
+            assert_eq!(location.class, "Main");
+            assert_eq!(location.method, "main");
+            assert_eq!(location.line, line);
+        }
+        other => panic!("expected JDI launch breakpoint stop, got {other:?}"),
+    }
+
+    let locals = session.locals().expect("JDI launch locals failed");
+    match &locals.result {
+        CommandResult::Locals { vars } => {
+            assert!(
+                vars.iter()
+                    .any(|var| var.name == "label" && var.value.contains("hello")),
+                "locals should include label=hello, got {vars:?}"
+            );
+        }
+        other => panic!("expected locals after JDI launch stop, got {other:?}"),
+    }
+
+    let exited = session.cont(Some(30)).expect("JDI launch cont failed");
+    assert!(
+        matches!(exited.result, CommandResult::VmExited { .. }),
+        "expected JDI launched VM to exit, got {:?}",
+        exited.result
+    );
+
+    let _ = session.kill();
+}
+
+#[test]
+fn jdi_method_entry_and_exit_events_stop_with_return_value() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("MethodEventTest.java");
+    let target = start_jdwp_fixture("MethodEventTest");
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::attach(
+        "127.0.0.1",
+        target.port,
+        &sourcepath,
+        "jdi-method-entry-exit".into(),
+        None,
+    )
+    .expect("JDI attach failed");
+
+    let method_bp = session
+        .break_in(
+            "MethodEventTest",
+            "work",
+            Some("int,java.lang.String"),
+            MethodEventKind::Entry,
+            Some("thread"),
+        )
+        .expect("JDI method entry breakpoint failed");
+    match &method_bp.result {
+        CommandResult::BreakpointSet {
+            bp_kind: BreakpointKind::Method,
+            deferred: true,
+            ..
+        } => {}
+        other => panic!("expected deferred method breakpoint, got {other:?}"),
+    }
+
+    let entry = session
+        .cont(Some(30))
+        .expect("JDI method entry cont failed");
+    match &entry.result {
+        CommandResult::Stopped {
+            event: Event::MethodEntry { thread, .. },
+            location,
+            thread_id,
+            ..
+        } => {
+            assert_eq!(location.class, "MethodEventTest");
+            assert_eq!(location.method, "work");
+            assert!(
+                !thread.is_empty(),
+                "method entry should include thread name"
+            );
+            assert!(
+                thread_id.is_some(),
+                "method entry should include a selectable thread id"
+            );
+        }
+        other => panic!("expected method entry stop, got {other:?}"),
+    }
+
+    session
+        .break_in(
+            "MethodEventTest",
+            "work",
+            Some("int,java.lang.String"),
+            MethodEventKind::Exit,
+            Some("thread"),
+        )
+        .expect("JDI method exit breakpoint failed");
+    let exit = session.cont(Some(30)).expect("JDI method exit cont failed");
+    match &exit.result {
+        CommandResult::Stopped {
+            event:
+                Event::MethodExit {
+                    return_value,
+                    return_type,
+                    ..
+                },
+            location,
+            ..
+        } => {
+            assert_eq!(location.class, "MethodEventTest");
+            assert_eq!(location.method, "work");
+            assert_eq!(return_value.as_deref(), Some("4"));
+            assert_eq!(return_type.as_deref(), Some("int"));
+        }
+        other => panic!("expected method exit stop, got {other:?}"),
+    }
+
+    let _ = session.kill();
+}
+
+#[test]
+fn jdi_method_both_stops_on_entry_then_exit() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("MethodEventTest.java");
+    let target = start_jdwp_fixture("MethodEventTest");
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::attach(
+        "127.0.0.1",
+        target.port,
+        &sourcepath,
+        "jdi-method-both".into(),
+        None,
+    )
+    .expect("JDI attach failed");
+
+    session
+        .break_in(
+            "MethodEventTest",
+            "work",
+            Some("int,java.lang.String"),
+            MethodEventKind::Both,
+            None,
+        )
+        .expect("JDI method both breakpoint failed");
+
+    let entry = session.cont(Some(30)).expect("JDI both entry cont failed");
+    assert!(
+        matches!(
+            entry.result,
+            CommandResult::Stopped {
+                event: Event::MethodEntry { .. },
+                ..
+            }
+        ),
+        "expected method entry first, got {:?}",
+        entry.result
+    );
+    let exit = session.cont(Some(30)).expect("JDI both exit cont failed");
+    assert!(
+        matches!(
+            exit.result,
+            CommandResult::Stopped {
+                event: Event::MethodExit { .. },
+                ..
+            }
+        ),
+        "expected method exit second, got {:?}",
+        exit.result
+    );
+
+    let _ = session.kill();
+}
+
+#[test]
+fn mcp_jdi_launch_breakpoint_run_locals_smoke() {
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("Main.java");
+    let guard = TestDaemonGuard::new("mcp-jdi-launch-smoke");
+    let sourcepath = fixture_dir().display().to_string();
+    let classpath = fixture_dir().display().to_string();
+    let line = fixture_line("Main.java", "System.out.println(label");
+    let messages = vec![
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "jdbg-test", "version": "0"}
+            }
+        }),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "launch",
+                "arguments": {
+                    "backend": "jdi",
+                    "main_class": "Main",
+                    "classpath": classpath,
+                    "sourcepath": sourcepath
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "break_at",
+                "arguments": {"class": "Main", "line": line}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "run",
+                "arguments": {"timeout": 10}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {"name": "locals", "arguments": {}}
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {"name": "kill", "arguments": {}}
+        }),
+    ];
+
+    let responses = run_mcp_jsonrpc(&messages, &guard);
+    for id in 2..=6 {
+        assert_mcp_success(mcp_response(&responses, id));
+    }
+    assert!(mcp_text(mcp_response(&responses, 2)).contains("Jdi Launch"));
+    assert!(mcp_text(mcp_response(&responses, 4)).contains("Breakpoint hit"));
+    assert!(mcp_text(mcp_response(&responses, 5)).contains("label"));
+}
+
+#[test]
+fn jdb_method_exit_break_in_is_explicitly_unsupported() {
+    let guard = TestDaemonGuard::new("jdb-method-exit-unsupported");
+    compile_java_fixture("MethodEventTest.java");
+    let classpath = fixture_dir().display().to_string();
+    let sourcepath = fixture_dir().display().to_string();
+
+    let launch = jdbg_command(&guard)
+        .arg("launch")
+        .arg("MethodEventTest")
+        .arg("--classpath")
+        .arg(&classpath)
+        .arg("--sourcepath")
+        .arg(&sourcepath)
+        .output()
+        .expect("spawn jdbg launch");
+    assert!(
+        launch.status.success(),
+        "launch failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&launch.stdout),
+        String::from_utf8_lossy(&launch.stderr)
+    );
+
+    let break_in = jdbg_command(&guard)
+        .arg("break-in")
+        .arg("MethodEventTest")
+        .arg("work")
+        .arg("--args")
+        .arg("int,java.lang.String")
+        .arg("--event")
+        .arg("exit")
+        .output()
+        .expect("spawn jdbg break-in");
+
+    assert!(
+        !break_in.status.success(),
+        "jdb break-in --event exit should fail"
+    );
+    let stderr = String::from_utf8_lossy(&break_in.stderr);
+    assert!(
+        stderr.contains("not supported") && stderr.contains("jdb") && stderr.contains("break_in"),
+        "error should be explicit unsupported-backend message, got {stderr}"
+    );
+
+    let _ = jdbg_command(&guard).arg("kill").output();
+}
+
+#[test]
+fn four_concurrent_jdi_cli_clients_debug_distinct_targets() {
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("Main.java");
+    let guard = TestDaemonGuard::new("jdi-four-clients");
+    let sourcepath = fixture_dir().display().to_string();
+    let line = fixture_line("Main.java", "System.out.println(label");
+    let targets: Vec<_> = (0..4).map(|_| start_jdwp_fixture("Main")).collect();
+    let ports: Vec<_> = targets.iter().map(|target| target.port).collect();
+
+    let handles: Vec<_> = ports
+        .into_iter()
+        .enumerate()
+        .map(|(index, port)| {
+            let username = guard.username.clone();
+            let data_dir = guard.data_dir.clone();
+            let sourcepath = sourcepath.clone();
+            std::thread::spawn(move || {
+                let run = |args: &[String]| {
+                    let mut command = Command::new(env!("CARGO_BIN_EXE_jdbg"));
+                    command
+                        .env("USERNAME", &username)
+                        .env("USER", &username)
+                        .env("JDBG_DATA_DIR", &data_dir)
+                        .stdin(Stdio::null())
+                        .args(args);
+                    hide_console(&mut command);
+                    let output = command.output().expect("spawn jdbg client");
+                    assert!(
+                        output.status.success(),
+                        "jdbg {:?} failed\nstdout:\n{}\nstderr:\n{}",
+                        args,
+                        String::from_utf8_lossy(&output.stdout),
+                        String::from_utf8_lossy(&output.stderr)
+                    );
+                    String::from_utf8_lossy(&output.stdout).to_string()
+                };
+
+                let attach = run(&[
+                    "attach".into(),
+                    "--backend".into(),
+                    "jdi".into(),
+                    "--host".into(),
+                    "127.0.0.1".into(),
+                    "--port".into(),
+                    port.to_string(),
+                    "--sourcepath".into(),
+                    sourcepath,
+                    "--name".into(),
+                    format!("agent-{index}"),
+                ]);
+                let session = attach
+                    .split_whitespace()
+                    .nth(1)
+                    .unwrap_or_else(|| panic!("missing session id in attach output: {attach}"))
+                    .to_string();
+                assert!(attach.contains("Jdi Attach"), "{attach}");
+
+                let breakpoint = run(&[
+                    "--session".into(),
+                    session.clone(),
+                    "break-at".into(),
+                    "Main".into(),
+                    line.to_string(),
+                ]);
+                assert!(breakpoint.contains("Breakpoint set"), "{breakpoint}");
+
+                let stop = run(&[
+                    "--session".into(),
+                    session.clone(),
+                    "--timeout".into(),
+                    "20".into(),
+                    "cont".into(),
+                ]);
+                assert!(stop.contains("Breakpoint hit"), "{stop}");
+                assert!(stop.contains("Main.main()"), "{stop}");
+
+                let locals = run(&["--session".into(), session.clone(), "locals".into()]);
+                assert!(locals.contains("label"), "{locals}");
+                assert!(locals.contains("hello"), "{locals}");
+
+                let exited = run(&[
+                    "--session".into(),
+                    session,
+                    "--timeout".into(),
+                    "20".into(),
+                    "cont".into(),
+                ]);
+                assert!(
+                    exited.contains("The application exited"),
+                    "expected VM exit, got {exited}"
+                );
+            })
+        })
+        .collect();
+
+    for handle in handles {
+        handle.join().expect("join JDI client thread");
+    }
+}
+
+#[test]
 fn jdi_watchpoint_modification_hit() {
     use java_agent_debugger::jdi::session::JdiSession;
 

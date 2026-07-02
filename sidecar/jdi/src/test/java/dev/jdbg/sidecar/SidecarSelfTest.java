@@ -21,6 +21,8 @@ public final class SidecarSelfTest {
         testConfigRejectsTcpTransport();
         testUnknownRpcMethodHasStableErrorCode();
         testValueRendererAppliesStringLimit();
+        testMethodSpecMatchesExactNameAndArguments();
+        testLaunchMainArgumentQuoting();
         System.out.println("SidecarSelfTest passed");
     }
 
@@ -154,6 +156,36 @@ public final class SidecarSelfTest {
         assertEquals("java.lang.String", rendered.get("type"), "rendered type");
         assertEquals("abc", rendered.get("value"), "truncated string value");
         assertEquals(Boolean.TRUE, rendered.get("truncated"), "truncated flag");
+    }
+
+    private static void testMethodSpecMatchesExactNameAndArguments() {
+        JdiService.MethodSpec anyArgs = JdiService.MethodSpec.from("com.example.Main", "work", null, "entry", "all");
+        assertTrue(anyArgs.matches("work", "()V"), "missing args should match empty signature");
+        assertTrue(anyArgs.matches("work", "(I)V"), "missing args should not filter overloads");
+
+        JdiService.MethodSpec overload = JdiService.MethodSpec.from(
+                "com.example.Main",
+                "work",
+                "int,java.lang.String",
+                "both",
+                "thread"
+        );
+        assertTrue(overload.matches("work", "(ILjava/lang/String;)I"), "typed overload should match");
+        assertTrue(!overload.matches("work", "(Ljava/lang/String;I)I"), "argument order matters");
+        assertEquals("both", overload.eventKind, "event kind");
+        assertEquals("thread", overload.suspend, "suspend policy");
+    }
+
+    private static void testLaunchMainArgumentQuoting() {
+        String main = JdiService.buildLaunchMainArgument(
+                "com.example.Main",
+                java.util.Arrays.asList("plain", "two words", "quote\"inside", "slash\\inside")
+        );
+        assertEquals(
+                "com.example.Main plain \"two words\" \"quote\\\"inside\" \"slash\\\\inside\"",
+                main,
+                "launch main argument"
+        );
     }
 
     private static StringReference stringReference(final String value) {

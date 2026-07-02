@@ -14,7 +14,7 @@ be expanded into a focused PLAN before implementation.
 
 `jdbg` is currently a Rust CLI/MCP/daemon with two debugger backends. The default
 compatibility path wraps the JDK's `jdb` through piped stdio. The optional JDI path
-attaches through a local Java sidecar and supports structured stop state, safe
+launches or attaches through a local Java sidecar and supports structured stop state, safe
 inspect, executable expression evaluation, mutation, watchpoints, and non-void
 force return. The daemon owns long-lived sessions, the CLI and MCP server both talk
 to the daemon through the existing JSONL IPC protocol, and the MCP server remains a
@@ -384,10 +384,11 @@ This section tracks the current branch state against the roadmap above.
   objects, arrays, collections, maps, enums, null, unavailable values, cycle
   references, and truncation metadata without invoking getters.
 - Milestone 8, CLI and MCP integration: default session creation remains `jdb`;
-  `attach --backend jdi` creates JDI sessions; follow-up commands route by session
-  backend; JDI supports `break-at`, `watch`, `unwatch`, `cont`, `next`, `where`,
-  `locals`, `threads`, `thread`, `inspect`, expression `print`/`eval`/`dump`,
-  `set`, and non-void `force-return`.
+  `launch --backend jdi` and `attach --backend jdi` create JDI sessions; follow-up
+  commands route by session backend; JDI supports `break-at`, method `break-in`
+  entry/exit events, `watch`, `unwatch`, `run`, `cont`, `next`, `where`, `locals`,
+  `threads`, `thread`, `inspect`, expression `print`/`eval`/`dump`, `set`, and
+  non-void `force-return`.
 - Milestone 9, executable JDI expressions and mutation: the sidecar Gradle fat jar
   bundles JavaParser, parses Java expressions in the sidecar, evaluates them against
   the suspended JDI frame/object graph, supports instance/static method invocation,
@@ -396,6 +397,11 @@ This section tracks the current branch state against the roadmap above.
   field-reading only and does not invoke getters.
 - Milestone 10, release readiness: `README.md`, `DESIGN.md`, both installed skills,
   and `Cargo.toml` metadata have been updated for the public JDI/rmcp behavior.
+- Post-MVP JDI launch and method events: `launch --backend jdi` starts a JDI-launched VM in
+  `Loaded`, `run` resumes it, method `break_in` supports entry/exit/both events on JDI,
+  method-exit stops render return values, and `jdb` rejects exit/both method events explicitly.
+- Post-MVP multi-project concurrency: the daemon keeps one sidecar per JDI session and each
+  `JdiSession` serializes its own commands while distinct sessions can run in parallel.
 - Setup integration beyond the original roadmap: `jdbg setup` can record an
   installed-skill backend preference through interactive TUI selection or
   `--backend jdb|jdi`; `jdbg update` preserves that preference when re-registering
@@ -496,11 +502,7 @@ CLI/MCP end-to-end tests should prove:
 
 ## Post-MVP Work
 
-The following are intentionally out of MVP scope but remain valid future work:
-
-- JDI launch mode;
-- method entry/exit events;
-- multi-client sidecar support;
+No ROADMAP-tracked Post-MVP work remains open in this branch.
 
 The following are closed non-goals for this roadmap:
 

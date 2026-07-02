@@ -45,7 +45,7 @@ impl SetupBackend {
     fn label(self) -> &'static str {
         match self {
             SetupBackend::Jdb => "JDB - full command surface, compatibility default",
-            SetupBackend::Jdi => "JDI - attach-only structured inspect/events subset",
+            SetupBackend::Jdi => "JDI - structured launch/attach inspect/events subset",
         }
     }
 
@@ -56,26 +56,26 @@ impl SetupBackend {
                 r#""backend": "jdb""#,
                 " on `launch`/`attach` for the full command surface. Use ",
                 r#""backend": "jdi""#,
-                " only for attach workflows that need structured JDI inspect."
+                " for launch/attach workflows that need structured JDI inspect or method events."
             )
             .into(),
             (SetupBackend::Jdb, false) => concat!(
                 "> Setup preference: Preferred backend: JDB. Omit `--backend` or pass ",
                 "`--backend jdb` on `launch`/`attach` for the full command surface. Use ",
-                "`--backend jdi` only for attach workflows that need structured JDI inspect."
+                "`--backend jdi` for launch/attach workflows that need structured JDI inspect or method events."
             )
             .into(),
             (SetupBackend::Jdi, true) => concat!(
-                "> Setup preference: Preferred backend: JDI. For JDWP attach workflows, pass ",
+                "> Setup preference: Preferred backend: JDI. For launch or JDWP attach workflows, pass ",
                 r#""backend": "jdi""#,
-                " to `attach` unless you need an unsupported JDI command. ",
-                "JDI launch is not supported; use `launch` with the default JDB backend."
+                " to `launch`/`attach` unless you need an unsupported JDI command. ",
+                "Method breakpoints can use entry, exit, or both events on JDI."
             )
             .into(),
             (SetupBackend::Jdi, false) => concat!(
-                "> Setup preference: Preferred backend: JDI. For JDWP attach workflows, run ",
-                "`jdbg attach --backend jdi ...` unless you need an unsupported JDI command. ",
-                "JDI launch is not supported; use `jdbg launch` with the default JDB backend."
+                "> Setup preference: Preferred backend: JDI. For launch or JDWP attach workflows, run ",
+                "`jdbg launch --backend jdi ...` or `jdbg attach --backend jdi ...` unless you need an unsupported JDI command. ",
+                "Method breakpoints can use entry, exit, or both events on JDI."
             )
             .into(),
         }
@@ -1421,7 +1421,7 @@ mod tests {
 
         assert!(rendered.contains("Preferred backend: JDI"));
         assert!(rendered.contains(r#""backend": "jdi""#));
-        assert!(rendered.contains("JDI launch is not supported"));
+        assert!(rendered.contains("Method breakpoints can use entry, exit, or both events on JDI"));
     }
 
     #[test]

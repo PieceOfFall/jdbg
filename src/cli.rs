@@ -131,6 +131,9 @@ pub enum Commands {
         class: String,
         /// Method name.
         method: String,
+        /// Method event to stop on: entry, exit, or both.
+        #[arg(long, value_parser = ["entry", "exit", "both"], default_value = "entry")]
+        event: String,
         /// Parameter types for overload disambiguation.
         #[arg(long)]
         args: Option<String>,

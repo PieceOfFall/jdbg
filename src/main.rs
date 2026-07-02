@@ -165,12 +165,14 @@ fn build_command(cli: &Cli) -> anyhow::Result<Command> {
         Commands::BreakIn {
             class,
             method,
+            event,
             args,
             condition,
             suspend,
         } => Command::BreakIn {
             class: class.clone(),
             method: method.clone(),
+            event: event.parse().map_err(|e: String| anyhow::anyhow!(e))?,
             args: args.clone(),
             condition: condition.clone(),
             suspend: suspend.clone(),

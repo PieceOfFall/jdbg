@@ -63,32 +63,48 @@ impl SessionManager {
 
     /// Create a launch session.
     pub fn create_launch(&self, params: LaunchParams) -> Result<DebugSession> {
-        if params.backend != BackendKind::Jdb {
-            return Err(Error::UnsupportedBackend {
-                backend: "jdi".into(),
-                operation: "launch".into(),
-            });
-        }
-
-        let jdb_path = match params.jdb_path {
-            Some(ref p) => {
-                let path = PathBuf::from(p);
-                jdkpath::find_jdb(Some(&path))?
-            }
-            None => jdkpath::find_jdb(None)?,
-        };
-
-        let config = LaunchConfig {
-            main_class: params.main_class,
-            classpath: params.classpath.into_iter().map(PathBuf::from).collect(),
-            sourcepath: params.sourcepath.into_iter().map(PathBuf::from).collect(),
-            app_args: params.app_args,
-            jdb_args: params.jdb_args,
-        };
-
         let id = gen_session_id();
-        let session = Session::launch(&jdb_path, &config, id.clone(), params.name)?;
-        let session = DebugSession::Jdb(Arc::new(session));
+        let session = match params.backend {
+            BackendKind::Jdb => {
+                let jdb_path = match params.jdb_path {
+                    Some(ref p) => {
+                        let path = PathBuf::from(p);
+                        jdkpath::find_jdb(Some(&path))?
+                    }
+                    None => jdkpath::find_jdb(None)?,
+                };
+
+                let config = LaunchConfig {
+                    main_class: params.main_class,
+                    classpath: params.classpath.into_iter().map(PathBuf::from).collect(),
+                    sourcepath: params.sourcepath.into_iter().map(PathBuf::from).collect(),
+                    app_args: params.app_args,
+                    jdb_args: params.jdb_args,
+                };
+                DebugSession::Jdb(Arc::new(Session::launch(
+                    &jdb_path,
+                    &config,
+                    id.clone(),
+                    params.name,
+                )?))
+            }
+            BackendKind::Jdi => {
+                if !params.jdb_args.is_empty() {
+                    return Err(Error::Connection(
+                        "JDI launch does not accept jdb_args; remove --jdb-arg or use --backend jdb"
+                            .into(),
+                    ));
+                }
+                DebugSession::Jdi(Arc::new(JdiSession::launch(
+                    &params.main_class,
+                    &params.classpath,
+                    &params.sourcepath,
+                    &params.app_args,
+                    id.clone(),
+                    params.name,
+                )?))
+            }
+        };
 
         let mut map = self.sessions.lock().expect("sessions mutex poisoned");
         map.insert(id, session.clone());

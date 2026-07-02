@@ -4,7 +4,7 @@ description: "Use when you need a Java program's real runtime state instead of r
 compatibility: "Requires a JDK 8+ (provides the `jdb` command). Debugging is driven through the `jdbg` MCP server (tools named `launch`, `break_at`, `run`, `locals`, …). Native on Windows, Linux, macOS."
 allowed-tools: "mcp__jdbg__launch, mcp__jdbg__attach, mcp__jdbg__status, mcp__jdbg__list, mcp__jdbg__kill, mcp__jdbg__break_at, mcp__jdbg__break_in, mcp__jdbg__catch, mcp__jdbg__watch, mcp__jdbg__unwatch, mcp__jdbg__breakpoints, mcp__jdbg__clear, mcp__jdbg__run, mcp__jdbg__cont, mcp__jdbg__step, mcp__jdbg__next, mcp__jdbg__step_out, mcp__jdbg__where, mcp__jdbg__locals, mcp__jdbg__print, mcp__jdbg__dump, mcp__jdbg__eval, mcp__jdbg__threads, mcp__jdbg__classes, mcp__jdbg__methods, mcp__jdbg__thread, mcp__jdbg__frame, mcp__jdbg__list_source, mcp__jdbg__inspect, mcp__jdbg__raw, mcp__jdbg__suspend, mcp__jdbg__resume, mcp__jdbg__set, mcp__jdbg__force_return, mcp__jdbg__ignore, mcp__jdbg__lock, mcp__jdbg__threadlocks, Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "2.13"
+  version: "2.14"
 ---
 
 # jdbg — interactive Java debugging for agents
@@ -46,7 +46,7 @@ Returns a session id, state `loaded` (JVM not started yet). Set breakpoints, the
 attach { "host": "localhost", "port": 5005, "sourcepath": "src" }
 ```
 The default `jdb` backend returns state `suspended`. Set breakpoints, then call `cont` (attach has no `run`).
-For the JDI sidecar subset, pass `backend: "jdi"`; JDI attach returns state `running`, then `cont` waits for the next stop after you set a line breakpoint.
+For the JDI sidecar subset, pass `backend: "jdi"` on `launch` or `attach`; launched sessions use `run`, attached sessions use `cont`.
 
 > **`localhost` is auto-normalized to `127.0.0.1`.** On dual-stack machines `localhost` often
 > resolves to IPv6 `[::1]`, but JDWP usually listens only on IPv4 `0.0.0.0` → connection refused.
@@ -80,16 +80,16 @@ found via `JAVA_HOME/bin` → PATH → common install dirs).
 ### Backend guidance
 
 - Omit `backend` for the mature `jdb` backend. It supports the full tool surface and keeps `raw` as an escape hatch.
-- Use `backend: "jdi"` only when attaching to an already-running JDWP target and you want structured sidecar data. The current JDI subset supports `attach`, `threads`, line `break_at`, field `watch`/`unwatch`, `cont`, `next`, `where`, `locals`, `thread`, safe JSON `inspect`, executable `print`/`eval`/`dump`, `set`, and non-void `force_return`.
-- JDI attach starts in state `running`; set a line breakpoint, then call `cont` to wait for the next stop.
+- Use `backend: "jdi"` when launching or attaching and you want structured sidecar data. The current JDI subset supports `launch`, `attach`, `threads`, line `break_at`, method `break_in` entry/exit events, field `watch`/`unwatch`, `run` for launched sessions, `cont`, `next`, `where`, `locals`, `thread`, safe JSON `inspect`, executable `print`/`eval`/`dump`, `set`, and non-void `force_return`.
+- JDI launch starts in state `loaded`; set breakpoints, then call `run`. JDI attach starts in state `running`; set a line or method breakpoint, then call `cont` to wait for the next stop.
 - Unsupported JDI tools return an explicit backend error. Start a `jdb` session if you need unsupported debugger commands.
 - JDI uses `jdbg-jdi-sidecar.jar` next to the `jdbg` binary. Source builds create it during `cargo build`; override with `JDBG_JDI_SIDECAR_JAR` or `JDBG_JDI_JAVA` only when necessary.
 
 ### Session
 | Tool | Purpose |
 |---|---|
-| `launch { main_class, backend?, classpath?, sourcepath?, app_args?, jdb_args?, name?, jdb_path? }` | start a JVM under jdb (state `loaded`); JDI launch is not implemented |
-| `attach { backend?, host?, port?, sourcepath?, name?, jdb_path? }` | attach to a running JVM via JDWP; pass `backend: "jdi"` for the JDI sidecar subset |
+| `launch { main_class, backend?, classpath?, sourcepath?, app_args?, jdb_args?, name?, jdb_path? }` | start a JVM under the selected backend (state `loaded`); `jdb_args` is jdb-only |
+| `attach { backend?, host?, port?, sourcepath?, name?, jdb_path? }` | attach to a running JVM via JDWP; pass `backend: "jdi"` for the JDI sidecar |
 | `status` · `list` | current state / all sessions |
 | `kill` | end the session (defaults to the sole session; pass `session` if more than one) |
 
@@ -100,7 +100,7 @@ found via `JAVA_HOME/bin` → PATH → common install dirs).
 | Tool | Purpose |
 |---|---|
 | `break_at { class, line, condition?, suspend? }` | break at a source line |
-| `break_in { class, method, args?, condition?, suspend? }` | break at method entry (`args` = comma-separated param types) |
+| `break_in { class, method, event?, args?, condition?, suspend? }` | break at method entry by default; JDI also supports `event: "exit"` and `"both"` |
 | `catch { exception, mode? }` | break when an exception is thrown (`mode`: caught \| uncaught \| all) |
 | `watch { field, mode? }` | break when a field is accessed or modified (`mode`: access \| modification \| all; default: modification) |
 | `unwatch { field, mode? }` | remove field watchpoint(s) (`mode`: access \| modification \| all; default: modification) |
@@ -173,6 +173,8 @@ Every tool returns a typed result. The ones that drive the next move:
   read them immediately without extra calls. Execution stops **before** the indicated line runs (the line has
   not yet executed). Use `locals` / `print { expr }` / `inspect { expr }` to examine state. To act on the hit
   thread (switch, suspend, inspect its locks), pass `thread_id` directly — do not scan `threads` for it.
+  For JDI method events, `event.type` is `method_entry` or `method_exit`; method exit includes the return
+  value when available.
 - **`ExceptionCaught`** — an exception fired. `where` for the throw site, `locals` for state.
 - **`VmExited`** — the program ended; the session is done (`list` / `kill`).
 - **`Timeout`** — the app did not stop within the timeout (long loop or deadlock). The session is **kept
@@ -232,7 +234,7 @@ to remove both classes of watchpoint in one call.
 
 Field watchpoints fire during blocking commands (`run`/`cont`/`step`/`next`/`step_out`) — the response
 includes the location, thread, and enriched source context just like breakpoint hits.
-On JDI sessions, watchpoints are supported through `cont`/`next`; unsupported launch-only or jdb-only
+On JDI sessions, watchpoints are supported through `run`/`cont`/`next`; unsupported jdb-only
 execution controls still return explicit backend errors.
 
 ## Common mistakes

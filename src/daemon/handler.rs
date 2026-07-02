@@ -259,10 +259,18 @@ fn dispatch_jdb_session_cmd(req: &Request, session: Arc<Session>) -> Response {
         Command::BreakIn {
             class,
             method,
+            event,
             args,
             condition,
             suspend,
         } => {
+            if *event != MethodEventKind::Entry {
+                let error = Error::UnsupportedBackend {
+                    backend: "jdb".into(),
+                    operation: format!("break_in --event {event:?}").to_lowercase(),
+                };
+                return Response::err(id, error.exit_code(), error.to_string());
+            }
             let r = session.stop_in(class, method, args.as_deref(), suspend.as_deref(), t);
             if r.is_ok() {
                 let spec = match args {
@@ -542,6 +550,21 @@ fn dispatch_jdi_session_cmd(req: &Request, session: Arc<JdiSession>) -> Response
                 session.stop_at(class, *line, suspend.as_deref())
             }
         }
+        Command::BreakIn {
+            class,
+            method,
+            event,
+            args,
+            condition,
+            suspend,
+        } => {
+            if condition.is_some() {
+                Err(session.unsupported("conditional break_in"))
+            } else {
+                session.break_in(class, method, args.as_deref(), *event, suspend.as_deref())
+            }
+        }
+        Command::Run => session.run(req.timeout),
         Command::Cont => session.cont(req.timeout),
         Command::Next => session.next(req.timeout),
         Command::Where { all } => session.stack(*all),
@@ -551,10 +574,8 @@ fn dispatch_jdi_session_cmd(req: &Request, session: Arc<JdiSession>) -> Response
         Command::Inspect { expr, max_elements } => session.inspect(expr, *max_elements),
         Command::Print { expr } | Command::Eval { expr } => session.evaluate(expr),
         Command::Dump { expr } => session.dump(expr, 10),
-        Command::Run => Err(session.unsupported("run")),
         Command::Step => Err(session.unsupported("step")),
         Command::StepOut => Err(session.unsupported("step_out")),
-        Command::BreakIn { .. } => Err(session.unsupported("break_in")),
         Command::Catch { .. } => Err(session.unsupported("catch")),
         Command::Watch { field, mode } => session.watch(field, mode),
         Command::Unwatch { field, mode } => session.unwatch(field, mode),

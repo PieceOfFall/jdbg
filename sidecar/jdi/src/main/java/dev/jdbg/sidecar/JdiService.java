@@ -6,6 +6,7 @@ import com.sun.jdi.Bootstrap;
 import com.sun.jdi.Field;
 import com.sun.jdi.IncompatibleThreadStateException;
 import com.sun.jdi.Location;
+import com.sun.jdi.Method;
 import com.sun.jdi.ObjectReference;
 import com.sun.jdi.ReferenceType;
 import com.sun.jdi.StackFrame;
@@ -16,12 +17,15 @@ import com.sun.jdi.Value;
 import com.sun.jdi.VirtualMachine;
 import com.sun.jdi.connect.AttachingConnector;
 import com.sun.jdi.connect.Connector;
+import com.sun.jdi.connect.LaunchingConnector;
 import com.sun.jdi.event.AccessWatchpointEvent;
 import com.sun.jdi.event.BreakpointEvent;
 import com.sun.jdi.event.ClassPrepareEvent;
 import com.sun.jdi.event.Event;
 import com.sun.jdi.event.EventIterator;
 import com.sun.jdi.event.EventSet;
+import com.sun.jdi.event.MethodEntryEvent;
+import com.sun.jdi.event.MethodExitEvent;
 import com.sun.jdi.event.ModificationWatchpointEvent;
 import com.sun.jdi.event.StepEvent;
 import com.sun.jdi.event.WatchpointEvent;
@@ -32,9 +36,12 @@ import com.sun.jdi.request.AccessWatchpointRequest;
 import com.sun.jdi.request.BreakpointRequest;
 import com.sun.jdi.request.ClassPrepareRequest;
 import com.sun.jdi.request.EventRequest;
+import com.sun.jdi.request.MethodEntryRequest;
+import com.sun.jdi.request.MethodExitRequest;
 import com.sun.jdi.request.ModificationWatchpointRequest;
 import com.sun.jdi.request.StepRequest;
 
+import java.io.File;
 import java.util.ArrayList;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
@@ -59,8 +66,12 @@ final class JdiService {
         switch (method) {
             case "ping":
                 return Json.object("ok", true, "serverVersion", SidecarMain.VERSION);
+            case "launch":
+                return launch(params);
             case "attach":
                 return attach(params);
+            case "terminate":
+                return terminate(params);
             case "detach":
                 return detach(params);
             case "threads":
@@ -73,6 +84,8 @@ final class JdiService {
                 return session(params).locals();
             case "setBreakpoint":
                 return session(params).setBreakpoint(params);
+            case "setMethodEvent":
+                return session(params).setMethodEvent(params);
             case "setWatchpoint":
                 return session(params).setWatchpoint(params);
             case "clearWatchpoint":
@@ -116,10 +129,38 @@ final class JdiService {
         return Json.object("ok", true, "session", id);
     }
 
+    private Object launch(Map<String, Object> params) throws Exception {
+        String id = Json.string(params, "session");
+        String mainClass = Json.string(params, "mainClass");
+        List<String> classpath = stringList(params, "classpath");
+        List<String> appArgs = stringList(params, "appArgs");
+
+        LaunchingConnector connector = commandLineLaunchConnector();
+        Map<String, Connector.Argument> args = connector.defaultArguments();
+        args.get("main").setValue(buildLaunchMainArgument(mainClass, appArgs));
+        args.get("suspend").setValue("true");
+        String options = buildLaunchOptions(classpath);
+        if (!options.isEmpty()) {
+            args.get("options").setValue(options);
+        }
+        VirtualMachine vm = connector.launch(args);
+        DebugSession session = new DebugSession(id, vm);
+        sessions.put(id, session);
+        session.startEventLoop();
+        return Json.object("ok", true, "session", id);
+    }
+
     private Object detach(Map<String, Object> params) throws Exception {
         DebugSession session = session(params);
         sessions.remove(session.id);
         session.detach();
+        return Json.object("ok", true);
+    }
+
+    private Object terminate(Map<String, Object> params) throws Exception {
+        DebugSession session = session(params);
+        sessions.remove(session.id);
+        session.terminate();
         return Json.object("ok", true);
     }
 
@@ -151,6 +192,61 @@ final class JdiService {
         throw new RpcException("connector_not_found", "JDI SocketAttach connector not found");
     }
 
+    private static LaunchingConnector commandLineLaunchConnector() throws RpcException {
+        for (LaunchingConnector connector : Bootstrap.virtualMachineManager().launchingConnectors()) {
+            if ("com.sun.jdi.CommandLineLaunch".equals(connector.name())) {
+                return connector;
+            }
+        }
+        throw new RpcException("connector_not_found", "JDI CommandLineLaunch connector not found");
+    }
+
+    static String buildLaunchMainArgument(String mainClass, List<String> appArgs) {
+        StringBuilder out = new StringBuilder(mainClass);
+        for (String arg : appArgs) {
+            out.append(' ').append(quoteLaunchArgument(arg));
+        }
+        return out.toString();
+    }
+
+    private static String buildLaunchOptions(List<String> classpath) {
+        if (classpath.isEmpty()) {
+            return "";
+        }
+        StringBuilder joined = new StringBuilder();
+        for (int i = 0; i < classpath.size(); i++) {
+            if (i > 0) {
+                joined.append(File.pathSeparator);
+            }
+            joined.append(classpath.get(i));
+        }
+        return "-cp " + quoteLaunchArgument(joined.toString());
+    }
+
+    private static String quoteLaunchArgument(String value) {
+        if (value.length() > 0 && value.matches("[A-Za-z0-9_./:=+-]+")) {
+            return value;
+        }
+        String escaped = value.replace("\\", "\\\\").replace("\"", "\\\"");
+        return "\"" + escaped + "\"";
+    }
+
+    private static List<String> stringList(Map<String, Object> params, String key) {
+        Object value = params.get(key);
+        List<String> out = new ArrayList<>();
+        if (value == null) {
+            return out;
+        }
+        for (Object item : Json.asList(value, key)) {
+            if (item instanceof String) {
+                out.add((String) item);
+            } else {
+                throw new IllegalArgumentException(key + " entries must be strings");
+            }
+        }
+        return out;
+    }
+
     private final class DebugSession {
         final String id;
         final VirtualMachine vm;
@@ -158,6 +254,7 @@ final class JdiService {
         final List<PendingBreakpoint> pendingBreakpoints = new ArrayList<>();
         final List<PendingWatchpoint> pendingWatchpoints = new ArrayList<>();
         final List<ActiveWatchpoint> activeWatchpoints = new ArrayList<>();
+        final List<ActiveMethodEvent> activeMethodEvents = new ArrayList<>();
         volatile String currentThreadId;
         volatile EventSet currentStopSet;
         volatile boolean disconnected;
@@ -251,6 +348,40 @@ final class JdiService {
             request.enable();
             pending.prepareRequest = request;
             return Json.object("spec", className + ":" + line, "deferred", true);
+        }
+
+        Object setMethodEvent(Map<String, Object> params) throws Exception {
+            MethodSpec spec = MethodSpec.from(
+                    Json.string(params, "class"),
+                    Json.string(params, "method"),
+                    Json.optionalString(params, "args", null),
+                    Json.optionalString(params, "event", "entry"),
+                    Json.optionalString(params, "suspend", "all")
+            );
+            int suspendPolicy = "thread".equals(spec.suspend)
+                    ? EventRequest.SUSPEND_EVENT_THREAD
+                    : EventRequest.SUSPEND_ALL;
+            if ("entry".equals(spec.eventKind) || "both".equals(spec.eventKind)) {
+                MethodEntryRequest request = vm.eventRequestManager().createMethodEntryRequest();
+                request.addClassFilter(spec.className);
+                request.setSuspendPolicy(suspendPolicy);
+                request.putProperty("jdbg.methodSpec", spec);
+                request.enable();
+                activeMethodEvents.add(new ActiveMethodEvent(spec, "entry", request));
+            }
+            if ("exit".equals(spec.eventKind) || "both".equals(spec.eventKind)) {
+                MethodExitRequest request = vm.eventRequestManager().createMethodExitRequest();
+                request.addClassFilter(spec.className);
+                request.setSuspendPolicy(suspendPolicy);
+                request.putProperty("jdbg.methodSpec", spec);
+                request.enable();
+                activeMethodEvents.add(new ActiveMethodEvent(spec, "exit", request));
+            }
+            return Json.object(
+                    "spec", spec.display(),
+                    "deferred", vm.classesByName(spec.className).isEmpty(),
+                    "note", "JDI method " + spec.eventKind + " event request installed"
+            );
         }
 
         Object setWatchpoint(Map<String, Object> params) throws Exception {
@@ -411,6 +542,18 @@ final class JdiService {
             disconnected = true;
         }
 
+        void terminate() {
+            try {
+                resumeFromStop();
+            } catch (Exception ignored) {
+            }
+            try {
+                vm.exit(0);
+            } catch (Exception ignored) {
+            }
+            disconnected = true;
+        }
+
         private void eventLoop() {
             while (!disconnected) {
                 EventSet eventSet;
@@ -434,6 +577,14 @@ final class JdiService {
                             handleVmStart(eventSet);
                         } else if (event instanceof ClassPrepareEvent) {
                             resolvePending((ClassPrepareEvent) event);
+                        } else if (event instanceof MethodEntryEvent) {
+                            if (handleMethodEntryStop(eventSet, (MethodEntryEvent) event)) {
+                                shouldResume = false;
+                            }
+                        } else if (event instanceof MethodExitEvent) {
+                            if (handleMethodExitStop(eventSet, (MethodExitEvent) event)) {
+                                shouldResume = false;
+                            }
                         } else if (event instanceof ModificationWatchpointEvent) {
                             shouldResume = false;
                             handleWatchStop(eventSet, (WatchpointEvent) event, "modified");
@@ -483,6 +634,38 @@ final class JdiService {
                 stops.offer(new StopRecord(stop, eventSet));
             }
             sendEvent("fieldWatch", stop);
+        }
+
+        private boolean handleMethodEntryStop(EventSet eventSet, MethodEntryEvent event) {
+            MethodSpec spec = methodSpec(event.request());
+            if (spec == null || !spec.matches(event.method())) {
+                return false;
+            }
+            handleStop(eventSet, "methodEntry", event.thread(), event.location(), null);
+            return true;
+        }
+
+        private boolean handleMethodExitStop(EventSet eventSet, MethodExitEvent event) {
+            MethodSpec spec = methodSpec(event.request());
+            if (spec == null || !spec.matches(event.method())) {
+                return false;
+            }
+            Map<String, Object> stop = stopPayload("methodExit", event.thread(), event.location(), null);
+            Value value = event.returnValue();
+            stop.put("returnValue", ValueRenderer.display(value));
+            stop.put("returnType", value == null ? event.method().returnTypeName() : value.type().name());
+            synchronized (this) {
+                currentStopSet = eventSet;
+                currentThreadId = Long.toString(event.thread().uniqueID());
+                stops.offer(new StopRecord(stop, eventSet));
+            }
+            sendEvent("methodExit", stop);
+            return true;
+        }
+
+        private MethodSpec methodSpec(EventRequest request) {
+            Object value = request.getProperty("jdbg.methodSpec");
+            return value instanceof MethodSpec ? (MethodSpec) value : null;
         }
 
         private void handleVmStart(EventSet eventSet) {
@@ -866,6 +1049,134 @@ final class JdiService {
 
         boolean matches(FieldSpec other, String otherMode) {
             return field.spec.equals(other.spec) && (mode.equals(otherMode) || "all".equals(otherMode));
+        }
+    }
+
+    private static final class ActiveMethodEvent {
+        final MethodSpec spec;
+        final String eventKind;
+        final EventRequest request;
+
+        ActiveMethodEvent(MethodSpec spec, String eventKind, EventRequest request) {
+            this.spec = spec;
+            this.eventKind = eventKind;
+            this.request = request;
+        }
+    }
+
+    static final class MethodSpec {
+        final String className;
+        final String methodName;
+        final List<String> argumentTypeNames;
+        final String eventKind;
+        final String suspend;
+
+        private MethodSpec(
+                String className,
+                String methodName,
+                List<String> argumentTypeNames,
+                String eventKind,
+                String suspend
+        ) {
+            this.className = className;
+            this.methodName = methodName;
+            this.argumentTypeNames = argumentTypeNames;
+            this.eventKind = eventKind;
+            this.suspend = suspend;
+        }
+
+        static MethodSpec from(String className, String methodName, String args, String eventKind, String suspend) {
+            if (!"entry".equals(eventKind) && !"exit".equals(eventKind) && !"both".equals(eventKind)) {
+                throw new IllegalArgumentException("event must be entry, exit, or both: " + eventKind);
+            }
+            if (!"all".equals(suspend) && !"thread".equals(suspend)) {
+                throw new IllegalArgumentException("suspend must be all or thread: " + suspend);
+            }
+            List<String> parsedArgs = null;
+            if (args != null && args.trim().length() > 0) {
+                parsedArgs = new ArrayList<>();
+                String[] parts = args.split(",");
+                for (String part : parts) {
+                    parsedArgs.add(part.trim());
+                }
+            }
+            return new MethodSpec(className, methodName, parsedArgs, eventKind, suspend);
+        }
+
+        boolean matches(Method method) {
+            if (!methodName.equals(method.name())) {
+                return false;
+            }
+            if (argumentTypeNames == null) {
+                return true;
+            }
+            return argumentTypeNames.equals(method.argumentTypeNames());
+        }
+
+        boolean matches(String methodName, String signature) {
+            if (!this.methodName.equals(methodName)) {
+                return false;
+            }
+            if (argumentTypeNames == null) {
+                return true;
+            }
+            StringBuilder descriptor = new StringBuilder("(");
+            for (String arg : argumentTypeNames) {
+                descriptor.append(typeDescriptor(arg));
+            }
+            descriptor.append(')');
+            return signature.startsWith(descriptor.toString());
+        }
+
+        String display() {
+            if (argumentTypeNames == null) {
+                return className + "." + methodName;
+            }
+            StringBuilder out = new StringBuilder(className)
+                    .append('.')
+                    .append(methodName)
+                    .append('(');
+            for (int i = 0; i < argumentTypeNames.size(); i++) {
+                if (i > 0) {
+                    out.append(',');
+                }
+                out.append(argumentTypeNames.get(i));
+            }
+            return out.append(')').toString();
+        }
+
+        private static String typeDescriptor(String typeName) {
+            String type = typeName.trim();
+            int dimensions = 0;
+            while (type.endsWith("[]")) {
+                dimensions++;
+                type = type.substring(0, type.length() - 2);
+            }
+            String base;
+            if ("boolean".equals(type)) {
+                base = "Z";
+            } else if ("byte".equals(type)) {
+                base = "B";
+            } else if ("char".equals(type)) {
+                base = "C";
+            } else if ("short".equals(type)) {
+                base = "S";
+            } else if ("int".equals(type)) {
+                base = "I";
+            } else if ("long".equals(type)) {
+                base = "J";
+            } else if ("float".equals(type)) {
+                base = "F";
+            } else if ("double".equals(type)) {
+                base = "D";
+            } else {
+                base = "L" + type.replace('.', '/') + ";";
+            }
+            StringBuilder out = new StringBuilder();
+            for (int i = 0; i < dimensions; i++) {
+                out.append('[');
+            }
+            return out.append(base).toString();
         }
     }
 

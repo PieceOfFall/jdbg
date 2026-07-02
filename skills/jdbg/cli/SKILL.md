@@ -4,12 +4,12 @@ description: "Use the jdbg CLI to debug Java programs interactively from Pi when
 compatibility: "Requires a JDK 8+ with jdb available through JAVA_HOME, PATH, or --jdb-path. Requires the jdbg CLI on PATH. Native on Windows, Linux, and macOS."
 allowed-tools: "Bash(jdbg:*), Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "1.6"
+  version: "1.7"
 ---
 
 # jdbg CLI - interactive Java debugging for Pi
 
-`jdbg` is a cross-platform CLI wrapper around the JDK's `jdb`, with an optional attach-only JDI sidecar backend for structured runtime data. It keeps a stateful background daemon alive, so a debug session survives across separate shell commands.
+`jdbg` is a cross-platform CLI wrapper around the JDK's `jdb`, with an optional JDI sidecar backend for structured runtime data. It keeps a stateful background daemon alive, so a debug session survives across separate shell commands.
 
 Pi has no official jdbg MCP setup. Use the `jdbg` CLI directly.
 
@@ -47,6 +47,12 @@ Launch with application arguments after `--`:
 jdbg launch com.example.Main --classpath target/classes --sourcepath src/main/java -- arg1 arg2
 ```
 
+Launch through the JDI sidecar when you need structured JDI data:
+
+```bash
+jdbg launch Main --backend jdi --classpath . --sourcepath src
+```
+
 Attach to a running JVM with JDWP enabled:
 
 ```bash
@@ -59,10 +65,10 @@ Use the JDI sidecar subset for structured attach debugging:
 jdbg attach --backend jdi --host localhost --port 5005 --sourcepath src/main/java
 ```
 
-The default backend is `jdb` and supports all commands. The current JDI backend supports attach, threads,
-line breakpoints, field watchpoints, cont, next, where, locals, thread selection, safe JSON inspect,
-executable print/eval/dump, set, and non-void force-return; unsupported commands fail explicitly instead of
-silently falling back.
+The default backend is `jdb` and supports all commands. The current JDI backend supports launch, attach,
+threads, line breakpoints, method entry/exit events, field watchpoints, run for launched sessions, cont,
+next, where, locals, thread selection, safe JSON inspect, executable print/eval/dump, set, and non-void
+force-return; unsupported commands fail explicitly instead of silently falling back.
 
 If the JDK is not the one you need, pass:
 
@@ -190,7 +196,12 @@ Method breakpoint:
 ```bash
 jdbg break-in com.example.Service process
 jdbg break-in com.example.Service process --args "java.lang.String,int"
+jdbg break-in com.example.Service process --event exit --args "java.lang.String,int"
 ```
+
+`--event entry` is the default. JDI sessions also support `--event exit` and `--event both`; method-exit stops
+include a rendered return value when JDI exposes it. The `jdb` backend supports entry only and rejects exit/both
+explicitly.
 
 Exception catchpoint:
 
