@@ -528,6 +528,12 @@ fn wait_for_jdwp_banner(child: &mut Child, rx: &mpsc::Receiver<String>, port: u1
 fn launch_fixture(main_class: &str) -> Arc<Session> {
     use java_agent_debugger::jdb::process::LaunchConfig;
 
+    let source_name = format!(
+        "{}.java",
+        main_class.rsplit('.').next().unwrap_or(main_class)
+    );
+    compile_java_fixture(&source_name);
+
     let dir = fixture_dir();
     let config = LaunchConfig {
         main_class: main_class.to_string(),

@@ -479,8 +479,9 @@ mod tests {
         assert!(!redacted.iter().any(|arg| arg == "secret-token"));
     }
 
+    #[cfg(windows)]
     #[test]
-    fn default_jar_path_lives_next_to_binary() {
+    fn default_jar_path_lives_next_to_binary_on_windows() {
         let exe = PathBuf::from(r"C:\tools\jdbg.exe");
 
         assert_eq!(
@@ -489,13 +490,36 @@ mod tests {
         );
     }
 
+    #[cfg(windows)]
     #[test]
-    fn default_jar_path_for_cargo_test_binary_lives_in_profile_dir() {
+    fn default_jar_path_for_cargo_test_binary_lives_in_profile_dir_on_windows() {
         let exe = PathBuf::from(r"C:\repo\target\debug\deps\server_integration.exe");
 
         assert_eq!(
             default_sidecar_jar_path_from_exe(&exe),
             PathBuf::from(r"C:\repo\target\debug\jdbg-jdi-sidecar.jar")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_jar_path_lives_next_to_binary_on_unix() {
+        let exe = PathBuf::from("/tools/jdbg");
+
+        assert_eq!(
+            default_sidecar_jar_path_from_exe(&exe),
+            PathBuf::from("/tools/jdbg-jdi-sidecar.jar")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn default_jar_path_for_cargo_test_binary_lives_in_profile_dir_on_unix() {
+        let exe = PathBuf::from("/repo/target/debug/deps/server_integration");
+
+        assert_eq!(
+            default_sidecar_jar_path_from_exe(&exe),
+            PathBuf::from("/repo/target/debug/jdbg-jdi-sidecar.jar")
         );
     }
 
