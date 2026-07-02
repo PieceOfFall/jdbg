@@ -763,10 +763,11 @@ final class JdiService {
             if (currentStopSet == stopSet) {
                 currentStopSet = null;
             }
+            // Startup VMStartEvent delivery can race with the first continue call; only resume
+            // an EventSet the event loop has actually recorded, otherwise deferred requests can
+            // be installed after the VM has already run past their first possible stop site.
             if (stopSet != null) {
                 stopSet.resume();
-            } else {
-                vm.resume();
             }
         }
 
