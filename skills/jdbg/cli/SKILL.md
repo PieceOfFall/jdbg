@@ -4,7 +4,7 @@ description: "Use the jdbg CLI to debug Java programs interactively from Pi when
 compatibility: "Requires a JDK 8+ with jdb available through JAVA_HOME, PATH, or --jdb-path. Requires the jdbg CLI on PATH. Native on Windows, Linux, and macOS."
 allowed-tools: "Bash(jdbg:*), Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "1.5"
+  version: "1.6"
 ---
 
 # jdbg CLI - interactive Java debugging for Pi
@@ -60,8 +60,9 @@ jdbg attach --backend jdi --host localhost --port 5005 --sourcepath src/main/jav
 ```
 
 The default backend is `jdb` and supports all commands. The current JDI backend supports attach, threads,
-line breakpoints, field watchpoints, cont, next, where, locals, thread selection, and safe JSON inspect;
-unsupported commands fail explicitly instead of silently falling back.
+line breakpoints, field watchpoints, cont, next, where, locals, thread selection, safe JSON inspect,
+executable print/eval/dump, set, and non-void force-return; unsupported commands fail explicitly instead of
+silently falling back.
 
 If the JDK is not the one you need, pass:
 
@@ -140,8 +141,10 @@ jdbg attach --backend jdi --host localhost --port 5005
 - `--jdb-path <path>` forces a specific `jdb`.
 - `--backend jdb|jdi` is accepted only on `launch` and `attach`; omit it for the full `jdb` backend.
 
-Source builds create `jdbg-jdi-sidecar.jar` during `cargo build` when `javac` and `jar` are available.
-Override sidecar discovery with `JDBG_JDI_SIDECAR_JAR` or the Java runtime with `JDBG_JDI_JAVA` only when needed.
+Source builds create `jdbg-jdi-sidecar.jar` during `cargo build` by running the Gradle wrapper in
+`sidecar/jdi`; this requires a JDK 17+ build JVM. Debug targets still support JDK 8+. Set
+`JDBG_GRADLE_JAVA_HOME` when the Gradle build JDK differs from the target/debuggee JDK. Override sidecar
+discovery with `JDBG_JDI_SIDECAR_JAR` or the Java runtime with `JDBG_JDI_JAVA` only when needed.
 
 List sessions and inspect state:
 
@@ -244,6 +247,10 @@ On JDI sessions, safe JSON `inspect` reads fields directly and does not invoke g
 `ArrayList`, `LinkedList`, `ArrayDeque`, `HashSet`, `LinkedHashSet`, `TreeMap`, `TreeSet`, `HashMap`,
 `LinkedHashMap`, unmodifiable wrappers, arrays, and ordinary objects.
 
+On JDI sessions, `print`, `eval`, `dump`, `set`, and `force-return` are executable capabilities. They may
+invoke methods in the target JVM and can have side effects. Use `inspect` when you need safe field-reading
+without getters or method calls.
+
 Source context:
 
 ```bash
@@ -318,7 +325,11 @@ Only change program state when it is useful and safe for the debugging task:
 ```bash
 jdbg set "this.count" "42"
 jdbg set "arr[0]" "\"patched\""
+jdbg force-return "123"
 ```
+
+`force-return` is JDI-only and currently supports non-void methods. It mutates control flow by forcing the
+current suspended method to return the evaluated value expression.
 
 ## Raw Escape Hatch
 

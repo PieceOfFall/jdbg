@@ -8,7 +8,7 @@
 //!
 //! Module split:
 //! - [`jsonrpc`]: basic JSON-RPC 2.0 types (request/response/error).
-//! - [`tools`]: 36 tool specs (name/description/inputSchema) plus tool-name → `Command` translation.
+//! - [`tools`]: 37 tool specs (name/description/inputSchema) plus tool-name → `Command` translation.
 //!
 //! **stdout discipline**: stdout carries only JSON-RPC messages. Any logs/diagnostics must go to stderr
 //! (`eprintln!`), otherwise they corrupt the protocol stream.

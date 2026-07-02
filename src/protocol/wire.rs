@@ -196,6 +196,9 @@ pub enum Command {
         lvalue: String,
         value: String,
     },
+    ForceReturn {
+        value: String,
+    },
     Ignore {
         exception: String,
         #[serde(default = "default_catch_mode")]

@@ -2,9 +2,9 @@
 name: "jdbg"
 description: "Use when you need a Java program's real runtime state instead of reading source or adding print statements — the actual value of a variable/field/expression at a line, why an exception or NullPointerException is thrown (with stack + locals at the throw site), what a thread is blocked or deadlocked on, or how execution reaches some code. Also for stepping through Java line by line, or attaching to an already-running JVM that has JDWP enabled. Cross-platform, native on Windows, no IDE."
 compatibility: "Requires a JDK 8+ (provides the `jdb` command). Debugging is driven through the `jdbg` MCP server (tools named `launch`, `break_at`, `run`, `locals`, …). Native on Windows, Linux, macOS."
-allowed-tools: "mcp__jdbg__launch, mcp__jdbg__attach, mcp__jdbg__status, mcp__jdbg__list, mcp__jdbg__kill, mcp__jdbg__break_at, mcp__jdbg__break_in, mcp__jdbg__catch, mcp__jdbg__watch, mcp__jdbg__unwatch, mcp__jdbg__breakpoints, mcp__jdbg__clear, mcp__jdbg__run, mcp__jdbg__cont, mcp__jdbg__step, mcp__jdbg__next, mcp__jdbg__step_out, mcp__jdbg__where, mcp__jdbg__locals, mcp__jdbg__print, mcp__jdbg__dump, mcp__jdbg__eval, mcp__jdbg__threads, mcp__jdbg__classes, mcp__jdbg__methods, mcp__jdbg__thread, mcp__jdbg__frame, mcp__jdbg__list_source, mcp__jdbg__inspect, mcp__jdbg__raw, mcp__jdbg__suspend, mcp__jdbg__resume, mcp__jdbg__set, mcp__jdbg__ignore, mcp__jdbg__lock, mcp__jdbg__threadlocks, Bash(javac:*), Bash(java:*), Read"
+allowed-tools: "mcp__jdbg__launch, mcp__jdbg__attach, mcp__jdbg__status, mcp__jdbg__list, mcp__jdbg__kill, mcp__jdbg__break_at, mcp__jdbg__break_in, mcp__jdbg__catch, mcp__jdbg__watch, mcp__jdbg__unwatch, mcp__jdbg__breakpoints, mcp__jdbg__clear, mcp__jdbg__run, mcp__jdbg__cont, mcp__jdbg__step, mcp__jdbg__next, mcp__jdbg__step_out, mcp__jdbg__where, mcp__jdbg__locals, mcp__jdbg__print, mcp__jdbg__dump, mcp__jdbg__eval, mcp__jdbg__threads, mcp__jdbg__classes, mcp__jdbg__methods, mcp__jdbg__thread, mcp__jdbg__frame, mcp__jdbg__list_source, mcp__jdbg__inspect, mcp__jdbg__raw, mcp__jdbg__suspend, mcp__jdbg__resume, mcp__jdbg__set, mcp__jdbg__force_return, mcp__jdbg__ignore, mcp__jdbg__lock, mcp__jdbg__threadlocks, Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "2.12"
+  version: "2.13"
 ---
 
 # jdbg — interactive Java debugging for agents
@@ -80,7 +80,7 @@ found via `JAVA_HOME/bin` → PATH → common install dirs).
 ### Backend guidance
 
 - Omit `backend` for the mature `jdb` backend. It supports the full tool surface and keeps `raw` as an escape hatch.
-- Use `backend: "jdi"` only when attaching to an already-running JDWP target and you want structured sidecar data. The current JDI subset supports `attach`, `threads`, line `break_at`, field `watch`/`unwatch`, `cont`, `next`, `where`, `locals`, `thread`, and safe JSON `inspect`.
+- Use `backend: "jdi"` only when attaching to an already-running JDWP target and you want structured sidecar data. The current JDI subset supports `attach`, `threads`, line `break_at`, field `watch`/`unwatch`, `cont`, `next`, `where`, `locals`, `thread`, safe JSON `inspect`, executable `print`/`eval`/`dump`, `set`, and non-void `force_return`.
 - JDI attach starts in state `running`; set a line breakpoint, then call `cont` to wait for the next stop.
 - Unsupported JDI tools return an explicit backend error. Start a `jdb` session if you need unsupported debugger commands.
 - JDI uses `jdbg-jdi-sidecar.jar` next to the `jdbg` binary. Source builds create it during `cargo build`; override with `JDBG_JDI_SIDECAR_JAR` or `JDBG_JDI_JAVA` only when necessary.
@@ -145,7 +145,7 @@ straight to `thread`/`suspend`/`threadlocks` — no need to scan `threads` for i
 | Tool | Purpose |
 |---|---|
 | `locals` | local variables in the current frame |
-| `print { expr }` · `eval { expr }` | value of an expression (can call methods on live objects) |
+| `print { expr }` · `eval { expr }` | value of an expression (JDI may call methods on live objects) |
 | `dump { expr }` | all fields of an object |
 | `inspect { expr, max_elements? }` | show size + first N elements of a collection/array (default 10, max 50) |
 | `where { all? }` | call stack of the current thread (or every thread with `all: true`) |
@@ -161,6 +161,7 @@ straight to `thread`/`suspend`/`threadlocks` — no need to scan `threads` for i
 |---|---|
 | `suspend { id? }` · `resume { id? }` | suspend/resume one thread (or all if no id) — fine-grained control without freezing the whole VM |
 | `set { lvalue, value }` | assign a variable/field/array element — **mutates live state** to test a fix or force a branch |
+| `force_return { value }` | JDI only: force the current non-void method to return a value expression — **mutates control flow** |
 | `ignore { exception, mode? }` | stop catching an exception (removes a `catch`); `mode` must match how it was caught |
 | `lock { expr }` | monitor owner + waiters for an object — contention/deadlock diagnosis |
 | `threadlocks { id? }` | locks a thread holds and is blocked on — the core deadlock command |
@@ -193,6 +194,10 @@ On JDI sessions, safe JSON `inspect` reads fields directly and does not invoke g
 `LinkedHashMap`, unmodifiable wrappers, arrays, and ordinary objects. On jdb sessions, `inspect` keeps the
 classic collection/array summary behavior. Results include size/entries/elements and truncation metadata
 where available.
+
+On JDI sessions, `print`, `eval`, `dump`, `set`, and `force_return` are executable capabilities. They may
+invoke methods in the target JVM and can have side effects. Use `inspect` when you need safe field-reading
+without getters or method calls.
 
 ## Finding classes and methods (Spring/CGLIB/Tomcat)
 

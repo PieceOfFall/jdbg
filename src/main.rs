@@ -227,6 +227,9 @@ fn build_command(cli: &Cli) -> anyhow::Result<Command> {
             lvalue: lvalue.clone(),
             value: value.clone(),
         },
+        Commands::ForceReturn { value } => Command::ForceReturn {
+            value: value.clone(),
+        },
         Commands::Ignore { exception, mode } => Command::Ignore {
             exception: exception.clone(),
             mode: mode.clone(),

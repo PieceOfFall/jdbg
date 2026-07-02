@@ -8,7 +8,7 @@ use interprocess::local_socket::Stream;
 
 use super::manager::SessionManager;
 use crate::backend::DebugSession;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::jdb::parser::CommandHint;
 use crate::jdi::session::JdiSession;
 use crate::protocol::*;
@@ -481,6 +481,10 @@ fn dispatch_jdb_session_cmd(req: &Request, session: Arc<Session>) -> Response {
             }
             first_try
         }
+        Command::ForceReturn { .. } => Err(Error::UnsupportedBackend {
+            backend: "jdb".into(),
+            operation: "force_return".into(),
+        }),
         Command::Ignore { exception, mode } => {
             // Mirror Catch's mode dispatch for symmetric exception breakpoint removal.
             let cmd = match mode.as_str() {
@@ -545,9 +549,8 @@ fn dispatch_jdi_session_cmd(req: &Request, session: Arc<JdiSession>) -> Response
         Command::Threads { filter } => session.threads(filter.as_deref()),
         Command::Thread { id } => session.select_thread(id),
         Command::Inspect { expr, max_elements } => session.inspect(expr, *max_elements),
-        Command::Print { expr } | Command::Eval { expr } | Command::Dump { expr } => {
-            session.inspect(expr, 10)
-        }
+        Command::Print { expr } | Command::Eval { expr } => session.evaluate(expr),
+        Command::Dump { expr } => session.dump(expr, 10),
         Command::Run => Err(session.unsupported("run")),
         Command::Step => Err(session.unsupported("step")),
         Command::StepOut => Err(session.unsupported("step_out")),
@@ -564,7 +567,8 @@ fn dispatch_jdi_session_cmd(req: &Request, session: Arc<JdiSession>) -> Response
         Command::Raw { .. } => Err(session.unsupported("raw")),
         Command::Suspend { .. } => Err(session.unsupported("suspend")),
         Command::Resume { .. } => Err(session.unsupported("resume")),
-        Command::Set { .. } => Err(session.unsupported("set")),
+        Command::Set { lvalue, value } => session.set_value(lvalue, value),
+        Command::ForceReturn { value } => session.force_return(value),
         Command::Ignore { .. } => Err(session.unsupported("ignore")),
         Command::Lock { .. } => Err(session.unsupported("lock")),
         Command::ThreadLocks { .. } => Err(session.unsupported("threadlocks")),
@@ -699,6 +703,7 @@ fn should_settle_async_conditions(cmd: &Command) -> bool {
             | Command::ListSource { .. }
             | Command::Inspect { .. }
             | Command::Set { .. }
+            | Command::ForceReturn { .. }
             | Command::Lock { .. }
             | Command::ThreadLocks { .. }
     )

@@ -118,7 +118,7 @@ agent-facing tool surface and daemon routing.
 
 Decisions to lock in this milestone:
 
-- how each of the 36 current MCP tools is represented as a typed macro-driven rmcp handler;
+- how each of the 37 current MCP tools is represented as a typed macro-driven rmcp handler;
 - how tool input structs map to the existing `protocol::Command` enum;
 - how tool-level business errors continue to surface as agent-visible tool errors;
 - how stdout remains protocol-only and diagnostics stay on stderr;
@@ -136,7 +136,7 @@ Scope:
 
 Acceptance:
 
-- `tools/list` exposes the same 36 tool names with compatible input schemas;
+- `tools/list` exposes the same 37 tool names with compatible input schemas;
 - `tools/call` preserves current success and tool-error semantics;
 - MCP end-to-end launch -> break_at -> run -> locals -> cont remains green;
 - stdout carries only MCP protocol data;
@@ -328,7 +328,7 @@ This section tracks the current branch state against the roadmap above.
 ### Implemented
 
 - Milestone 1, MCP rmcp migration: `jdbg __mcp` now uses `rmcp` over stdio,
-  preserves the 36-tool catalog, routes tool calls through `client::send_request`
+  preserves the 37-tool catalog, routes tool calls through `client::send_request`
   and `output::render`, and keeps tool-level errors agent-visible.
 - Milestone 2, backend boundary: CLI and MCP session creation accept
   `backend: jdb|jdi`; session creation, list, status, registry records, and output
@@ -355,8 +355,14 @@ This section tracks the current branch state against the roadmap above.
 - Milestone 8, CLI and MCP integration: default session creation remains `jdb`;
   `attach --backend jdi` creates JDI sessions; follow-up commands route by session
   backend; JDI supports `break-at`, `watch`, `unwatch`, `cont`, `next`, `where`,
-  `locals`, `threads`, `thread`, `inspect`, and print/eval/dump through safe
-  inspect.
+  `locals`, `threads`, `thread`, `inspect`, expression `print`/`eval`/`dump`,
+  `set`, and non-void `force-return`.
+- Milestone 10, executable JDI expressions and mutation: the sidecar Gradle fat jar
+  bundles JavaParser, parses Java expressions in the sidecar, evaluates them against
+  the suspended JDI frame/object graph, supports instance/static method invocation,
+  local/field/array reads, primitive operators, casts, `setValue`, and
+  `ThreadReference.forceEarlyReturn` for non-void returns. Safe `inspect` remains
+  field-reading only and does not invoke getters.
 - Milestone 9, release readiness: `README.md`, `DESIGN.md`, both installed skills,
   and `Cargo.toml` metadata have been updated for the public JDI/rmcp behavior.
 - Setup integration beyond the original roadmap: `jdbg setup` can record an
@@ -382,6 +388,9 @@ This section tracks the current branch state against the roadmap above.
 - Java sidecar self-tests cover JSON protocol parsing/serialization, sidecar
   token/config validation, stable unknown-method RPC errors, and value-rendering
   string limits.
+- JDI expression integration covers local arithmetic, instance method calls, static
+  method calls, array access, field mutation, array mutation, and force-return with
+  caller-observed replacement values.
 - Unexpected sidecar process exit while the Rust daemon still holds a JDI session
   now marks the session `Dead`; `status` reports `jdb_alive=false` and follow-up
   operations fail explicitly instead of falling back to `jdb`.
@@ -454,9 +463,6 @@ CLI/MCP end-to-end tests should prove:
 The following are intentionally out of MVP scope but remain valid future work:
 
 - JDI launch mode;
-- setValue;
-- method invocation;
-- force return;
 - method entry/exit events;
 - multi-client sidecar support;
 

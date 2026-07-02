@@ -81,90 +81,27 @@ fn compile_java_fixture(source_name: &str) {
     assert!(status.success(), "javac failed with status {status}");
 }
 
-fn sidecar_java_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+fn run_java_sidecar_self_tests() {
+    let sidecar_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("sidecar")
-        .join("jdi")
-        .join("src")
-        .join("main")
-        .join("java")
-}
-
-fn sidecar_java_test_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("sidecar")
-        .join("jdi")
-        .join("src")
-        .join("test")
-        .join("java")
-}
-
-fn collect_java_sources(root: &Path, out: &mut Vec<PathBuf>) {
-    let entries = fs::read_dir(root)
-        .unwrap_or_else(|e| panic!("failed to read Java source dir {}: {e}", root.display()));
-    for entry in entries {
-        let path = entry.expect("read Java source entry").path();
-        if path.is_dir() {
-            collect_java_sources(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "java") {
-            out.push(path);
+        .join("jdi");
+    let mut gradle = Command::new(sidecar_dir.join(if cfg!(windows) {
+        "gradlew.bat"
+    } else {
+        "gradlew"
+    }));
+    gradle
+        .current_dir(&sidecar_dir)
+        .arg("--no-daemon")
+        .arg("selfTest");
+    if let Some(java_home) = gradle_java_home() {
+        gradle.env("JAVA_HOME", &java_home);
+        if let Some(path) = path_with_java_home(&java_home) {
+            gradle.env("PATH", path);
         }
     }
-}
-
-fn tools_jar_path() -> Option<PathBuf> {
-    std::env::var_os("JAVA_HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join("lib").join("tools.jar"))
-        .filter(|path| path.is_file())
-}
-
-fn classpath_join(paths: &[PathBuf]) -> String {
-    let sep = if cfg!(windows) { ";" } else { ":" };
-    paths
-        .iter()
-        .map(|path| path.display().to_string())
-        .collect::<Vec<_>>()
-        .join(sep)
-}
-
-fn run_java_sidecar_self_tests() {
-    let mut sources = Vec::new();
-    collect_java_sources(&sidecar_java_dir(), &mut sources);
-    collect_java_sources(&sidecar_java_test_dir(), &mut sources);
-
-    let classes_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("target")
-        .join("sidecar-self-test-classes");
-    let _ = fs::remove_dir_all(&classes_dir);
-    fs::create_dir_all(&classes_dir).expect("create sidecar self-test classes dir");
-
-    let mut javac = Command::new(javac_path());
-    javac.arg("-encoding").arg("UTF-8");
-    if let Some(tools_jar) = tools_jar_path() {
-        javac.arg("-cp").arg(tools_jar);
-    }
-    javac.arg("-d").arg(&classes_dir).args(&sources);
-    hide_console(&mut javac);
-    let output = javac.output().expect("spawn javac for sidecar tests");
-    assert!(
-        output.status.success(),
-        "javac sidecar tests failed with {}\nstdout:\n{}\nstderr:\n{}",
-        output.status,
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let mut classpath = vec![classes_dir.clone()];
-    if let Some(tools_jar) = tools_jar_path() {
-        classpath.push(tools_jar);
-    }
-    let mut java = Command::new(java_path(false));
-    java.arg("-cp")
-        .arg(classpath_join(&classpath))
-        .arg("dev.jdbg.sidecar.SidecarSelfTest");
-    hide_console(&mut java);
-    let output = java.output().expect("spawn sidecar self-test runner");
+    hide_console(&mut gradle);
+    let output = gradle.output().expect("spawn Gradle sidecar self-test");
     assert!(
         output.status.success(),
         "sidecar self-tests failed with {}\nstdout:\n{}\nstderr:\n{}",
@@ -172,6 +109,88 @@ fn run_java_sidecar_self_tests() {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+fn gradle_java_home() -> Option<PathBuf> {
+    std::env::var_os("JDBG_GRADLE_JAVA_HOME")
+        .map(PathBuf::from)
+        .filter(|home| java_home_major(home).is_some_and(|major| major >= 17))
+        .or_else(|| {
+            std::env::var_os("JAVA_HOME")
+                .map(PathBuf::from)
+                .filter(|home| java_home_major(home).is_some_and(|major| major >= 17))
+        })
+        .or_else(|| {
+            common_jdk_homes()
+                .into_iter()
+                .find(|home| java_home_major(home).is_some_and(|major| major >= 17))
+        })
+}
+
+fn java_home_major(home: &Path) -> Option<u32> {
+    let release = fs::read_to_string(home.join("release")).ok()?;
+    for line in release.lines() {
+        let Some(version) = line.strip_prefix("JAVA_VERSION=\"") else {
+            continue;
+        };
+        let version = version.trim_end_matches('"');
+        let mut parts = version.split(['.', '_']);
+        let first = parts.next()?.parse::<u32>().ok()?;
+        if first == 1 {
+            return parts.next()?.parse().ok();
+        }
+        return Some(first);
+    }
+    None
+}
+
+fn common_jdk_homes() -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    let mut parents = Vec::new();
+    if let Some(home) = std::env::var_os("USERPROFILE").or_else(|| std::env::var_os("HOME")) {
+        parents.push(PathBuf::from(&home).join(".jdks"));
+    }
+    if cfg!(windows) {
+        parents.push(PathBuf::from(r"C:\Program Files\Java"));
+        parents.push(PathBuf::from(r"C:\Program Files\Eclipse Adoptium"));
+        parents.push(PathBuf::from(r"C:\Program Files\Microsoft"));
+    } else {
+        parents.push(PathBuf::from("/usr/lib/jvm"));
+        parents.push(PathBuf::from("/Library/Java/JavaVirtualMachines"));
+    }
+
+    for parent in parents {
+        let Ok(entries) = fs::read_dir(parent) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.join("bin").join(java_exe("java")).is_file() {
+                homes.push(path.clone());
+            }
+            let bundled = path.join("Contents").join("Home");
+            if bundled.join("bin").join(java_exe("java")).is_file() {
+                homes.push(bundled);
+            }
+        }
+    }
+    homes
+}
+
+fn path_with_java_home(java_home: &Path) -> Option<std::ffi::OsString> {
+    let mut paths = vec![java_home.join("bin")];
+    if let Some(existing) = std::env::var_os("PATH") {
+        paths.extend(std::env::split_paths(&existing));
+    }
+    std::env::join_paths(paths).ok()
+}
+
+fn java_exe(name: &str) -> std::ffi::OsString {
+    if cfg!(windows) {
+        format!("{name}.exe").into()
+    } else {
+        name.into()
+    }
 }
 
 fn terminate_process(pid: u32) {
@@ -1061,6 +1080,79 @@ fn jdi_step_over_returns_step_event_with_stack_and_locals() {
 }
 
 #[test]
+fn jdi_eval_set_and_force_return_execute_in_stopped_frame() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("EvalMutationTest.java");
+    let target = start_jdwp_fixture("EvalMutationTest");
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::attach(
+        "127.0.0.1",
+        target.port,
+        &sourcepath,
+        "jdi-eval-set-force-return".into(),
+        None,
+    )
+    .expect("JDI attach failed");
+
+    session
+        .stop_at("EvalMutationTest", 26, None)
+        .expect("JDI breakpoint failed");
+    let stop = session.cont(Some(30)).expect("JDI cont failed");
+    assert!(
+        matches!(stop.result, CommandResult::Stopped { .. }),
+        "expected breakpoint stop, got {:?}",
+        stop.result
+    );
+
+    let evaluated = session
+        .evaluate("box.add(values[1]) + local + EvalMutationTest.staticAdd(1, 2)")
+        .expect("JDI expression eval failed");
+    match &evaluated.result {
+        CommandResult::Value { expr, value, .. } => {
+            assert_eq!(
+                expr,
+                "box.add(values[1]) + local + EvalMutationTest.staticAdd(1, 2)"
+            );
+            assert_eq!(value, "15");
+        }
+        other => panic!("expected JDI Value result, got {other:?}"),
+    }
+
+    session
+        .set_value("box.count", "10")
+        .expect("JDI field set failed");
+    session
+        .set_value("values[1]", "5")
+        .expect("JDI array set failed");
+    session
+        .force_return("123")
+        .expect("JDI force return failed");
+    session
+        .stop_at("EvalMutationTest", 19, None)
+        .expect("JDI post-return breakpoint failed");
+    let post_return = session
+        .cont(Some(30))
+        .expect("JDI cont after force return failed");
+    assert!(
+        matches!(post_return.result, CommandResult::Stopped { .. }),
+        "expected post-return breakpoint stop, got {:?}",
+        post_return.result
+    );
+
+    for (expr, expected) in [("result", "123"), ("box.count", "10"), ("values[1]", "5")] {
+        let value = session.evaluate(expr).expect("JDI post-return eval failed");
+        match &value.result {
+            CommandResult::Value { value, .. } => assert_eq!(value, expected, "{expr}"),
+            other => panic!("expected Value for {expr}, got {other:?}"),
+        }
+    }
+
+    let _ = session.kill();
+}
+
+#[test]
 fn jdi_watchpoint_modification_hit() {
     use java_agent_debugger::jdi::session::JdiSession;
 
@@ -1387,6 +1479,166 @@ fn mcp_jdi_attach_breakpoint_locals_and_inspect_smoke() {
     assert!(inspect.contains("\"kind\": \"object\""), "{inspect}");
     assert!(inspect.contains("\"kind\": \"collection\""), "{inspect}");
     let kill = mcp_text(mcp_response(&responses, 7));
+    assert!(kill.contains("killed"), "{kill}");
+}
+
+#[test]
+fn mcp_jdi_eval_set_force_return_smoke() {
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("EvalMutationTest.java");
+    let target = start_jdwp_fixture("EvalMutationTest");
+    let guard = TestDaemonGuard::new("mcp-jdi-eval-set-force-return");
+    let sourcepath = fixture_dir().display().to_string();
+    let messages = vec![
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-06-18",
+                "capabilities": {},
+                "clientInfo": {"name": "jdbg-test", "version": "0"}
+            }
+        }),
+        json!({"jsonrpc": "2.0", "method": "notifications/initialized"}),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "attach",
+                "arguments": {
+                    "backend": "jdi",
+                    "host": "127.0.0.1",
+                    "port": target.port,
+                    "sourcepath": sourcepath
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 3,
+            "method": "tools/call",
+            "params": {
+                "name": "break_at",
+                "arguments": {"class": "EvalMutationTest", "line": 26}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 4,
+            "method": "tools/call",
+            "params": {
+                "name": "cont",
+                "arguments": {"timeout": 10}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 5,
+            "method": "tools/call",
+            "params": {
+                "name": "print",
+                "arguments": {
+                    "expr": "box.add(values[1]) + local + EvalMutationTest.staticAdd(1, 2)"
+                }
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "set",
+                "arguments": {"lvalue": "box.count", "value": "10"}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 7,
+            "method": "tools/call",
+            "params": {
+                "name": "set",
+                "arguments": {"lvalue": "values[1]", "value": "5"}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "force_return",
+                "arguments": {"value": "123"}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 9,
+            "method": "tools/call",
+            "params": {
+                "name": "break_at",
+                "arguments": {"class": "EvalMutationTest", "line": 19}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 10,
+            "method": "tools/call",
+            "params": {
+                "name": "cont",
+                "arguments": {"timeout": 10}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 11,
+            "method": "tools/call",
+            "params": {
+                "name": "eval",
+                "arguments": {"expr": "result"}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 12,
+            "method": "tools/call",
+            "params": {
+                "name": "inspect",
+                "arguments": {"expr": "box", "max_elements": 2}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 13,
+            "method": "tools/call",
+            "params": {"name": "kill", "arguments": {}}
+        }),
+    ];
+
+    let responses = run_mcp_jsonrpc(&messages, &guard);
+    for id in 2..=13 {
+        assert_mcp_success(mcp_response(&responses, id));
+    }
+
+    let printed = mcp_text(mcp_response(&responses, 5));
+    assert!(printed.contains("= 15"), "{printed}");
+    let set_field = mcp_text(mcp_response(&responses, 6));
+    assert!(set_field.contains("box.count = 10"), "{set_field}");
+    let set_array = mcp_text(mcp_response(&responses, 7));
+    assert!(set_array.contains("values[1] = 5"), "{set_array}");
+    let forced = mcp_text(mcp_response(&responses, 8));
+    assert!(
+        forced.contains("Forced current method to return 123"),
+        "{forced}"
+    );
+    let stopped = mcp_text(mcp_response(&responses, 10));
+    assert!(stopped.contains("Breakpoint hit"), "{stopped}");
+    let result = mcp_text(mcp_response(&responses, 11));
+    assert!(result.contains("= 123"), "{result}");
+    let inspect = mcp_text(mcp_response(&responses, 12));
+    assert!(inspect.contains("\"name\": \"count\""), "{inspect}");
+    assert!(inspect.contains("\"value\": \"10\""), "{inspect}");
+    let kill = mcp_text(mcp_response(&responses, 13));
     assert!(kill.contains("killed"), "{kill}");
 }
 

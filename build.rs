@@ -3,13 +3,22 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-const SIDECAR_MAIN: &str = "dev.jdbg.sidecar.SidecarMain";
 const SIDECAR_JAR: &str = "jdbg-jdi-sidecar.jar";
+const MIN_GRADLE_JAVA_MAJOR: u32 = 17;
 
 fn main() {
     println!("cargo:rerun-if-env-changed=JAVA_HOME");
+    println!("cargo:rerun-if-env-changed=JDBG_GRADLE_JAVA_HOME");
     println!("cargo:rerun-if-env-changed=JDBG_SKIP_JDI_SIDECAR_BUILD");
-    println!("cargo:rerun-if-changed=sidecar/jdi/src/main/java");
+    println!("cargo:rerun-if-changed=sidecar/jdi/build.gradle");
+    println!("cargo:rerun-if-changed=sidecar/jdi/settings.gradle");
+    println!("cargo:rerun-if-changed=sidecar/jdi/gradle/wrapper/gradle-wrapper.properties");
+    let java_src_dir = Path::new("sidecar")
+        .join("jdi")
+        .join("src")
+        .join("main")
+        .join("java");
+    emit_rerun_for_dir(&java_src_dir);
 
     if env::var_os("JDBG_SKIP_JDI_SIDECAR_BUILD").is_some() {
         println!(
@@ -18,51 +27,53 @@ fn main() {
         return;
     }
 
-    let Some(javac) = find_java_tool("javac") else {
-        println!("cargo:warning=javac not found; JDI sidecar jar will not be built");
+    let Some(gradle_java_home) = find_gradle_java_home() else {
+        println!(
+            "cargo:warning=JDK {MIN_GRADLE_JAVA_MAJOR}+ not found; JDI sidecar jar will not be built"
+        );
         return;
     };
-    let Some(jar) = find_java_tool("jar") else {
-        println!("cargo:warning=jar not found; JDI sidecar jar will not be built");
-        return;
-    };
-
-    let source_root = PathBuf::from("sidecar")
-        .join("jdi")
-        .join("src")
-        .join("main")
-        .join("java");
-    let sources = java_sources(&source_root);
-    if sources.is_empty() {
-        println!("cargo:warning=no JDI sidecar Java sources found");
-        return;
-    }
 
     let out_dir = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR set by cargo"));
-    let classes_dir = out_dir.join("jdi-sidecar-classes");
     let profile_dir = profile_dir_from_out_dir(&out_dir);
     let jar_path = profile_dir.join(SIDECAR_JAR);
+    let sidecar_dir = PathBuf::from("sidecar").join("jdi");
 
-    let _ = std::fs::remove_dir_all(&classes_dir);
-    std::fs::create_dir_all(&classes_dir).expect("create sidecar classes dir");
-
-    let mut javac_cmd = Command::new(&javac);
-    javac_cmd.arg("-encoding").arg("UTF-8");
-    if let Some(tools_jar) = tools_jar() {
-        javac_cmd.arg("-cp").arg(tools_jar);
+    let mut gradle_cmd = Command::new(gradle_wrapper_path(&sidecar_dir));
+    gradle_cmd
+        .current_dir(&sidecar_dir)
+        .arg("--no-daemon")
+        .arg("jar")
+        .env("JAVA_HOME", &gradle_java_home);
+    if let Some(path) = gradle_path_with_java_home(&gradle_java_home) {
+        gradle_cmd.env("PATH", path);
     }
-    javac_cmd.arg("-d").arg(&classes_dir).args(&sources);
-    run_or_panic(javac_cmd, "javac JDI sidecar");
+    run_or_panic(gradle_cmd, "Gradle JDI sidecar build");
 
-    let mut jar_cmd = Command::new(&jar);
-    jar_cmd
-        .arg("cfe")
-        .arg(&jar_path)
-        .arg(SIDECAR_MAIN)
-        .arg("-C")
-        .arg(&classes_dir)
-        .arg(".");
-    run_or_panic(jar_cmd, "jar JDI sidecar");
+    let built_jar = sidecar_dir.join("build").join("libs").join(SIDECAR_JAR);
+    std::fs::create_dir_all(&profile_dir).expect("create cargo profile dir");
+    std::fs::copy(&built_jar, &jar_path).unwrap_or_else(|e| {
+        panic!(
+            "failed to copy JDI sidecar jar from {} to {}: {e}",
+            built_jar.display(),
+            jar_path.display()
+        )
+    });
+}
+
+fn emit_rerun_for_dir(dir: &Path) {
+    println!("cargo:rerun-if-changed={}", dir.display());
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            emit_rerun_for_dir(&path);
+        } else {
+            println!("cargo:rerun-if-changed={}", path.display());
+        }
+    }
 }
 
 fn run_or_panic(mut command: Command, label: &str) {
@@ -79,15 +90,12 @@ fn run_or_panic(mut command: Command, label: &str) {
     }
 }
 
-fn find_java_tool(name: &str) -> Option<PathBuf> {
-    let exe = java_exe_name(name);
-    if let Some(home) = env::var_os("JAVA_HOME") {
-        let candidate = PathBuf::from(home).join("bin").join(&exe);
-        if candidate.is_file() {
-            return Some(candidate);
-        }
-    }
-    find_in_path(&exe)
+fn gradle_wrapper_path(sidecar_dir: &Path) -> PathBuf {
+    sidecar_dir.join(if cfg!(windows) {
+        "gradlew.bat"
+    } else {
+        "gradlew"
+    })
 }
 
 fn java_exe_name(name: &str) -> OsString {
@@ -98,38 +106,90 @@ fn java_exe_name(name: &str) -> OsString {
     }
 }
 
-fn find_in_path(exe: &OsString) -> Option<PathBuf> {
-    let path = env::var_os("PATH")?;
-    env::split_paths(&path)
-        .map(|dir| dir.join(exe))
-        .find(|candidate| candidate.is_file())
-}
+fn find_gradle_java_home() -> Option<PathBuf> {
+    if let Some(home) = env::var_os("JDBG_GRADLE_JAVA_HOME").map(PathBuf::from) {
+        if java_home_major(&home).is_some_and(|major| major >= MIN_GRADLE_JAVA_MAJOR) {
+            return Some(home);
+        }
+        panic!(
+            "JDBG_GRADLE_JAVA_HOME must point to JDK {MIN_GRADLE_JAVA_MAJOR}+; got {}",
+            home.display()
+        );
+    }
 
-fn tools_jar() -> Option<PathBuf> {
-    env::var_os("JAVA_HOME")
-        .map(PathBuf::from)
-        .map(|home| home.join("lib").join("tools.jar"))
-        .filter(|path| path.is_file())
-}
-
-fn java_sources(root: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    collect_java_sources(root, &mut out);
-    out
-}
-
-fn collect_java_sources(dir: &Path, out: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            collect_java_sources(&path, out);
-        } else if path.extension().is_some_and(|ext| ext == "java") {
-            out.push(path);
+    if let Some(home) = env::var_os("JAVA_HOME").map(PathBuf::from) {
+        if java_home_major(&home).is_some_and(|major| major >= MIN_GRADLE_JAVA_MAJOR) {
+            return Some(home);
         }
     }
+
+    common_jdk_homes()
+        .into_iter()
+        .find(|home| java_home_major(home).is_some_and(|major| major >= MIN_GRADLE_JAVA_MAJOR))
+}
+
+fn java_home_major(home: &Path) -> Option<u32> {
+    let release = std::fs::read_to_string(home.join("release")).ok()?;
+    for line in release.lines() {
+        let Some(version) = line.strip_prefix("JAVA_VERSION=\"") else {
+            continue;
+        };
+        let version = version.trim_end_matches('"');
+        let mut parts = version.split(['.', '_']);
+        let first = parts.next()?.parse::<u32>().ok()?;
+        if first == 1 {
+            return parts.next()?.parse().ok();
+        }
+        return Some(first);
+    }
+    None
+}
+
+fn common_jdk_homes() -> Vec<PathBuf> {
+    let mut homes = Vec::new();
+    for parent in common_jdk_parents() {
+        let Ok(entries) = std::fs::read_dir(parent) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.join("bin").join(java_exe_name("java")).is_file() {
+                homes.push(path.clone());
+            }
+            let bundled = path.join("Contents").join("Home");
+            if bundled.join("bin").join(java_exe_name("java")).is_file() {
+                homes.push(bundled);
+            }
+        }
+    }
+    homes
+}
+
+fn common_jdk_parents() -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(home) = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME")) {
+        dirs.push(PathBuf::from(&home).join(".jdks"));
+    }
+    #[cfg(windows)]
+    {
+        dirs.push(PathBuf::from(r"C:\Program Files\Java"));
+        dirs.push(PathBuf::from(r"C:\Program Files\Eclipse Adoptium"));
+        dirs.push(PathBuf::from(r"C:\Program Files\Microsoft"));
+    }
+    #[cfg(not(windows))]
+    {
+        dirs.push(PathBuf::from("/usr/lib/jvm"));
+        dirs.push(PathBuf::from("/Library/Java/JavaVirtualMachines"));
+    }
+    dirs
+}
+
+fn gradle_path_with_java_home(java_home: &Path) -> Option<OsString> {
+    let mut paths = vec![java_home.join("bin")];
+    if let Some(existing) = env::var_os("PATH") {
+        paths.extend(env::split_paths(&existing));
+    }
+    env::join_paths(paths).ok()
 }
 
 fn profile_dir_from_out_dir(out_dir: &Path) -> PathBuf {

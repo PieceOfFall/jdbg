@@ -245,7 +245,7 @@ jdbg update
 
 ## MCP Server
 
-`jdbg __mcp` runs an rmcp-based stdio MCP server exposing the debugger as 36 native tools.
+`jdbg __mcp` runs an rmcp-based stdio MCP server exposing the debugger as 37 native tools.
 The MCP layer is a thin daemon client: it maps tool calls to the same command protocol used by the CLI, then renders the same results.
 
 <table>
@@ -267,7 +267,7 @@ The MCP layer is a thin daemon client: it maps tool calls to the same command pr
   </tr>
   <tr>
     <td><strong>Inspection</strong></td>
-    <td><code>where</code>, <code>locals</code>, <code>print</code>, <code>dump</code>, <code>eval</code>, <code>inspect</code>, <code>threads</code>, <code>thread</code>, <code>frame</code>, <code>list_source</code>, <code>set</code>, <code>lock</code>, <code>threadlocks</code>, <code>raw</code></td>
+    <td><code>where</code>, <code>locals</code>, <code>print</code>, <code>dump</code>, <code>eval</code>, <code>inspect</code>, <code>threads</code>, <code>thread</code>, <code>frame</code>, <code>list_source</code>, <code>set</code>, <code>force_return</code>, <code>lock</code>, <code>threadlocks</code>, <code>raw</code></td>
   </tr>
   <tr>
     <td><strong>Discovery</strong></td>
@@ -349,6 +349,7 @@ jdbg inspect <expr> [--max-elements N]
 jdbg threads | thread <id> | frame <up|down> [n] | list-source [line]
 jdbg suspend [thread-id] | resume [thread-id]
 jdbg set <lvalue> <value>
+jdbg force-return <value>
 jdbg lock <expr> | thread-locks [thread-id]
 jdbg raw <jdb command...>
 
@@ -371,8 +372,14 @@ Global flags:
 Backend selection is made only when creating a session. The default `jdb` backend is the compatibility path
 and supports the full command surface. The `jdi` backend is currently attach-only and uses a local Java sidecar
 for structured runtime data; it supports `attach`, `threads`, line `break-at`, `cont`, `next`, `where`, `locals`,
-`thread`, `watch`, `unwatch`, and safe JSON `inspect`. Unsupported JDI commands fail explicitly instead of
-falling back to `jdb`.
+`thread`, `watch`, `unwatch`, safe JSON `inspect`, expression `print`/`eval`/`dump`, `set`, and non-void
+`force-return`. Unsupported JDI commands fail explicitly instead of falling back to `jdb`.
+
+On JDI sessions, `inspect` is intentionally safe and reads fields directly without invoking getters. JDI
+`print`, `eval`, `dump`, `set`, and `force-return` are executable capabilities: method calls may run in the
+target JVM and can have side effects. `set` assigns locals, fields, or array elements by evaluating the right
+hand side as a Java expression. `force-return` evaluates its value expression and forces the current non-void
+method to return it; void force-return is reported as unsupported.
 
 The JDI sidecar message protocol is length-prefixed JSON over platform-local byte streams: two one-way
 Named Pipes on Windows, or an AF_UNIX socketpair on Linux/macOS. The Unix socket is handed to the Java 8
@@ -411,16 +418,18 @@ See [`DESIGN.md`](DESIGN.md) for the full design reference.
 
 | Requirement | Notes |
 |---|---|
-| JDK | JDK 8-21+ with `jdb` on `PATH` or discoverable via `JAVA_HOME`. |
+| Target JDK | JDK 8-21+ with `jdb` on `PATH` or discoverable via `JAVA_HOME`. |
 | Debug info | Compile Java with `javac -g` for locals and reliable line breakpoints. |
 | Rust | Rust 1.85+ only when installing through cargo or building from source. |
+| Source build JDK | JDK 17+ is required to run Gradle and build the JDI sidecar fat jar. Debug targets still support JDK 8+. |
 
 For JDWP attach on JDK 8, start the target with `address=5005` or `address=localhost:5005`.
 `address=*:5005` is JDK 9+ syntax.
 
-When building from source, `cargo build` also builds `jdbg-jdi-sidecar.jar` next to the `jdbg` binary when
-`javac` and `jar` are available. Override sidecar discovery with `JDBG_JDI_SIDECAR_JAR` or the Java runtime
-with `JDBG_JDI_JAVA`.
+When building from source, `cargo build` runs the Gradle wrapper in `sidecar/jdi`, builds the fat jar
+`jdbg-jdi-sidecar.jar`, and copies it next to the `jdbg` binary. Set `JDBG_GRADLE_JAVA_HOME` when the build
+JDK is different from the target/debuggee JDK. Override sidecar discovery with `JDBG_JDI_SIDECAR_JAR` or the
+Java runtime with `JDBG_JDI_JAVA`.
 
 `classes` works without a pattern, but that lists every loaded class; pass a pattern in real application
 servers. `watch --mode all` creates separate access and modification watchpoints on both backends, so

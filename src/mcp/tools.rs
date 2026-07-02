@@ -20,7 +20,7 @@ pub struct ToolSpec {
     pub input_schema: Value,
 }
 
-/// Specs for all 36 tools, used by `tools/list`.
+/// Specs for all 37 tools, used by `tools/list`.
 pub fn tool_specs() -> Vec<ToolSpec> {
     vec![
         // ── Sessions ──
@@ -369,6 +369,17 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             false,
         ),
         tool(
+            "force_return",
+            "Force the current method to return a value in a JDI session. MUTATES control flow; \
+             use only when intentionally testing a branch or bypassing a failing method.",
+            json!({
+                "value": {"type": "string", "description": "Return expression to evaluate in the current suspended frame."}
+            }),
+            &["value"],
+            true,
+            false,
+        ),
+        tool(
             "ignore",
             "Stop catching an exception — removes a breakpoint previously set with `catch`. \
              The mode must match how it was caught.",
@@ -509,6 +520,9 @@ pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> 
         },
         "set" => Command::Set {
             lvalue: require_str(args, "lvalue")?,
+            value: require_str(args, "value")?,
+        },
+        "force_return" => Command::ForceReturn {
             value: require_str(args, "value")?,
         },
         "ignore" => Command::Ignore {
@@ -653,8 +667,8 @@ mod tests {
     use serde_json::json;
 
     #[test]
-    fn exposes_36_tools() {
-        assert_eq!(tool_specs().len(), 36);
+    fn exposes_37_tools() {
+        assert_eq!(tool_specs().len(), 37);
     }
 
     #[test]
@@ -1053,6 +1067,17 @@ mod tests {
     #[test]
     fn set_missing_value_is_error() {
         assert!(dispatch_tool("set", &json!({"lvalue": "x"})).is_err());
+    }
+
+    #[test]
+    fn force_return_maps_value() {
+        match dispatch_tool("force_return", &json!({"value": "123"}))
+            .unwrap()
+            .cmd
+        {
+            Command::ForceReturn { value } => assert_eq!(value, "123"),
+            other => panic!("expected ForceReturn, got {other:?}"),
+        }
     }
 
     #[test]

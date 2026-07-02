@@ -1,0 +1,38 @@
+plugins {
+    id 'java'
+}
+
+group = 'dev.jdbg'
+version = '1.0.0'
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_1_8
+    targetCompatibility = JavaVersion.VERSION_1_8
+}
+
+dependencies {
+    implementation 'com.github.javaparser:javaparser-core:3.28.2'
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+}
+
+jar {
+    archiveFileName = 'jdbg-jdi-sidecar.jar'
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest {
+        attributes 'Main-Class': 'dev.jdbg.sidecar.SidecarMain'
+    }
+    from {
+        configurations.runtimeClasspath.collect { dep ->
+            dep.isDirectory() ? dep : zipTree(dep)
+        }
+    }
+}
+
+tasks.register('selfTest', JavaExec) {
+    dependsOn testClasses
+    classpath = sourceSets.test.runtimeClasspath
+    mainClass = 'dev.jdbg.sidecar.SidecarSelfTest'
+}

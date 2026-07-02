@@ -284,6 +284,11 @@ pub enum Commands {
         /// Right-hand side expression (e.g. "42", "\"hello\"", "null").
         value: String,
     },
+    /// Force the current method to return a value (JDI backend only).
+    ForceReturn {
+        /// Return expression for the current method.
+        value: String,
+    },
     /// Stop catching an exception (removes a `catch` breakpoint).
     Ignore {
         /// Exception class name or pattern.

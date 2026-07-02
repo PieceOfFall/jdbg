@@ -316,6 +316,107 @@ impl JdiSession {
         })
     }
 
+    pub fn evaluate(&self, expr: &str) -> Result<CommandResponse> {
+        self.require_suspended("evaluate expression")?;
+        let value = request(
+            &self.sidecar,
+            "evaluateExpression",
+            json!({
+                "session": self.meta.id,
+                "expr": expr,
+            }),
+            SIDECAR_REQUEST_TIMEOUT,
+        )?;
+        let payload: EvalPayload = serde_json::from_value(value)
+            .map_err(|e| Error::Connection(format!("invalid JDI evaluate response: {e}")))?;
+        Ok(CommandResponse {
+            result: CommandResult::Value {
+                expr: payload.expr,
+                value: payload.value,
+                ty: payload.ty,
+            },
+            stderr: self.sidecar.take_stderr(),
+            note: Some("JDI print/eval may invoke methods and mutate target state.".into()),
+        })
+    }
+
+    pub fn dump(&self, expr: &str, max_elements: u32) -> Result<CommandResponse> {
+        self.require_suspended("dump expression")?;
+        let value = request(
+            &self.sidecar,
+            "renderExpression",
+            json!({
+                "session": self.meta.id,
+                "expr": expr,
+                "limits": {
+                    "maxDepth": 3,
+                    "maxFields": 100,
+                    "maxArrayLength": max_elements.min(50),
+                    "maxStringLength": 4096,
+                    "maxTotalBytes": 8 * 1024 * 1024,
+                    "maxObjects": 1000
+                }
+            }),
+            SIDECAR_REQUEST_TIMEOUT,
+        )?;
+        let text = serde_json::to_string_pretty(&value).unwrap_or_else(|_| value.to_string());
+        Ok(CommandResponse {
+            result: CommandResult::Raw { text },
+            stderr: self.sidecar.take_stderr(),
+            note: Some("JDI dump evaluates the expression before rendering fields.".into()),
+        })
+    }
+
+    pub fn set_value(&self, lvalue: &str, value_expr: &str) -> Result<CommandResponse> {
+        self.require_suspended("set value")?;
+        let value = request(
+            &self.sidecar,
+            "setValue",
+            json!({
+                "session": self.meta.id,
+                "lvalue": lvalue,
+                "value": value_expr,
+            }),
+            SIDECAR_REQUEST_TIMEOUT,
+        )?;
+        let payload: SetPayload = serde_json::from_value(value)
+            .map_err(|e| Error::Connection(format!("invalid JDI setValue response: {e}")))?;
+        Ok(CommandResponse {
+            result: CommandResult::Raw {
+                text: format!("{} = {}", payload.lvalue, payload.value),
+            },
+            stderr: self.sidecar.take_stderr(),
+            note: payload
+                .ty
+                .map(|ty| format!("JDI setValue evaluated and assigned a {ty} value.")),
+        })
+    }
+
+    pub fn force_return(&self, value_expr: &str) -> Result<CommandResponse> {
+        self.require_suspended("force return")?;
+        let value = request(
+            &self.sidecar,
+            "forceReturn",
+            json!({
+                "session": self.meta.id,
+                "value": value_expr,
+            }),
+            SIDECAR_REQUEST_TIMEOUT,
+        )?;
+        let payload: ForceReturnPayload = serde_json::from_value(value)
+            .map_err(|e| Error::Connection(format!("invalid JDI forceReturn response: {e}")))?;
+        Ok(CommandResponse {
+            result: CommandResult::Raw {
+                text: format!("Forced current method to return {}", payload.value),
+            },
+            stderr: self.sidecar.take_stderr(),
+            note: Some(
+                "Current JDI frame/value references are invalid after force_return; subsequent commands re-read stop state."
+                    .into(),
+            ),
+        })
+    }
+
     pub fn unsupported(&self, operation: &str) -> Error {
         Error::UnsupportedBackend {
             backend: "jdi".into(),
@@ -347,6 +448,21 @@ impl JdiSession {
         )?;
         let response = self.stop_response_from_value(value)?;
         Ok(response)
+    }
+
+    fn require_suspended(&self, operation: &str) -> Result<()> {
+        self.drain_events();
+        let state = self.inner.lock().expect("jdi session mutex poisoned").state;
+        match state {
+            RunState::Suspended => Ok(()),
+            RunState::Dead | RunState::Exited => Err(Error::SessionDead(format!(
+                "session {} is {:?}",
+                self.meta.id, state
+            ))),
+            other => Err(Error::Connection(format!(
+                "JDI {operation} requires a suspended stop site; current state is {other:?}"
+            ))),
+        }
     }
 
     fn stop_response_from_value(&self, value: Value) -> Result<CommandResponse> {
@@ -495,6 +611,27 @@ struct WatchpointPayload {
     deferred: bool,
     #[serde(default)]
     note: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EvalPayload {
+    expr: String,
+    value: String,
+    #[serde(default, rename = "type")]
+    ty: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SetPayload {
+    lvalue: String,
+    value: String,
+    #[serde(default, rename = "type")]
+    ty: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ForceReturnPayload {
+    value: String,
 }
 
 #[derive(Debug, Deserialize)]

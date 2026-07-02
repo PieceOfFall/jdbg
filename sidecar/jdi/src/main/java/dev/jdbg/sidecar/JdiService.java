@@ -85,6 +85,14 @@ final class JdiService {
                 return session(params).selectThread(Json.string(params, "threadId"));
             case "inspect":
                 return session(params).inspect(params);
+            case "evaluateExpression":
+                return session(params).evaluateExpression(params);
+            case "renderExpression":
+                return session(params).renderExpression(params);
+            case "setValue":
+                return session(params).setValue(params);
+            case "forceReturn":
+                return session(params).forceReturn(params);
             case "shutdown":
                 shutdown();
                 return Json.object("ok", true);
@@ -344,6 +352,50 @@ final class JdiService {
             );
         }
 
+        Object evaluateExpression(Map<String, Object> params) throws RpcException {
+            String expr = Json.string(params, "expr");
+            EvaluationContext context = evaluationContext();
+            Value value = new ExpressionEvaluator(vm, context.thread, context.frame).evaluate(expr);
+            return Json.object(
+                    "expr", expr,
+                    "value", ValueRenderer.display(value),
+                    "type", value == null ? null : value.type().name()
+            );
+        }
+
+        Object renderExpression(Map<String, Object> params) throws RpcException {
+            String expr = Json.string(params, "expr");
+            Map<String, Object> limits = Json.asObject(params.get("limits"), "limits");
+            EvaluationContext context = evaluationContext();
+            Value value = new ExpressionEvaluator(vm, context.thread, context.frame).evaluate(expr);
+            return Json.object(
+                    "expr", expr,
+                    "value", ValueRenderer.render(value, limits)
+            );
+        }
+
+        Object setValue(Map<String, Object> params) throws RpcException {
+            String lvalue = Json.string(params, "lvalue");
+            String valueExpr = Json.string(params, "value");
+            EvaluationContext context = evaluationContext();
+            Value value = new ExpressionEvaluator(vm, context.thread, context.frame).setValue(lvalue, valueExpr);
+            return Json.object(
+                    "lvalue", lvalue,
+                    "value", ValueRenderer.display(value),
+                    "type", value == null ? null : value.type().name()
+            );
+        }
+
+        Object forceReturn(Map<String, Object> params) throws RpcException {
+            String valueExpr = Json.string(params, "value");
+            EvaluationContext context = evaluationContext();
+            Value value = new ExpressionEvaluator(vm, context.thread, context.frame).forceReturn(valueExpr);
+            return Json.object(
+                    "value", ValueRenderer.display(value),
+                    "type", value == null ? null : value.type().name()
+            );
+        }
+
         void detach() {
             try {
                 resumeFromStop();
@@ -582,6 +634,15 @@ final class JdiService {
 
         private StackFrame currentFrame() throws RpcException {
             ThreadReference thread = currentThread();
+            return frame(thread);
+        }
+
+        private EvaluationContext evaluationContext() throws RpcException {
+            ThreadReference thread = currentThread();
+            return new EvaluationContext(thread, frame(thread));
+        }
+
+        private StackFrame frame(ThreadReference thread) throws RpcException {
             try {
                 if (thread.frameCount() == 0) {
                     throw new RpcException("empty_stack", "current thread has no stack frames");
@@ -766,6 +827,16 @@ final class JdiService {
             this.spec = spec;
             this.className = className;
             this.fieldName = fieldName;
+        }
+    }
+
+    private static final class EvaluationContext {
+        final ThreadReference thread;
+        final StackFrame frame;
+
+        EvaluationContext(ThreadReference thread, StackFrame frame) {
+            this.thread = thread;
+            this.frame = frame;
         }
     }
 
