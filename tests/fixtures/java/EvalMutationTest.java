@@ -1,8 +1,6 @@
 public class EvalMutationTest {
     static final class Box {
         int count;
-        String phase;
-        String afterCompute;
 
         int add(int value) {
             return count + value;
@@ -18,14 +16,12 @@ public class EvalMutationTest {
         box.count = 4;
         int[] values = new int[] {1, 2, 3};
         int result = compute(box, values);
-        box.afterCompute = "returned";
         System.out.println("result=" + result + " count=" + box.count + " value1=" + values[1]);
         Thread.sleep(300000);
     }
 
     static int compute(Box box, int[] values) {
         int local = 6;
-        box.phase = "compute";
         int before = box.add(values[1]);
         return before + local;
     }
