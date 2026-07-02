@@ -1106,53 +1106,23 @@ fn jdi_eval_set_and_force_return_execute_in_stopped_frame() {
     .expect("JDI attach failed");
 
     session
-        .stop_at("EvalMutationTest", 18, None)
-        .expect("JDI main-call breakpoint failed");
-    let main_stop = session.cont(Some(30)).expect("JDI cont to main failed");
-    assert!(
-        matches!(main_stop.result, CommandResult::Stopped { .. }),
-        "expected main-call breakpoint stop, got {:?}",
-        main_stop.result
-    );
-
-    session
-        .stop_at("EvalMutationTest", 24, None)
-        .expect("JDI compute breakpoint failed");
+        .watch("EvalMutationTest.gate", "modification")
+        .expect("JDI compute gate watch failed");
     let stop = session.cont(Some(30)).expect("JDI cont to compute failed");
-    assert!(
-        matches!(stop.result, CommandResult::Stopped { .. }),
-        "expected compute breakpoint stop, got {:?}",
-        stop.result
-    );
-    let first_step = session.next(Some(30)).expect("JDI first step-over failed");
-    match &first_step.result {
+    match &stop.result {
         CommandResult::Stopped {
-            event, location, ..
+            event: Event::FieldWatch {
+                field, access_type, ..
+            },
+            location,
+            ..
         } => {
-            assert!(matches!(event, Event::Step { .. }));
+            assert_eq!(field, "EvalMutationTest.gate");
+            assert_eq!(access_type, "modified");
             assert_eq!(location.class, "EvalMutationTest");
             assert_eq!(location.method, "compute");
-            assert!(
-                (24..=25).contains(&location.line),
-                "expected first step-over to remain near local setup, got {location:?}"
-            );
         }
-        other => panic!("expected first step stop in compute, got {other:?}"),
-    }
-    let step = session.next(Some(30)).expect("JDI second step-over failed");
-    match &step.result {
-        CommandResult::Stopped {
-            event, location, ..
-        } => {
-            assert!(matches!(event, Event::Step { .. }));
-            assert_eq!(location.class, "EvalMutationTest");
-            assert_eq!(location.method, "compute");
-            assert!(
-                (25..=26).contains(&location.line),
-                "expected step-over to remain near the compute return site, got {location:?}"
-            );
-        }
-        other => panic!("expected step stop at return line, got {other:?}"),
+        other => panic!("expected compute gate FieldWatch stop, got {other:?}"),
     }
 
     let evaluated = session
@@ -1176,19 +1146,28 @@ fn jdi_eval_set_and_force_return_execute_in_stopped_frame() {
         .set_value("values[1]", "5")
         .expect("JDI array set failed");
     session
+        .watch("EvalMutationTest.afterCompute", "modification")
+        .expect("JDI post-return watch failed");
+    session
         .force_return("123")
         .expect("JDI force return failed");
-    session
-        .stop_at("EvalMutationTest", 19, None)
-        .expect("JDI post-return breakpoint failed");
     let post_return = session
         .cont(Some(30))
         .expect("JDI cont after force return failed");
-    assert!(
-        matches!(post_return.result, CommandResult::Stopped { .. }),
-        "expected post-return breakpoint stop, got {:?}",
-        post_return.result
-    );
+    match &post_return.result {
+        CommandResult::Stopped {
+            event: Event::FieldWatch {
+                field, access_type, ..
+            },
+            location,
+            ..
+        } => {
+            assert_eq!(field, "EvalMutationTest.afterCompute");
+            assert_eq!(access_type, "modified");
+            assert_eq!(location.class, "EvalMutationTest");
+        }
+        other => panic!("expected post-return FieldWatch stop, got {other:?}"),
+    }
 
     for (expr, expected) in [("result", "123"), ("box.count", "10"), ("values[1]", "5")] {
         let value = session.evaluate(expr).expect("JDI post-return eval failed");
@@ -1569,8 +1548,8 @@ fn mcp_jdi_eval_set_force_return_smoke() {
             "id": 3,
             "method": "tools/call",
             "params": {
-                "name": "break_at",
-                "arguments": {"class": "EvalMutationTest", "line": 18}
+                "name": "watch",
+                "arguments": {"field": "EvalMutationTest.gate", "mode": "modification"}
             }
         }),
         json!({
@@ -1587,42 +1566,6 @@ fn mcp_jdi_eval_set_force_return_smoke() {
             "id": 5,
             "method": "tools/call",
             "params": {
-                "name": "break_at",
-                "arguments": {"class": "EvalMutationTest", "line": 24}
-            }
-        }),
-        json!({
-            "jsonrpc": "2.0",
-            "id": 6,
-            "method": "tools/call",
-            "params": {
-                "name": "cont",
-                "arguments": {"timeout": 10}
-            }
-        }),
-        json!({
-            "jsonrpc": "2.0",
-            "id": 7,
-            "method": "tools/call",
-            "params": {
-                "name": "next",
-                "arguments": {"timeout": 10}
-            }
-        }),
-        json!({
-            "jsonrpc": "2.0",
-            "id": 8,
-            "method": "tools/call",
-            "params": {
-                "name": "next",
-                "arguments": {"timeout": 10}
-            }
-        }),
-        json!({
-            "jsonrpc": "2.0",
-            "id": 9,
-            "method": "tools/call",
-            "params": {
                 "name": "print",
                 "arguments": {
                     "expr": "box.add(values[1]) + local + EvalMutationTest.staticAdd(1, 2)"
@@ -1631,7 +1574,7 @@ fn mcp_jdi_eval_set_force_return_smoke() {
         }),
         json!({
             "jsonrpc": "2.0",
-            "id": 10,
+            "id": 6,
             "method": "tools/call",
             "params": {
                 "name": "set",
@@ -1640,7 +1583,7 @@ fn mcp_jdi_eval_set_force_return_smoke() {
         }),
         json!({
             "jsonrpc": "2.0",
-            "id": 11,
+            "id": 7,
             "method": "tools/call",
             "params": {
                 "name": "set",
@@ -1649,7 +1592,16 @@ fn mcp_jdi_eval_set_force_return_smoke() {
         }),
         json!({
             "jsonrpc": "2.0",
-            "id": 12,
+            "id": 8,
+            "method": "tools/call",
+            "params": {
+                "name": "watch",
+                "arguments": {"field": "EvalMutationTest.afterCompute", "mode": "modification"}
+            }
+        }),
+        json!({
+            "jsonrpc": "2.0",
+            "id": 9,
             "method": "tools/call",
             "params": {
                 "name": "force_return",
@@ -1658,16 +1610,7 @@ fn mcp_jdi_eval_set_force_return_smoke() {
         }),
         json!({
             "jsonrpc": "2.0",
-            "id": 13,
-            "method": "tools/call",
-            "params": {
-                "name": "break_at",
-                "arguments": {"class": "EvalMutationTest", "line": 19}
-            }
-        }),
-        json!({
-            "jsonrpc": "2.0",
-            "id": 14,
+            "id": 10,
             "method": "tools/call",
             "params": {
                 "name": "cont",
@@ -1676,7 +1619,7 @@ fn mcp_jdi_eval_set_force_return_smoke() {
         }),
         json!({
             "jsonrpc": "2.0",
-            "id": 15,
+            "id": 11,
             "method": "tools/call",
             "params": {
                 "name": "eval",
@@ -1685,7 +1628,7 @@ fn mcp_jdi_eval_set_force_return_smoke() {
         }),
         json!({
             "jsonrpc": "2.0",
-            "id": 16,
+            "id": 12,
             "method": "tools/call",
             "params": {
                 "name": "inspect",
@@ -1694,44 +1637,53 @@ fn mcp_jdi_eval_set_force_return_smoke() {
         }),
         json!({
             "jsonrpc": "2.0",
-            "id": 17,
+            "id": 13,
             "method": "tools/call",
             "params": {"name": "kill", "arguments": {}}
         }),
     ];
 
     let responses = run_mcp_jsonrpc(&messages, &guard);
-    for id in 2..=17 {
+    for id in 2..=13 {
         assert_mcp_success(mcp_response(&responses, id));
     }
 
-    let main_stop = mcp_text(mcp_response(&responses, 4));
-    assert!(main_stop.contains("Breakpoint hit"), "{main_stop}");
-    let compute_stop = mcp_text(mcp_response(&responses, 6));
-    assert!(compute_stop.contains("Breakpoint hit"), "{compute_stop}");
-    let first_step = mcp_text(mcp_response(&responses, 7));
-    assert!(first_step.contains("Step completed"), "{first_step}");
-    let second_step = mcp_text(mcp_response(&responses, 8));
-    assert!(second_step.contains("Step completed"), "{second_step}");
-    let printed = mcp_text(mcp_response(&responses, 9));
+    let compute_watch = mcp_text(mcp_response(&responses, 3));
+    assert!(compute_watch.contains("Watch set"), "{compute_watch}");
+    let compute_stop = mcp_text(mcp_response(&responses, 4));
+    assert!(
+        compute_stop.contains("Field watchpoint hit"),
+        "{compute_stop}"
+    );
+    assert!(
+        compute_stop.contains("EvalMutationTest.gate"),
+        "{compute_stop}"
+    );
+    let printed = mcp_text(mcp_response(&responses, 5));
     assert!(printed.contains("= 15"), "{printed}");
-    let set_field = mcp_text(mcp_response(&responses, 10));
+    let set_field = mcp_text(mcp_response(&responses, 6));
     assert!(set_field.contains("box.count = 10"), "{set_field}");
-    let set_array = mcp_text(mcp_response(&responses, 11));
+    let set_array = mcp_text(mcp_response(&responses, 7));
     assert!(set_array.contains("values[1] = 5"), "{set_array}");
-    let forced = mcp_text(mcp_response(&responses, 12));
+    let post_watch = mcp_text(mcp_response(&responses, 8));
+    assert!(post_watch.contains("Watch set"), "{post_watch}");
+    let forced = mcp_text(mcp_response(&responses, 9));
     assert!(
         forced.contains("Forced current method to return 123"),
         "{forced}"
     );
-    let stopped = mcp_text(mcp_response(&responses, 14));
-    assert!(stopped.contains("Breakpoint hit"), "{stopped}");
-    let result = mcp_text(mcp_response(&responses, 15));
+    let stopped = mcp_text(mcp_response(&responses, 10));
+    assert!(stopped.contains("Field watchpoint hit"), "{stopped}");
+    assert!(
+        stopped.contains("EvalMutationTest.afterCompute"),
+        "{stopped}"
+    );
+    let result = mcp_text(mcp_response(&responses, 11));
     assert!(result.contains("= 123"), "{result}");
-    let inspect = mcp_text(mcp_response(&responses, 16));
+    let inspect = mcp_text(mcp_response(&responses, 12));
     assert!(inspect.contains("\"name\": \"count\""), "{inspect}");
     assert!(inspect.contains("\"value\": \"10\""), "{inspect}");
-    let kill = mcp_text(mcp_response(&responses, 17));
+    let kill = mcp_text(mcp_response(&responses, 13));
     assert!(kill.contains("killed"), "{kill}");
 }
 
