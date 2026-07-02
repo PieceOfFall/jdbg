@@ -127,6 +127,14 @@ jobs:
             curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
             echo "$HOME/.cargo/bin" >> $GITHUB_PATH
           fi
+      - name: "Set up JDK 17 for sidecar build"
+        uses: "actions/setup-java@v4"
+        with:
+          "distribution": "zulu"
+          "java-version": "17"
+      - name: "Capture Gradle JDK"
+        run: "echo \"JDBG_GRADLE_JAVA_HOME=$JAVA_HOME\" >> \"$GITHUB_ENV\""
+        shell: "bash"
       - name: Install dist
         run: ${{ matrix.install_dist.run }}
       # Get the dist-manifest
@@ -139,14 +147,6 @@ jobs:
       - name: Install dependencies
         run: |
           ${{ matrix.packages_install }}
-      - name: Set up JDK 17 for sidecar build
-        uses: actions/setup-java@v4
-        with:
-          distribution: zulu
-          java-version: '17'
-      - name: Capture Gradle JDK
-        shell: bash
-        run: echo "JDBG_GRADLE_JAVA_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
       - name: Build artifacts
         run: |
           # Actually do builds and make zips and whatnot

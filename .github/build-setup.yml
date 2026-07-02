@@ -1,0 +1,8 @@
+- name: Set up JDK 17 for sidecar build
+  uses: actions/setup-java@v4
+  with:
+    distribution: zulu
+    java-version: '17'
+- name: Capture Gradle JDK
+  shell: bash
+  run: echo "JDBG_GRADLE_JAVA_HOME=$JAVA_HOME" >> "$GITHUB_ENV"
