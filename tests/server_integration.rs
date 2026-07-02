@@ -1224,11 +1224,11 @@ fn jdi_launch_breakpoint_run_locals_and_cont() {
     use java_agent_debugger::jdi::session::JdiSession;
 
     let _guard = jdi_e2e_guard();
-    compile_java_fixture("Main.java");
+    compile_java_fixture("JdiLaunchTest.java");
     let classpath = vec![fixture_dir().display().to_string()];
     let sourcepath = vec![fixture_dir().display().to_string()];
     let session = JdiSession::launch(
-        "Main",
+        "JdiLaunchTest",
         &classpath,
         &sourcepath,
         &[],
@@ -1238,9 +1238,9 @@ fn jdi_launch_breakpoint_run_locals_and_cont() {
     .expect("JDI launch failed");
     assert_eq!(session.state(), RunState::Loaded);
 
-    let line = fixture_line("Main.java", "System.out.println(label");
+    let line = fixture_line("JdiLaunchTest.java", "System.out.println(label");
     session
-        .stop_at("Main", line, None)
+        .stop_at("JdiLaunchTest", line, None)
         .expect("JDI launch breakpoint failed");
 
     let stop = session.run(Some(30)).expect("JDI launch run failed");
@@ -1250,7 +1250,7 @@ fn jdi_launch_breakpoint_run_locals_and_cont() {
             location,
             ..
         } => {
-            assert_eq!(location.class, "Main");
+            assert_eq!(location.class, "JdiLaunchTest");
             assert_eq!(location.method, "main");
             assert_eq!(location.line, line);
         }
@@ -1428,11 +1428,11 @@ fn jdi_method_both_stops_on_entry_then_exit() {
 #[test]
 fn mcp_jdi_launch_breakpoint_run_locals_smoke() {
     let _guard = jdi_e2e_guard();
-    compile_java_fixture("Main.java");
+    compile_java_fixture("JdiLaunchTest.java");
     let guard = TestDaemonGuard::new("mcp-jdi-launch-smoke");
     let sourcepath = fixture_dir().display().to_string();
     let classpath = fixture_dir().display().to_string();
-    let line = fixture_line("Main.java", "System.out.println(label");
+    let line = fixture_line("JdiLaunchTest.java", "System.out.println(label");
     let messages = vec![
         json!({
             "jsonrpc": "2.0",
@@ -1453,7 +1453,7 @@ fn mcp_jdi_launch_breakpoint_run_locals_smoke() {
                 "name": "launch",
                 "arguments": {
                     "backend": "jdi",
-                    "main_class": "Main",
+                    "main_class": "JdiLaunchTest",
                     "classpath": classpath,
                     "sourcepath": sourcepath
                 }
@@ -1465,7 +1465,7 @@ fn mcp_jdi_launch_breakpoint_run_locals_smoke() {
             "method": "tools/call",
             "params": {
                 "name": "break_at",
-                "arguments": {"class": "Main", "line": line}
+                "arguments": {"class": "JdiLaunchTest", "line": line}
             }
         }),
         json!({
@@ -1550,11 +1550,13 @@ fn jdb_method_exit_break_in_is_explicitly_unsupported() {
 #[test]
 fn four_concurrent_jdi_cli_clients_debug_distinct_targets() {
     let _guard = jdi_e2e_guard();
-    compile_java_fixture("Main.java");
+    compile_java_fixture("JdiLaunchTest.java");
     let guard = TestDaemonGuard::new("jdi-four-clients");
     let sourcepath = fixture_dir().display().to_string();
-    let line = fixture_line("Main.java", "System.out.println(label");
-    let targets: Vec<_> = (0..4).map(|_| start_jdwp_fixture("Main")).collect();
+    let line = fixture_line("JdiLaunchTest.java", "System.out.println(label");
+    let targets: Vec<_> = (0..4)
+        .map(|_| start_jdwp_fixture("JdiLaunchTest"))
+        .collect();
     let ports: Vec<_> = targets.iter().map(|target| target.port).collect();
 
     let handles: Vec<_> = ports
@@ -1609,7 +1611,7 @@ fn four_concurrent_jdi_cli_clients_debug_distinct_targets() {
                     "--session".into(),
                     session.clone(),
                     "break-at".into(),
-                    "Main".into(),
+                    "JdiLaunchTest".into(),
                     line.to_string(),
                 ]);
                 assert!(breakpoint.contains("Breakpoint set"), "{breakpoint}");
@@ -1622,7 +1624,7 @@ fn four_concurrent_jdi_cli_clients_debug_distinct_targets() {
                     "cont".into(),
                 ]);
                 assert!(stop.contains("Breakpoint hit"), "{stop}");
-                assert!(stop.contains("Main.main()"), "{stop}");
+                assert!(stop.contains("JdiLaunchTest.main()"), "{stop}");
 
                 let locals = run(&["--session".into(), session.clone(), "locals".into()]);
                 assert!(locals.contains("label"), "{locals}");
