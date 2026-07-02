@@ -154,7 +154,7 @@ final class JdiService {
     private final class DebugSession {
         final String id;
         final VirtualMachine vm;
-        final BlockingQueue<Map<String, Object>> stops = new LinkedBlockingQueue<>();
+        final BlockingQueue<StopRecord> stops = new LinkedBlockingQueue<>();
         final List<PendingBreakpoint> pendingBreakpoints = new ArrayList<>();
         final List<PendingWatchpoint> pendingWatchpoints = new ArrayList<>();
         final List<ActiveWatchpoint> activeWatchpoints = new ArrayList<>();
@@ -304,22 +304,25 @@ final class JdiService {
 
         Object continueFor(long timeoutMs) throws RpcException, InterruptedException {
             long deadline = System.currentTimeMillis() + timeoutMs;
-            stops.clear();
-            resumeFromStop();
+            StopRecord stop = pollQueuedStopOrResume();
             while (true) {
-                long remaining = deadline - System.currentTimeMillis();
-                if (remaining <= 0) {
-                    return Json.object("timedOut", true, "partialOutput", "", "state", "running");
-                }
-                Map<String, Object> stop = stops.poll(remaining, TimeUnit.MILLISECONDS);
                 if (stop == null) {
-                    return Json.object("timedOut", true, "partialOutput", "", "state", "running");
+                    long remaining = deadline - System.currentTimeMillis();
+                    if (remaining <= 0) {
+                        return Json.object("timedOut", true, "partialOutput", "", "state", "running");
+                    }
+                    stop = stops.poll(remaining, TimeUnit.MILLISECONDS);
+                    if (stop == null) {
+                        return Json.object("timedOut", true, "partialOutput", "", "state", "running");
+                    }
                 }
-                if ("vmStart".equals(stop.get("event"))) {
-                    resumeFromStop();
+                if ("vmStart".equals(stop.payload.get("event"))) {
+                    resumeStopSet(stop.eventSet);
+                    stop = null;
                     continue;
                 }
-                return stop;
+                selectStop(stop);
+                return stop.payload;
             }
         }
 
@@ -461,25 +464,28 @@ final class JdiService {
         }
 
         private void handleStop(EventSet eventSet, String kind, ThreadReference thread, Location location, String note) {
-            currentStopSet = eventSet;
-            currentThreadId = Long.toString(thread.uniqueID());
             Map<String, Object> stop = stopPayload(kind, thread, location, note);
-            stops.offer(stop);
+            synchronized (this) {
+                currentStopSet = eventSet;
+                currentThreadId = Long.toString(thread.uniqueID());
+                stops.offer(new StopRecord(stop, eventSet));
+            }
             sendEvent(kind, stop);
         }
 
         private void handleWatchStop(EventSet eventSet, WatchpointEvent event, String accessType) {
-            currentStopSet = eventSet;
-            currentThreadId = Long.toString(event.thread().uniqueID());
             Map<String, Object> stop = stopPayload("fieldWatch", event.thread(), event.location(), null);
             stop.put("field", event.field().declaringType().name() + "." + event.field().name());
             stop.put("accessType", accessType);
-            stops.offer(stop);
+            synchronized (this) {
+                currentStopSet = eventSet;
+                currentThreadId = Long.toString(event.thread().uniqueID());
+                stops.offer(new StopRecord(stop, eventSet));
+            }
             sendEvent("fieldWatch", stop);
         }
 
         private void handleVmStart(EventSet eventSet) {
-            currentStopSet = eventSet;
             Map<String, Object> stop = Json.object(
                     "event", "vmStart",
                     "thread", "",
@@ -487,7 +493,10 @@ final class JdiService {
                     "location", Json.object("class", "", "method", "", "file", null, "line", 0),
                     "note", "target VM is suspended at startup"
             );
-            stops.offer(stop);
+            synchronized (this) {
+                currentStopSet = eventSet;
+                stops.offer(new StopRecord(stop, eventSet));
+            }
             sendEvent("vmStart", stop);
         }
 
@@ -518,7 +527,9 @@ final class JdiService {
                     "location", Json.object("class", "", "method", "", "file", null, "line", 0),
                     "message", message
             );
-            stops.offer(payload);
+            synchronized (this) {
+                stops.offer(new StopRecord(payload, null));
+            }
             sendEvent("vmDisconnected", Json.object("message", message));
         }
 
@@ -536,9 +547,39 @@ final class JdiService {
             }
         }
 
-        private void resumeFromStop() {
+        private synchronized StopRecord pollQueuedStopOrResume() {
+            StopRecord stop = stops.poll();
+            if (stop == null) {
+                resumeFromStopLocked();
+            }
+            return stop;
+        }
+
+        private synchronized void selectStop(StopRecord stop) {
+            currentStopSet = stop.eventSet;
+            Object threadId = stop.payload.get("threadId");
+            if (threadId instanceof String) {
+                currentThreadId = (String) threadId;
+            }
+        }
+
+        private synchronized void resumeFromStop() {
+            resumeFromStopLocked();
+        }
+
+        private synchronized void resumeStopSet(EventSet stopSet) {
+            resumeStopSetLocked(stopSet);
+        }
+
+        private void resumeFromStopLocked() {
             EventSet stopSet = currentStopSet;
-            currentStopSet = null;
+            resumeStopSetLocked(stopSet);
+        }
+
+        private void resumeStopSetLocked(EventSet stopSet) {
+            if (currentStopSet == stopSet) {
+                currentStopSet = null;
+            }
             if (stopSet != null) {
                 stopSet.resume();
             } else {
@@ -758,6 +799,16 @@ final class JdiService {
                 return "zombie";
             default:
                 return "unknown";
+        }
+    }
+
+    private static final class StopRecord {
+        final Map<String, Object> payload;
+        final EventSet eventSet;
+
+        StopRecord(Map<String, Object> payload, EventSet eventSet) {
+            this.payload = payload;
+            this.eventSet = eventSet;
         }
     }
 
