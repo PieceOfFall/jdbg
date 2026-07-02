@@ -53,8 +53,10 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -308,6 +310,7 @@ final class JdiService {
         volatile String currentThreadId;
         volatile int currentFrameIndex;
         volatile EventSet currentStopSet;
+        volatile boolean waitingForStopResponse;
         volatile boolean disconnected;
 
         DebugSession(String id, VirtualMachine vm, List<String> sourcePaths) {
@@ -326,7 +329,7 @@ final class JdiService {
             List<Object> threads = Json.array();
             for (ThreadReference thread : vm.allThreads()) {
                 String state = threadState(thread);
-                if (Long.toString(thread.uniqueID()).equals(currentThreadId)) {
+                if (currentStopSet != null && Long.toString(thread.uniqueID()).equals(currentThreadId)) {
                     state = state + " (at breakpoint)";
                 }
                 threads.add(Json.object(
@@ -629,25 +632,35 @@ final class JdiService {
 
         Object continueFor(long timeoutMs) throws RpcException, InterruptedException {
             long deadline = System.currentTimeMillis() + timeoutMs;
-            StopRecord stop = pollQueuedStopOrResume();
-            while (true) {
-                if (stop == null) {
-                    long remaining = deadline - System.currentTimeMillis();
-                    if (remaining <= 0) {
-                        return Json.object("timedOut", true, "partialOutput", "", "state", "running");
-                    }
-                    stop = stops.poll(remaining, TimeUnit.MILLISECONDS);
+            waitingForStopResponse = true;
+            try {
+                StopRecord stop = pollQueuedStopOrResume();
+                while (true) {
                     if (stop == null) {
-                        return Json.object("timedOut", true, "partialOutput", "", "state", "running");
+                        long remaining = deadline - System.currentTimeMillis();
+                        if (remaining <= 0) {
+                            return Json.object("timedOut", true, "partialOutput", "", "state", "running");
+                        }
+                        stop = stops.poll(remaining, TimeUnit.MILLISECONDS);
+                        if (stop == null) {
+                            return Json.object("timedOut", true, "partialOutput", "", "state", "running");
+                        }
                     }
+                    if (!stop.deliverToWaitingRequest && !"vmDisconnected".equals(stop.payload.get("event"))) {
+                        resumeStopSet(stop.eventSet);
+                        stop = null;
+                        continue;
+                    }
+                    if ("vmStart".equals(stop.payload.get("event"))) {
+                        resumeStopSet(stop.eventSet);
+                        stop = null;
+                        continue;
+                    }
+                    selectStop(stop);
+                    return stop.payload;
                 }
-                if ("vmStart".equals(stop.payload.get("event"))) {
-                    resumeStopSet(stop.eventSet);
-                    stop = null;
-                    continue;
-                }
-                selectStop(stop);
-                return stop.payload;
+            } finally {
+                waitingForStopResponse = false;
             }
         }
 
@@ -1000,7 +1013,7 @@ final class JdiService {
                 currentStopSet = eventSet;
                 currentThreadId = Long.toString(thread.uniqueID());
                 currentFrameIndex = 0;
-                stops.offer(new StopRecord(stop, eventSet));
+                stops.offer(new StopRecord(stop, eventSet, waitingForStopResponse));
             }
             sendEvent(kind, stop);
         }
@@ -1013,7 +1026,7 @@ final class JdiService {
                 currentStopSet = eventSet;
                 currentThreadId = Long.toString(event.thread().uniqueID());
                 currentFrameIndex = 0;
-                stops.offer(new StopRecord(stop, eventSet));
+                stops.offer(new StopRecord(stop, eventSet, waitingForStopResponse));
             }
             sendEvent("fieldWatch", stop);
         }
@@ -1032,7 +1045,7 @@ final class JdiService {
                 currentStopSet = eventSet;
                 currentThreadId = Long.toString(event.thread().uniqueID());
                 currentFrameIndex = 0;
-                stops.offer(new StopRecord(stop, eventSet));
+                stops.offer(new StopRecord(stop, eventSet, waitingForStopResponse));
             }
             sendEvent("exception", stop);
             return true;
@@ -1060,7 +1073,7 @@ final class JdiService {
                 currentStopSet = eventSet;
                 currentThreadId = Long.toString(event.thread().uniqueID());
                 currentFrameIndex = 0;
-                stops.offer(new StopRecord(stop, eventSet));
+                stops.offer(new StopRecord(stop, eventSet, waitingForStopResponse));
             }
             sendEvent("methodExit", stop);
             return true;
@@ -1081,7 +1094,7 @@ final class JdiService {
             );
             synchronized (this) {
                 currentStopSet = eventSet;
-                stops.offer(new StopRecord(stop, eventSet));
+                stops.offer(new StopRecord(stop, eventSet, waitingForStopResponse));
             }
             sendEvent("vmStart", stop);
         }
@@ -1114,7 +1127,7 @@ final class JdiService {
                     "message", message
             );
             synchronized (this) {
-                stops.offer(new StopRecord(payload, null));
+                stops.offer(new StopRecord(payload, null, true));
             }
             sendEvent("vmDisconnected", Json.object("message", message));
         }
@@ -1353,16 +1366,12 @@ final class JdiService {
                 candidates.add(location.sourceName());
             } catch (AbsentInformationException ignored) {
             }
-            for (String candidate : candidates) {
-                Path path = Paths.get(candidate);
+            for (Path path : sourceCandidates(sourcePaths, candidates, location.declaringType().name())) {
                 if (path.isAbsolute() && Files.isRegularFile(path)) {
                     return path;
                 }
-                for (String root : sourcePaths) {
-                    Path resolved = Paths.get(root).resolve(candidate);
-                    if (Files.isRegularFile(resolved)) {
-                        return resolved;
-                    }
+                if (Files.isRegularFile(path)) {
+                    return path;
                 }
             }
             throw new RpcException("source_not_found", "source file not found for " + location.declaringType().name());
@@ -1375,6 +1384,56 @@ final class JdiService {
         private String objectLabel(ObjectReference object) {
             return object.referenceType().name() + "@" + object.uniqueID();
         }
+    }
+
+    static List<Path> sourceCandidates(List<String> roots, List<String> locationCandidates, String className) {
+        List<String> candidates = new ArrayList<>();
+        for (String candidate : locationCandidates) {
+            if (candidate != null && !candidate.isEmpty()) {
+                candidates.add(candidate);
+            }
+        }
+        String sourceName = candidates.isEmpty()
+                ? null
+                : Paths.get(candidates.get(candidates.size() - 1)).getFileName().toString();
+        String packagePath = sourcePathFromClassName(className, sourceName);
+        if (packagePath != null && !candidates.contains(packagePath)) {
+            candidates.add(packagePath);
+        }
+
+        Set<Path> out = new LinkedHashSet<>();
+        for (String candidate : candidates) {
+            Path candidatePath = Paths.get(candidate);
+            out.add(candidatePath);
+            for (String root : roots) {
+                if (root == null || root.isEmpty()) {
+                    continue;
+                }
+                Path rootPath = Paths.get(root);
+                out.add(rootPath.resolve(candidate));
+                out.add(rootPath.resolve("src").resolve("main").resolve("java").resolve(candidate));
+                out.add(rootPath.resolve("src").resolve("test").resolve("java").resolve(candidate));
+                out.add(rootPath.resolve("src").resolve("main").resolve("kotlin").resolve(candidate));
+                out.add(rootPath.resolve("src").resolve("test").resolve("kotlin").resolve(candidate));
+            }
+        }
+        return new ArrayList<>(out);
+    }
+
+    private static String sourcePathFromClassName(String className, String sourceName) {
+        if (className == null || className.isEmpty()) {
+            return null;
+        }
+        int nested = className.indexOf('$');
+        String outerClass = nested >= 0 ? className.substring(0, nested) : className;
+        int dot = outerClass.lastIndexOf('.');
+        String simple = dot >= 0 ? outerClass.substring(dot + 1) : outerClass;
+        String fileName = sourceName == null || sourceName.isEmpty() ? simple + ".java" : sourceName;
+        String packageName = dot >= 0 ? outerClass.substring(0, dot) : "";
+        if (packageName.isEmpty()) {
+            return fileName;
+        }
+        return packageName.replace('.', File.separatorChar) + File.separator + fileName;
     }
 
     private static Map<String, Object> frameMap(int index, StackFrame frame) {
@@ -1432,10 +1491,12 @@ final class JdiService {
     private static final class StopRecord {
         final Map<String, Object> payload;
         final EventSet eventSet;
+        final boolean deliverToWaitingRequest;
 
-        StopRecord(Map<String, Object> payload, EventSet eventSet) {
+        StopRecord(Map<String, Object> payload, EventSet eventSet, boolean deliverToWaitingRequest) {
             this.payload = payload;
             this.eventSet = eventSet;
+            this.deliverToWaitingRequest = deliverToWaitingRequest;
         }
     }
 

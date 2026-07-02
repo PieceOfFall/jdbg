@@ -4,6 +4,8 @@ import com.sun.jdi.StringReference;
 import com.sun.jdi.Type;
 
 import java.lang.reflect.Proxy;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.List;
 import java.util.Map;
 
@@ -23,6 +25,7 @@ public final class SidecarSelfTest {
         testValueRendererAppliesStringLimit();
         testMethodSpecMatchesExactNameAndArguments();
         testLaunchMainArgumentQuoting();
+        testSourceCandidatesSearchMavenRoots();
         System.out.println("SidecarSelfTest passed");
     }
 
@@ -185,6 +188,28 @@ public final class SidecarSelfTest {
                 "com.example.Main plain \"two words\" \"quote\\\"inside\" \"slash\\\\inside\"",
                 main,
                 "launch main argument"
+        );
+    }
+
+    private static void testSourceCandidatesSearchMavenRoots() {
+        Path root = Paths.get("mall-portal");
+        List<Path> candidates = JdiService.sourceCandidates(
+                java.util.Arrays.asList(root.toString()),
+                java.util.Arrays.asList("MallPortalApplication.java"),
+                "com.macro.mall.portal.MallPortalApplication"
+        );
+        Path expected = root
+                .resolve("src")
+                .resolve("main")
+                .resolve("java")
+                .resolve("com")
+                .resolve("macro")
+                .resolve("mall")
+                .resolve("portal")
+                .resolve("MallPortalApplication.java");
+        assertTrue(
+                candidates.contains(expected),
+                "source candidates should include Maven src/main/java package path"
         );
     }
 

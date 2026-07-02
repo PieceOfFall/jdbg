@@ -54,6 +54,31 @@ fn fixture_line(source_name: &str, needle: &str) -> u32 {
         })
 }
 
+fn wait_for_jdi_breakpoint_status(
+    session: &java_agent_debugger::jdi::session::JdiSession,
+    line: u32,
+) -> CommandResult {
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        let status = session.status();
+        if matches!(
+            &status,
+            CommandResult::Status {
+                state: RunState::Suspended,
+                last_event: Some(Event::Breakpoint { location, .. }),
+                ..
+            } if location.line == line
+        ) {
+            return status;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "JDI async breakpoint did not update status before deadline; last status: {status:?}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn javac_path() -> PathBuf {
     let exe = if cfg!(windows) { "javac.exe" } else { "javac" };
     jdb_path()
@@ -1577,6 +1602,104 @@ fn jdi_launch_breakpoint_run_locals_and_cont() {
         matches!(exited.result, CommandResult::VmExited { .. }),
         "expected JDI launched VM to exit, got {:?}",
         exited.result
+    );
+
+    let _ = session.kill();
+}
+
+#[test]
+fn jdi_async_breakpoint_after_timeout_updates_status_and_resumes_cleanly() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("AsyncBreakpointTest.java");
+    let classpath = vec![fixture_dir().display().to_string()];
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::launch(
+        "AsyncBreakpointTest",
+        &classpath,
+        &sourcepath,
+        &[],
+        "jdi-async-breakpoint-timeout".into(),
+        None,
+    )
+    .expect("JDI launch failed");
+
+    let line = fixture_line("AsyncBreakpointTest.java", "ASYNC_BREAKPOINT");
+    session
+        .stop_at("AsyncBreakpointTest", line, None)
+        .expect("JDI async breakpoint failed");
+
+    let timed_out = session
+        .run(Some(1))
+        .expect("JDI launch run should return timeout while worker sleeps");
+    assert!(
+        matches!(
+            timed_out.result,
+            CommandResult::Timeout {
+                state: RunState::Running,
+                ..
+            }
+        ),
+        "expected initial run timeout, got {:?}",
+        timed_out.result
+    );
+
+    let status = wait_for_jdi_breakpoint_status(&session, line);
+    match status {
+        CommandResult::Status {
+            state,
+            last_event: Some(Event::Breakpoint { location, thread }),
+            ..
+        } => {
+            assert_eq!(state, RunState::Suspended);
+            assert_eq!(location.class, "AsyncBreakpointTest");
+            assert_eq!(location.method, "hit");
+            assert_eq!(location.line, line);
+            assert_eq!(thread, "delayed-worker");
+        }
+        other => panic!("expected async breakpoint status, got {other:?}"),
+    }
+
+    let stack = session
+        .stack(false)
+        .expect("JDI stack should work after async stop event");
+    match &stack.result {
+        CommandResult::StackTrace { frames } => {
+            let top = frames.first().expect("stack should include top frame");
+            assert_eq!(top.location.class, "AsyncBreakpointTest");
+            assert_eq!(top.location.method, "hit");
+            assert_eq!(top.location.line, line);
+        }
+        other => panic!("expected stack trace after async stop, got {other:?}"),
+    }
+
+    let this_value = session
+        .evaluate("this")
+        .expect("JDI print this should work after async stop event");
+    match &this_value.result {
+        CommandResult::Value { value, .. } => {
+            assert!(
+                value.contains("AsyncBreakpointTest@"),
+                "this should render as AsyncBreakpointTest object, got {value}"
+            );
+        }
+        other => panic!("expected value for this, got {other:?}"),
+    }
+
+    let resumed = session
+        .cont(Some(1))
+        .expect("JDI cont after async stop should resume current stop");
+    assert!(
+        matches!(
+            resumed.result,
+            CommandResult::Timeout {
+                state: RunState::Running,
+                ..
+            }
+        ),
+        "cont should resume the async stop instead of returning it again: {:?}",
+        resumed.result
     );
 
     let _ = session.kill();

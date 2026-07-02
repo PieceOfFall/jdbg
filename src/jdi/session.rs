@@ -9,7 +9,7 @@ use serde_json::{Value, json};
 use crate::error::{Error, Result};
 use crate::jdb::process::normalize_attach_host;
 use crate::jdi::lifecycle::{LaunchedSidecar, launch_sidecar, resolve_sidecar_paths};
-use crate::jdi::transport::SidecarTransportError;
+use crate::jdi::transport::{SidecarEvent, SidecarTransportError};
 use crate::protocol::*;
 
 const SIDECAR_START_TIMEOUT: Duration = Duration::from_secs(10);
@@ -1119,13 +1119,7 @@ impl JdiSession {
         }
         let mut inner = self.inner.lock().expect("jdi session mutex poisoned");
         for event in events {
-            if event.event == "vmDisconnected"
-                && event.session == self.meta.id
-                && !matches!(inner.state, RunState::Dead)
-            {
-                inner.state = RunState::Exited;
-                inner.last_event = Some(Event::VmExit);
-            }
+            apply_sidecar_event(&mut inner, event, &self.meta.id);
         }
         if !sidecar_alive && !matches!(inner.state, RunState::Dead | RunState::Exited) {
             inner.state = RunState::Dead;
@@ -1315,6 +1309,37 @@ fn event_from_stop_payload(payload: &StopPayload) -> Result<(Event, RunState)> {
     }
 }
 
+fn apply_sidecar_event(inner: &mut JdiSessionInner, event: SidecarEvent, session_id: &str) {
+    if event.session != session_id {
+        return;
+    }
+    if event.event == "vmDisconnected" {
+        if !matches!(inner.state, RunState::Dead) {
+            inner.state = RunState::Exited;
+            inner.last_event = Some(Event::VmExit);
+        }
+        return;
+    }
+    if !is_stop_event(&event.event) || matches!(inner.state, RunState::Dead | RunState::Exited) {
+        return;
+    }
+    let Ok(payload) = serde_json::from_value::<StopPayload>(event.payload) else {
+        return;
+    };
+    let Ok((next_event, state)) = event_from_stop_payload(&payload) else {
+        return;
+    };
+    inner.state = state;
+    inner.last_event = Some(next_event);
+}
+
+fn is_stop_event(event: &str) -> bool {
+    matches!(
+        event,
+        "breakpoint" | "methodEntry" | "methodExit" | "step" | "fieldWatch" | "exception"
+    )
+}
+
 #[cfg(test)]
 fn payload_to_event_for_test(payload: &StopPayload) -> Result<Event> {
     event_from_stop_payload(payload).map(|(event, _)| event)
@@ -1419,5 +1444,84 @@ mod tests {
             }
             other => panic!("expected MethodExit, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn jdi_async_stop_event_updates_state_and_last_event() {
+        let mut inner = JdiSessionInner {
+            state: RunState::Running,
+            last_event: Some(Event::Breakpoint {
+                location: Location {
+                    class: "Old".into(),
+                    method: "main".into(),
+                    file: Some("Old.java".into()),
+                    line: 10,
+                },
+                thread: "main".into(),
+            }),
+        };
+
+        apply_sidecar_event(
+            &mut inner,
+            SidecarEvent {
+                session: "s1".into(),
+                seq: 7,
+                event: "breakpoint".into(),
+                payload: json!({
+                    "event": "breakpoint",
+                    "thread": "http-nio-8085-exec-1",
+                    "threadId": "42",
+                    "location": {
+                        "class": "HomeController",
+                        "method": "content",
+                        "file": "HomeController.java",
+                        "line": 32
+                    }
+                }),
+            },
+            "s1",
+        );
+
+        assert_eq!(inner.state, RunState::Suspended);
+        match inner.last_event {
+            Some(Event::Breakpoint { location, thread }) => {
+                assert_eq!(location.class, "HomeController");
+                assert_eq!(location.line, 32);
+                assert_eq!(thread, "http-nio-8085-exec-1");
+            }
+            other => panic!("expected async breakpoint event, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn jdi_async_stop_event_ignores_other_sessions() {
+        let mut inner = JdiSessionInner {
+            state: RunState::Running,
+            last_event: None,
+        };
+
+        apply_sidecar_event(
+            &mut inner,
+            SidecarEvent {
+                session: "other".into(),
+                seq: 1,
+                event: "breakpoint".into(),
+                payload: json!({
+                    "event": "breakpoint",
+                    "thread": "main",
+                    "threadId": "1",
+                    "location": {
+                        "class": "Main",
+                        "method": "main",
+                        "file": "Main.java",
+                        "line": 12
+                    }
+                }),
+            },
+            "s1",
+        );
+
+        assert_eq!(inner.state, RunState::Running);
+        assert!(inner.last_event.is_none());
     }
 }
