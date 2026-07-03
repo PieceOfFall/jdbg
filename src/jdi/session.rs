@@ -1110,10 +1110,7 @@ impl JdiSession {
         let note = append_optional_note(payload.note.clone(), ack_note);
         {
             let mut inner = self.inner.lock().expect("jdi session mutex poisoned");
-            inner.state = state;
-            inner.last_event = Some(event.clone());
-            inner.delivered_stop = Some(event.clone());
-            remember_delivered_stop_id(&mut inner, payload.stop_id.as_deref());
+            finalize_delivered_stop(&mut inner, &payload, &event, state);
         }
         if matches!(event, Event::VmExit) {
             return Ok(CommandResponse {
@@ -1472,6 +1469,30 @@ fn is_same_stop_payload(
         .unwrap_or(false)
 }
 
+/// Record a just-delivered stop and drop its async twin from the pending queue.
+///
+/// A stop is delivered on two channels sharing one `stopId`: the blocking response to
+/// `continue`/step, and an async event. When the async twin is drained (by a concurrent
+/// `state()` call from another client's `create_attach` dedup sweep or `persist_sessions`)
+/// before we remember the stopId, it lands in `pending_stops` and would be replayed by the
+/// next resume as a phantom duplicate stop. Remembering the id and purging the twin under a
+/// single lock closes the race: a twin queued earlier is removed here; one queued later is
+/// rejected by `is_delivered_stop`.
+fn finalize_delivered_stop(
+    inner: &mut JdiSessionInner,
+    payload: &StopPayload,
+    event: &Event,
+    state: RunState,
+) {
+    inner.state = state;
+    inner.last_event = Some(event.clone());
+    inner.delivered_stop = Some(event.clone());
+    remember_delivered_stop_id(inner, payload.stop_id.as_deref());
+    inner
+        .pending_stops
+        .retain(|pending| !is_same_stop_payload(pending, payload, event));
+}
+
 fn remember_delivered_stop_id(inner: &mut JdiSessionInner, stop_id: Option<&str>) {
     let Some(stop_id) = stop_id else {
         return;
@@ -1704,6 +1725,68 @@ mod tests {
         assert!(
             inner.pending_stops.is_empty(),
             "already delivered stopId should be treated as a duplicate"
+        );
+    }
+
+    #[test]
+    fn finalize_delivered_stop_purges_concurrently_queued_twin() {
+        // Reproduces the four-client race at the logic layer: a concurrent state()
+        // drain queued the async twin of a stop into pending_stops before the owning
+        // cont could remember its stopId. Finalizing the direct delivery must drop the
+        // twin so the next resume does not replay it as a phantom breakpoint.
+        let payload: StopPayload = serde_json::from_value(json!({
+            "event": "breakpoint",
+            "stopId": "1",
+            "thread": "main",
+            "threadId": "1",
+            "location": {
+                "class": "JdiLaunchTest",
+                "method": "main",
+                "file": "JdiLaunchTest.java",
+                "line": 9
+            }
+        }))
+        .unwrap();
+        let (event, state) = event_from_stop_payload(&payload).unwrap();
+
+        let mut inner = JdiSessionInner {
+            state: RunState::Running,
+            last_event: None,
+            delivered_stop: None,
+            delivered_stop_ids: VecDeque::new(),
+            pending_stops: VecDeque::from([payload.clone()]),
+        };
+
+        finalize_delivered_stop(&mut inner, &payload, &event, state);
+
+        assert!(
+            inner.pending_stops.is_empty(),
+            "async twin of the delivered stop must be purged from pending_stops"
+        );
+        assert!(inner.delivered_stop_ids.iter().any(|id| id == "1"));
+
+        // A late-arriving twin (drained after finalize) is now rejected by stopId dedup.
+        let late_twin = SidecarEvent {
+            session: "s1".into(),
+            seq: 9,
+            event: "breakpoint".into(),
+            payload: json!({
+                "event": "breakpoint",
+                "stopId": "1",
+                "thread": "main",
+                "threadId": "1",
+                "location": {
+                    "class": "JdiLaunchTest",
+                    "method": "main",
+                    "file": "JdiLaunchTest.java",
+                    "line": 9
+                }
+            }),
+        };
+        apply_sidecar_events(&mut inner, vec![late_twin], "s1", true);
+        assert!(
+            inner.pending_stops.is_empty(),
+            "late twin with the delivered stopId must not be re-queued"
         );
     }
 

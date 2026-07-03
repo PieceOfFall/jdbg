@@ -2382,6 +2382,74 @@ fn jdb_method_exit_break_in_is_explicitly_unsupported() {
     let _ = jdbg_command(&guard).arg("kill").output();
 }
 
+/// Reproduction harness for the flaky four-client failure: a background thread hammers
+/// `session.state()` (exactly what `create_attach` dedup + `persist_sessions` do to OTHER
+/// sessions in the daemon) while the owning flow runs cont -> locals -> cont. If the
+/// concurrent drain steals the async breakpoint into `pending_stops` before the first
+/// cont remembers its stopId, the second cont wrongly returns the duplicate breakpoint.
+/// Run with: cargo test --test server_integration jdi_concurrent_state_probe_repro -- --ignored --nocapture
+#[test]
+#[ignore]
+fn jdi_concurrent_state_probe_repro() {
+    use java_agent_debugger::jdi::session::JdiSession;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("JdiLaunchTest.java");
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let line = fixture_line("JdiLaunchTest.java", "System.out.println(label");
+    let rounds: usize = std::env::var("REPRO_ROUNDS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(200);
+
+    for round in 0..rounds {
+        let target = start_jdwp_fixture("JdiLaunchTest");
+        let session = Arc::new(
+            JdiSession::attach(
+                "127.0.0.1",
+                target.port,
+                &sourcepath,
+                format!("repro-{round}"),
+                None,
+            )
+            .expect("JDI attach failed"),
+        );
+        session
+            .stop_at("JdiLaunchTest", line, None)
+            .expect("break-at failed");
+
+        // Background hammer: mimic other clients sweeping this session's state().
+        let stop = Arc::new(AtomicBool::new(false));
+        let probe_session = Arc::clone(&session);
+        let probe_stop = Arc::clone(&stop);
+        let probe = std::thread::spawn(move || {
+            while !probe_stop.load(Ordering::Relaxed) {
+                let _ = probe_session.state();
+            }
+        });
+
+        let first = session.cont(Some(20)).expect("first cont failed");
+        assert!(
+            matches!(first.result, CommandResult::Stopped { .. }),
+            "round {round}: first cont should hit the breakpoint, got {:?}",
+            first.result
+        );
+        let _ = session.locals().expect("locals failed");
+        let second = session.cont(Some(20)).expect("second cont failed");
+
+        stop.store(true, Ordering::Relaxed);
+        probe.join().unwrap();
+
+        match &second.result {
+            CommandResult::VmExited { .. } => {}
+            other => panic!("round {round}: expected VM exit, got {other:?}"),
+        }
+        let _ = session.kill();
+    }
+    eprintln!("completed {rounds} rounds with no reproduction");
+}
+
 #[test]
 fn four_concurrent_jdi_cli_clients_debug_distinct_targets() {
     let _guard = jdi_e2e_guard();
