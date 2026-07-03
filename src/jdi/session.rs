@@ -1,5 +1,6 @@
 //! JDI backend session backed by the Java sidecar.
 
+use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use crate::protocol::*;
 const SIDECAR_START_TIMEOUT: Duration = Duration::from_secs(10);
 const SIDECAR_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const SIDECAR_BLOCKING_TIMEOUT: Duration = Duration::from_secs(30);
+const MAX_TIMEOUT_EVENT_GRACE: Duration = Duration::from_secs(2);
 const DEFAULT_STACK_FRAMES: u32 = 24;
 const ALL_STACK_FRAMES: u32 = 64;
 
@@ -41,6 +43,14 @@ struct JdiSessionInner {
     state: RunState,
     last_event: Option<Event>,
     delivered_stop: Option<Event>,
+    delivered_stop_ids: VecDeque<String>,
+    pending_stops: VecDeque<StopPayload>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StopDelivery {
+    Direct,
+    Async,
 }
 
 impl JdiSession {
@@ -79,6 +89,8 @@ impl JdiSession {
                 state: RunState::Running,
                 last_event: None,
                 delivered_stop: None,
+                delivered_stop_ids: VecDeque::new(),
+                pending_stops: VecDeque::new(),
             }),
         })
     }
@@ -118,6 +130,8 @@ impl JdiSession {
                 state: RunState::Loaded,
                 last_event: None,
                 delivered_stop: None,
+                delivered_stop_ids: VecDeque::new(),
+                pending_stops: VecDeque::new(),
             }),
         })
     }
@@ -1004,7 +1018,7 @@ impl JdiSession {
 
     fn resume_like(&self, method: &str, timeout: Option<u64>) -> Result<CommandResponse> {
         if let Some(payload) = self.drain_events_and_take_stop_payload() {
-            return self.command_response_from_stop_payload(payload);
+            return self.command_response_from_stop_payload(payload, StopDelivery::Async);
         }
         {
             let mut inner = self.inner.lock().expect("jdi session mutex poisoned");
@@ -1015,6 +1029,7 @@ impl JdiSession {
                 )));
             }
             inner.state = RunState::Running;
+            inner.delivered_stop = None;
         }
 
         let timeout = timeout
@@ -1026,7 +1041,7 @@ impl JdiSession {
             json!({ "session": self.meta.id, "timeoutMs": timeout.as_millis() as u64 }),
             timeout + Duration::from_secs(2),
         )?;
-        let response = self.stop_response_from_value(value)?;
+        let response = self.stop_response_from_value(value, timeout)?;
         Ok(response)
     }
 
@@ -1045,14 +1060,16 @@ impl JdiSession {
         }
     }
 
-    fn stop_response_from_value(&self, value: Value) -> Result<CommandResponse> {
+    fn stop_response_from_value(&self, value: Value, timeout: Duration) -> Result<CommandResponse> {
         if value
             .get("timedOut")
             .and_then(Value::as_bool)
             .unwrap_or(false)
         {
-            if let Some(payload) = self.drain_events_and_take_stop_payload() {
-                return self.command_response_from_stop_payload(payload);
+            if let Some(payload) =
+                self.wait_for_events_and_take_stop_payload(timeout_event_grace(timeout))
+            {
+                return self.command_response_from_stop_payload(payload, StopDelivery::Async);
             }
             {
                 let mut inner = self.inner.lock().expect("jdi session mutex poisoned");
@@ -1074,16 +1091,29 @@ impl JdiSession {
 
         let payload: StopPayload = serde_json::from_value(value)
             .map_err(|e| Error::Connection(format!("invalid JDI stop response: {e}")))?;
-        self.command_response_from_stop_payload(payload)
+        self.command_response_from_stop_payload(payload, StopDelivery::Direct)
     }
 
-    fn command_response_from_stop_payload(&self, payload: StopPayload) -> Result<CommandResponse> {
+    fn command_response_from_stop_payload(
+        &self,
+        payload: StopPayload,
+        delivery: StopDelivery,
+    ) -> Result<CommandResponse> {
         let (event, state) = event_from_stop_payload(&payload)?;
+        let ack_note = if delivery == StopDelivery::Async && !matches!(event, Event::VmExit) {
+            self.acknowledge_stop_payload(&payload)
+                .err()
+                .map(|e| format!("WARNING: failed to acknowledge queued JDI stop: {e}"))
+        } else {
+            None
+        };
+        let note = append_optional_note(payload.note.clone(), ack_note);
         {
             let mut inner = self.inner.lock().expect("jdi session mutex poisoned");
             inner.state = state;
             inner.last_event = Some(event.clone());
             inner.delivered_stop = Some(event.clone());
+            remember_delivered_stop_id(&mut inner, payload.stop_id.as_deref());
         }
         if matches!(event, Event::VmExit) {
             return Ok(CommandResponse {
@@ -1092,7 +1122,7 @@ impl JdiSession {
                     tail: payload.message,
                 },
                 stderr: self.sidecar.take_stderr(),
-                note: None,
+                note,
             });
         }
         if let Event::Exception {
@@ -1111,7 +1141,7 @@ impl JdiSession {
                     thread_id: payload.thread_id,
                 },
                 stderr: self.sidecar.take_stderr(),
-                note: payload.note,
+                note,
             });
         }
         Ok(CommandResponse {
@@ -1124,22 +1154,56 @@ impl JdiSession {
                 source_context: None,
             },
             stderr: self.sidecar.take_stderr(),
-            note: payload.note,
+            note,
         })
     }
 
+    fn acknowledge_stop_payload(&self, payload: &StopPayload) -> Result<()> {
+        request(
+            &self.sidecar,
+            "ackStop",
+            json!({
+                "session": self.meta.id,
+                "event": &payload.event,
+                "stopId": &payload.stop_id,
+                "thread": &payload.thread,
+                "threadId": &payload.thread_id,
+                "location": &payload.location,
+            }),
+            SIDECAR_REQUEST_TIMEOUT,
+        )
+        .map(|_| ())
+    }
+
     fn drain_events(&self) {
-        let _ = self.drain_events_and_take_stop_payload();
+        self.drain_transport_events();
     }
 
     fn drain_events_and_take_stop_payload(&self) -> Option<StopPayload> {
+        self.drain_transport_events();
+        let mut inner = self.inner.lock().expect("jdi session mutex poisoned");
+        inner.pending_stops.pop_front()
+    }
+
+    fn wait_for_events_and_take_stop_payload(&self, timeout: Duration) -> Option<StopPayload> {
+        let events = self.sidecar.transport().wait_for_events(timeout);
+        self.apply_transport_events(events);
+        let mut inner = self.inner.lock().expect("jdi session mutex poisoned");
+        inner.pending_stops.pop_front()
+    }
+
+    fn drain_transport_events(&self) {
         let events = self.sidecar.transport().drain_events();
+        self.apply_transport_events(events);
+    }
+
+    fn apply_transport_events(&self, events: Vec<SidecarEvent>) {
         let sidecar_alive = self.sidecar.is_alive();
         if events.is_empty() && sidecar_alive {
-            return None;
+            return;
         }
         let mut inner = self.inner.lock().expect("jdi session mutex poisoned");
-        apply_sidecar_events(&mut inner, events, &self.meta.id, sidecar_alive)
+        apply_sidecar_events(&mut inner, events, &self.meta.id, sidecar_alive);
     }
 }
 
@@ -1245,6 +1309,8 @@ struct ForceReturnPayload {
 #[serde(rename_all = "camelCase")]
 struct StopPayload {
     event: String,
+    #[serde(default)]
+    stop_id: Option<String>,
     location: Location,
     thread: String,
     #[serde(default)]
@@ -1354,14 +1420,18 @@ fn apply_sidecar_events(
     events: Vec<SidecarEvent>,
     session_id: &str,
     sidecar_alive: bool,
-) -> Option<StopPayload> {
-    let mut stop_payload = None;
+) {
     for event in events {
         if event.session == session_id && is_stop_event(&event.event) {
             if let Ok(payload) = serde_json::from_value::<StopPayload>(event.payload.clone()) {
                 if let Ok((next_event, _)) = event_from_stop_payload(&payload) {
-                    if inner.delivered_stop.as_ref() != Some(&next_event) {
-                        stop_payload = Some(payload);
+                    if !is_delivered_stop(inner, &payload, &next_event)
+                        && !inner
+                            .pending_stops
+                            .iter()
+                            .any(|pending| is_same_stop_payload(pending, &payload, &next_event))
+                    {
+                        inner.pending_stops.push_back(payload);
                     }
                 }
             }
@@ -1371,7 +1441,6 @@ fn apply_sidecar_events(
     if !sidecar_alive && !matches!(inner.state, RunState::Dead | RunState::Exited) {
         inner.state = RunState::Dead;
     }
-    stop_payload
 }
 
 fn is_stop_event(event: &str) -> bool {
@@ -1379,6 +1448,41 @@ fn is_stop_event(event: &str) -> bool {
         event,
         "breakpoint" | "methodEntry" | "methodExit" | "step" | "fieldWatch" | "exception"
     )
+}
+
+fn is_delivered_stop(inner: &JdiSessionInner, payload: &StopPayload, event: &Event) -> bool {
+    match payload.stop_id.as_deref() {
+        Some(stop_id) => inner.delivered_stop_ids.iter().any(|id| id == stop_id),
+        None => inner.delivered_stop.as_ref() == Some(event),
+    }
+}
+
+fn is_same_stop_payload(
+    existing: &StopPayload,
+    incoming: &StopPayload,
+    incoming_event: &Event,
+) -> bool {
+    if let (Some(existing_id), Some(incoming_id)) =
+        (existing.stop_id.as_deref(), incoming.stop_id.as_deref())
+    {
+        return existing_id == incoming_id;
+    }
+    event_from_stop_payload(existing)
+        .map(|(existing_event, _)| existing_event == *incoming_event)
+        .unwrap_or(false)
+}
+
+fn remember_delivered_stop_id(inner: &mut JdiSessionInner, stop_id: Option<&str>) {
+    let Some(stop_id) = stop_id else {
+        return;
+    };
+    if inner.delivered_stop_ids.iter().any(|id| id == stop_id) {
+        return;
+    }
+    inner.delivered_stop_ids.push_back(stop_id.to_string());
+    while inner.delivered_stop_ids.len() > 32 {
+        inner.delivered_stop_ids.pop_front();
+    }
 }
 
 #[cfg(test)]
@@ -1416,6 +1520,28 @@ fn sidecar_error(error: SidecarTransportError) -> Error {
             Error::Connection(format!("JDI sidecar error {code}: {message}"))
         }
         other => Error::Connection(other.to_string()),
+    }
+}
+
+fn append_optional_note(mut note: Option<String>, extra: Option<String>) -> Option<String> {
+    if let Some(extra) = extra {
+        match &mut note {
+            Some(existing) => {
+                existing.push('\n');
+                existing.push_str(&extra);
+            }
+            None => note = Some(extra),
+        }
+    }
+    note
+}
+
+fn timeout_event_grace(timeout: Duration) -> Duration {
+    let tenth = timeout / 10;
+    if tenth > MAX_TIMEOUT_EVENT_GRACE {
+        MAX_TIMEOUT_EVENT_GRACE
+    } else {
+        tenth
     }
 }
 
@@ -1477,10 +1603,15 @@ mod tests {
             state: RunState::Running,
             last_event: None,
             delivered_stop: None,
+            delivered_stop_ids: VecDeque::new(),
+            pending_stops: VecDeque::new(),
         };
 
-        let payload = apply_sidecar_events(&mut inner, vec![event], "s1", true)
-            .expect("stop payload should be returned");
+        apply_sidecar_events(&mut inner, vec![event], "s1", true);
+        let payload = inner
+            .pending_stops
+            .pop_front()
+            .expect("stop payload should be queued");
 
         assert_eq!(inner.state, RunState::Suspended);
         assert_eq!(payload.thread, "http-nio-8085-exec-1");
@@ -1522,12 +1653,14 @@ mod tests {
             state: RunState::Suspended,
             last_event: Some(delivered.clone()),
             delivered_stop: Some(delivered),
+            delivered_stop_ids: VecDeque::new(),
+            pending_stops: VecDeque::new(),
         };
 
-        let payload = apply_sidecar_events(&mut inner, vec![event], "s1", true);
+        apply_sidecar_events(&mut inner, vec![event], "s1", true);
 
         assert!(
-            payload.is_none(),
+            inner.pending_stops.is_empty(),
             "already delivered async stop should be treated as a duplicate"
         );
         assert_eq!(inner.state, RunState::Suspended);
@@ -1535,6 +1668,43 @@ mod tests {
             inner.last_event,
             Some(Event::Breakpoint { ref thread, .. }) if thread == "main"
         ));
+    }
+
+    #[test]
+    fn delivered_sidecar_stop_id_is_not_returned_again() {
+        let event = SidecarEvent {
+            session: "s1".into(),
+            seq: 2,
+            event: "breakpoint".into(),
+            payload: json!({
+                "event": "breakpoint",
+                "stopId": "stop-7",
+                "thread": "main",
+                "threadId": "1",
+                "location": {
+                    "class": "StructuredInspectTest",
+                    "method": "main",
+                    "file": "StructuredInspectTest.java",
+                    "line": 35
+                }
+            }),
+        };
+        let mut delivered_stop_ids = VecDeque::new();
+        delivered_stop_ids.push_back("stop-7".into());
+        let mut inner = JdiSessionInner {
+            state: RunState::Suspended,
+            last_event: None,
+            delivered_stop: None,
+            delivered_stop_ids,
+            pending_stops: VecDeque::new(),
+        };
+
+        apply_sidecar_events(&mut inner, vec![event], "s1", true);
+
+        assert!(
+            inner.pending_stops.is_empty(),
+            "already delivered stopId should be treated as a duplicate"
+        );
     }
 
     #[test]
@@ -1583,6 +1753,8 @@ mod tests {
                 thread: "main".into(),
             }),
             delivered_stop: None,
+            delivered_stop_ids: VecDeque::new(),
+            pending_stops: VecDeque::new(),
         };
 
         apply_sidecar_event(
@@ -1623,6 +1795,8 @@ mod tests {
             state: RunState::Running,
             last_event: None,
             delivered_stop: None,
+            delivered_stop_ids: VecDeque::new(),
+            pending_stops: VecDeque::new(),
         };
 
         apply_sidecar_event(

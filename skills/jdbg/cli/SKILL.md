@@ -4,7 +4,7 @@ description: "Use the jdbg CLI to debug Java programs interactively from Pi when
 compatibility: "Requires a JDK 8+ with jdb available through JAVA_HOME, PATH, or --jdb-path. Requires the jdbg CLI on PATH. Native on Windows, Linux, and macOS."
 allowed-tools: "Bash(jdbg:*), Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "1.11"
+  version: "1.12"
 ---
 
 # jdbg CLI - interactive Java debugging for Pi
@@ -277,6 +277,9 @@ Source context:
 jdbg list-source
 jdbg list-source 120
 ```
+
+`run`, `cont`, `step`, `next`, and `step-out` stop output includes the top frame and surrounding source context
+when available. Use `list-source` only when you need a different line range or want to re-read source while stopped.
 
 Classes and methods:
 

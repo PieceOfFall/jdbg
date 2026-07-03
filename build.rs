@@ -171,6 +171,12 @@ fn common_jdk_parents() -> Vec<PathBuf> {
     let mut dirs = Vec::new();
     if let Some(home) = env::var_os("USERPROFILE").or_else(|| env::var_os("HOME")) {
         dirs.push(PathBuf::from(&home).join(".jdks"));
+        dirs.push(
+            PathBuf::from(&home)
+                .join("Library")
+                .join("Java")
+                .join("JavaVirtualMachines"),
+        );
     }
     #[cfg(windows)]
     {

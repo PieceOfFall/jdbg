@@ -8,7 +8,7 @@ use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
 
@@ -18,6 +18,12 @@ use crate::jdi::codec::{DEFAULT_MAX_FRAME_SIZE, FrameError, encode_frame};
 use crate::jdi::protocol::{SidecarErrorPayload, SidecarMessage};
 
 type PendingMap = Arc<Mutex<HashMap<String, Sender<SidecarResponse>>>>;
+type EventQueueRef = Arc<EventQueue>;
+
+struct EventQueue {
+    events: Mutex<VecDeque<SidecarEvent>>,
+    ready: Condvar,
+}
 
 pub enum SidecarStream {
     #[cfg(test)]
@@ -134,7 +140,7 @@ pub enum SidecarTransportError {
 pub struct SidecarTransport {
     writer: Mutex<SidecarStream>,
     pending: PendingMap,
-    events: Arc<Mutex<VecDeque<SidecarEvent>>>,
+    events: EventQueueRef,
     ids: AtomicU64,
     _reader: JoinHandle<()>,
 }
@@ -143,7 +149,10 @@ impl SidecarTransport {
     pub fn start(stream: SidecarStream) -> std::io::Result<Self> {
         let reader_stream = stream.try_clone()?;
         let pending = Arc::new(Mutex::new(HashMap::new()));
-        let events = Arc::new(Mutex::new(VecDeque::new()));
+        let events = Arc::new(EventQueue {
+            events: Mutex::new(VecDeque::new()),
+            ready: Condvar::new(),
+        });
         let reader = spawn_reader(reader_stream, Arc::clone(&pending), Arc::clone(&events));
         Ok(Self {
             writer: Mutex::new(stream),
@@ -191,7 +200,20 @@ impl SidecarTransport {
     }
 
     pub fn drain_events(&self) -> Vec<SidecarEvent> {
-        let mut events = self.events.lock().expect("events mutex poisoned");
+        let mut events = self.events.events.lock().expect("events mutex poisoned");
+        events.drain(..).collect()
+    }
+
+    pub fn wait_for_events(&self, timeout: Duration) -> Vec<SidecarEvent> {
+        let mut events = self.events.events.lock().expect("events mutex poisoned");
+        if events.is_empty() && !timeout.is_zero() {
+            let (guard, _) = self
+                .events
+                .ready
+                .wait_timeout_while(events, timeout, |events| events.is_empty())
+                .expect("events mutex poisoned");
+            events = guard;
+        }
         events.drain(..).collect()
     }
 
@@ -217,7 +239,7 @@ impl SidecarTransport {
 fn spawn_reader(
     mut stream: SidecarStream,
     pending: PendingMap,
-    events: Arc<Mutex<VecDeque<SidecarEvent>>>,
+    events: EventQueueRef,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         while let Ok(msg) = read_framed_message(&mut stream) {
@@ -255,11 +277,7 @@ pub(crate) fn write_framed_message(
     Ok(())
 }
 
-fn dispatch_incoming(
-    msg: SidecarMessage,
-    pending: &PendingMap,
-    events: &Arc<Mutex<VecDeque<SidecarEvent>>>,
-) {
+fn dispatch_incoming(msg: SidecarMessage, pending: &PendingMap, events: &EventQueueRef) {
     match msg {
         SidecarMessage::Response { id, result, error } => {
             if let Some(tx) = pending.lock().expect("pending mutex poisoned").remove(&id) {
@@ -273,6 +291,7 @@ fn dispatch_incoming(
             payload,
         } => {
             events
+                .events
                 .lock()
                 .expect("events mutex poisoned")
                 .push_back(SidecarEvent {
@@ -281,6 +300,7 @@ fn dispatch_incoming(
                     event,
                     payload,
                 });
+            events.ready.notify_all();
         }
         SidecarMessage::Heartbeat { .. } | SidecarMessage::Request { .. } => {}
     }
@@ -408,6 +428,28 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, json!({"ok": true}));
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn wait_for_events_returns_arriving_event() {
+        let (client_stream, server_thread) = connected_fake_server(|mut stream| {
+            write_test_message(
+                &mut stream,
+                &SidecarMessage::Event {
+                    session: "s1".into(),
+                    seq: 3,
+                    event: "breakpoint".into(),
+                    payload: json!({"event": "breakpoint"}),
+                },
+            );
+        });
+        let client = SidecarTransport::start(SidecarStream::tcp_for_tests(client_stream)).unwrap();
+
+        let events = client.wait_for_events(Duration::from_secs(1));
+
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "breakpoint");
         server_thread.join().unwrap();
     }
 

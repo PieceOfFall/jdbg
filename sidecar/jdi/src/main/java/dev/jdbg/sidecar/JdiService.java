@@ -120,6 +120,8 @@ final class JdiService {
                 return session(params).clearWatchpoint(params);
             case "continue":
                 return session(params).continueFor(Json.longValue(params, "timeoutMs", 30000));
+            case "ackStop":
+                return session(params).ackStop(params);
             case "stepInto":
                 return session(params).stepInto(Json.longValue(params, "timeoutMs", 30000));
             case "stepOver":
@@ -311,6 +313,7 @@ final class JdiService {
         final VirtualMachine vm;
         final List<String> sourcePaths;
         final BlockingQueue<StopRecord> stops = new LinkedBlockingQueue<>();
+        final AtomicLong stopSeq = new AtomicLong(1);
         final List<PendingBreakpoint> pendingBreakpoints = new ArrayList<>();
         final List<ActiveBreakpoint> activeBreakpoints = new ArrayList<>();
         final List<PendingWatchpoint> pendingWatchpoints = new ArrayList<>();
@@ -678,6 +681,64 @@ final class JdiService {
                 selectStop(stop);
                 return stop.payload;
             }
+        }
+
+        Object ackStop(Map<String, Object> params) {
+            StopRecord matched = null;
+            synchronized (this) {
+                for (StopRecord stop : stops) {
+                    if (stopMatches(stop.payload, params)) {
+                        matched = stop;
+                        break;
+                    }
+                }
+                if (matched != null) {
+                    stops.remove(matched);
+                    selectStop(matched);
+                }
+            }
+            return Json.object("acked", matched != null);
+        }
+
+        private boolean stopMatches(Map<String, Object> payload, Map<String, Object> params) {
+            if (!sameValue(payload.get("event"), params.get("event"))) {
+                return false;
+            }
+            if (!sameValue(payload.get("thread"), params.get("thread"))) {
+                return false;
+            }
+            Object threadId = params.get("threadId");
+            if (threadId != null && !sameValue(payload.get("threadId"), threadId)) {
+                return false;
+            }
+            Object stopId = params.get("stopId");
+            if (stopId != null && !sameValue(payload.get("stopId"), stopId)) {
+                return false;
+            }
+            return locationMatches(payload.get("location"), params.get("location"));
+        }
+
+        private boolean locationMatches(Object payloadValue, Object paramValue) {
+            if (!(payloadValue instanceof Map<?, ?>) || !(paramValue instanceof Map<?, ?>)) {
+                return false;
+            }
+            Map<String, Object> payload = Json.asObject(payloadValue, "payload.location");
+            Map<String, Object> params = Json.asObject(paramValue, "location");
+            return sameValue(payload.get("class"), params.get("class"))
+                    && sameValue(payload.get("method"), params.get("method"))
+                    && sameValue(payload.get("file"), params.get("file"))
+                    && intValue(payload.get("line")) == intValue(params.get("line"));
+        }
+
+        private boolean sameValue(Object left, Object right) {
+            if (left == null || right == null) {
+                return left == right;
+            }
+            return left.toString().equals(right.toString());
+        }
+
+        private int intValue(Object value) {
+            return value instanceof Number ? ((Number) value).intValue() : 0;
         }
 
         private long timeoutGraceMillis(long timeoutMs) {
@@ -1136,6 +1197,7 @@ final class JdiService {
         private Map<String, Object> stopPayload(String kind, ThreadReference thread, Location location, String note) {
             Map<String, Object> out = new LinkedHashMap<>();
             out.put("event", kind);
+            out.put("stopId", Long.toString(stopSeq.getAndIncrement()));
             out.put("thread", thread.name());
             out.put("threadId", Long.toString(thread.uniqueID()));
             out.put("location", locationMap(location));

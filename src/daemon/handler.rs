@@ -564,9 +564,23 @@ fn dispatch_jdi_session_cmd(req: &Request, session: Arc<JdiSession>) -> Response
                 session.break_in(class, method, args.as_deref(), *event, suspend.as_deref())
             }
         }
-        Command::Run => session.run(req.timeout),
-        Command::Cont => session.cont(req.timeout),
-        Command::Next => session.next(req.timeout),
+        Command::Run | Command::Cont | Command::Step | Command::Next | Command::StepOut => {
+            let result = match &req.cmd {
+                Command::Run => session.run(req.timeout),
+                Command::Cont => session.cont(req.timeout),
+                Command::Step => session.step(req.timeout),
+                Command::Next => session.next(req.timeout),
+                Command::StepOut => session.step_out(req.timeout),
+                _ => unreachable!(),
+            };
+            return match result {
+                Ok(mut resp) => {
+                    enrich_jdi_stopped(&session, &mut resp);
+                    Response::ok(id, resp)
+                }
+                Err(e) => Response::err(id, e.exit_code(), e.to_string()),
+            };
+        }
         Command::Where { all } => session.stack(*all),
         Command::Locals => session.locals(),
         Command::Threads { filter } => session.threads(filter.as_deref()),
@@ -574,8 +588,6 @@ fn dispatch_jdi_session_cmd(req: &Request, session: Arc<JdiSession>) -> Response
         Command::Inspect { expr, max_elements } => session.inspect(expr, *max_elements),
         Command::Print { expr } | Command::Eval { expr } => session.evaluate(expr),
         Command::Dump { expr } => session.dump(expr, 10),
-        Command::Step => session.step(req.timeout),
-        Command::StepOut => session.step_out(req.timeout),
         Command::Catch { exception, mode } => session.catch_exception(exception, mode),
         Command::Watch { field, mode } => session.watch(field, mode),
         Command::Unwatch { field, mode } => session.unwatch(field, mode),
@@ -904,6 +916,89 @@ fn enrich_stopped(session: &Session, resp: &mut CommandResponse) {
 
     for w in &warnings {
         append_note(resp, w);
+    }
+}
+
+fn enrich_jdi_stopped(session: &JdiSession, resp: &mut CommandResponse) {
+    let (location_line, needs_frame, needs_source) = match &resp.result {
+        CommandResult::Stopped {
+            location,
+            frame,
+            source_context,
+            ..
+        } => (location.line, frame.is_none(), source_context.is_none()),
+        _ => return,
+    };
+
+    let mut frame_data = None;
+    let mut source_data = None;
+    let mut warnings: Vec<String> = Vec::new();
+
+    if needs_frame {
+        match session.stack(false) {
+            Ok(stack_resp) => {
+                if let CommandResult::StackTrace { frames } = &stack_resp.result {
+                    if let Some(top) = frames.first() {
+                        frame_data = Some(top.clone());
+                    }
+                }
+            }
+            Err(e) => warnings.push(format!("WARNING: failed to enrich JDI stack frame: {e}")),
+        }
+    }
+
+    let effective_line = if location_line > 0 {
+        location_line
+    } else {
+        frame_data.as_ref().map(|f| f.location.line).unwrap_or(0)
+    };
+
+    if needs_source && effective_line > 0 {
+        match session.list_source(Some(effective_line)) {
+            Ok(src_resp) => {
+                if let CommandResult::Source { lines, .. } = src_resp.result {
+                    source_data = Some(lines);
+                }
+            }
+            Err(e) => warnings.push(format!("WARNING: failed to enrich JDI source context: {e}")),
+        }
+    }
+
+    if let CommandResult::Stopped {
+        location,
+        frame,
+        source_context,
+        ..
+    } = &mut resp.result
+    {
+        if frame.is_none() {
+            *frame = frame_data.clone();
+        }
+        if location.line == 0 {
+            if let Some(ref f) = frame_data {
+                location.class = f.location.class.clone();
+                location.method = f.location.method.clone();
+                location.file = f.location.file.clone();
+                location.line = f.location.line;
+            }
+        }
+        if source_context.is_none() {
+            *source_context = source_data;
+        }
+
+        if frame.is_none() && needs_frame {
+            warnings.push("WARNING: could not retrieve JDI stack frame.".into());
+        }
+        if source_context.is_none() && needs_source && effective_line > 0 {
+            warnings.push(
+                "WARNING: could not retrieve JDI source context (is sourcepath set and class compiled with -g?)."
+                    .into(),
+            );
+        }
+    }
+
+    for warning in &warnings {
+        append_note(resp, warning);
     }
 }
 

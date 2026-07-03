@@ -2082,6 +2082,10 @@ fn jdi_cli_cont_waits_for_running_thread_suspend_breakpoint() {
         "{stop_text}"
     );
     assert!(stop_text.contains("external-trigger-worker"), "{stop_text}");
+    assert!(
+        stop_text.contains("EXTERNAL_TRIGGER_BREAKPOINT"),
+        "JDI CLI stop should include source context: {stop_text}"
+    );
 
     let _ = jdbg_command(&guard)
         .arg("--session")
@@ -2935,6 +2939,10 @@ fn mcp_jdi_cont_waits_for_running_thread_suspend_breakpoint() {
         "{stop_text}"
     );
     assert!(stop_text.contains("external-trigger-worker"), "{stop_text}");
+    assert!(
+        stop_text.contains("EXTERNAL_TRIGGER_BREAKPOINT"),
+        "JDI MCP stop should include source context: {stop_text}"
+    );
 
     let kill = call_mcp!(json!({
         "jsonrpc": "2.0",
