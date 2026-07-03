@@ -151,6 +151,23 @@ pub fn launch_sidecar(paths: SidecarPaths, timeout: Duration) -> Result<Launched
         )));
     }
 
+    // JDK 8's JDI (com.sun.jdi.*) lives only in tools.jar, and the fat jar does not
+    // bundle it. Without tools.jar a JDK 8 sidecar starts via `-jar` and dies with
+    // NoClassDefFoundError the instant it touches JDI (which previously surfaced as a
+    // misleading 15s request timeout). Detect it up front and fail with guidance.
+    // JDK 9+ ships JDI in the runtime image, so tools.jar is not needed there.
+    if paths.tools_jar.is_none() {
+        if let Some(home) = jdk_home_for(&paths.java_path) {
+            if jdk_home_needs_tools_jar(&home) {
+                return Err(Error::Connection(format!(
+                    "JDI backend needs tools.jar for the JDK 8 sidecar JVM at {}, but none was found. \
+                     Set JDBG_JDI_TOOLS_JAR to <jdk8>/lib/tools.jar, or point JAVA_HOME at a JDK 8 that has it.",
+                    home.display()
+                )));
+            }
+        }
+    }
+
     let token = generate_auth_token();
     let pending_connection = PendingSidecarConnection::new(&token[..8])?;
     let endpoint = pending_connection.endpoint();
@@ -386,9 +403,11 @@ fn take_stderr(stderr: &Arc<Mutex<String>>) -> Option<String> {
 }
 
 fn resolve_tools_jar(java_path: &Path) -> Option<PathBuf> {
+    // 1. Explicit override.
     if let Some(path) = std::env::var_os("JDBG_JDI_TOOLS_JAR").map(PathBuf::from) {
         return path.is_file().then_some(path);
     }
+    // 2. JAVA_HOME/lib/tools.jar.
     if let Some(path) = std::env::var_os("JAVA_HOME")
         .map(PathBuf::from)
         .map(|home| home.join("lib").join("tools.jar"))
@@ -396,11 +415,51 @@ fn resolve_tools_jar(java_path: &Path) -> Option<PathBuf> {
     {
         return Some(path);
     }
-    let java_home_tools = java_path
+    // 3. Beside the java executable the sidecar will run (absolute paths only; a
+    //    bare `java` carries no directory to walk up from).
+    if let Some(path) = tools_jar_beside_bin(java_path) {
+        return Some(path);
+    }
+    // 4. Fall back to jdb discovery (JAVA_HOME -> PATH -> common install dirs). This
+    //    is the key recovery for the daemon environment, where JAVA_HOME may be unset
+    //    while a JDK 8 with tools.jar is on PATH: tools.jar sits in the same JDK as
+    //    jdb (`<home>/lib/tools.jar` next to `<home>/bin/jdb`).
+    if let Ok(jdb) = crate::jdkpath::find_jdb(None) {
+        if let Some(path) = tools_jar_beside_bin(&jdb) {
+            return Some(path);
+        }
+    }
+    None
+}
+
+/// Given a path to an executable inside a JDK `bin/` directory (java, jdb, ...),
+/// return `<home>/lib/tools.jar` if it exists, where `<home>` is the grandparent
+/// (`bin/..`). Returns None for bare names like `java` that carry no directory.
+fn tools_jar_beside_bin(bin_exe: &Path) -> Option<PathBuf> {
+    let candidate = bin_exe
         .parent()
         .and_then(|bin| bin.parent())
-        .map(|home| home.join("lib").join("tools.jar"));
-    java_home_tools.filter(|path| path.is_file())
+        .map(|home| home.join("lib").join("tools.jar"))?;
+    candidate.is_file().then_some(candidate)
+}
+
+/// Resolve the JDK home of the java executable the sidecar will run. Handles both an
+/// absolute `.../bin/java(.exe)` path and a bare `java` resolved via jdb discovery.
+fn jdk_home_for(java_path: &Path) -> Option<PathBuf> {
+    if let Some(home) = java_path.parent().and_then(|bin| bin.parent()) {
+        if home.is_dir() {
+            return Some(home.to_path_buf());
+        }
+    }
+    crate::jdkpath::find_jdb(None)
+        .ok()
+        .and_then(|jdb| jdb.parent().and_then(|bin| bin.parent()).map(Path::to_path_buf))
+}
+
+/// True when a JDK home is pre-9 and therefore needs tools.jar for JDI. JDK 9+ ships
+/// a modular runtime image file at `<home>/lib/modules`; JDK 8 and earlier do not.
+fn jdk_home_needs_tools_jar(home: &Path) -> bool {
+    !home.join("lib").join("modules").is_file()
 }
 
 fn classpath_separator() -> char {
@@ -529,5 +588,36 @@ mod tests {
 
         assert!(token.len() >= 32);
         assert!(token.chars().all(|c| c.is_ascii_alphanumeric()));
+    }
+
+    #[test]
+    fn tools_jar_beside_bin_returns_none_for_bare_name() {
+        // A bare `java` has no parent directory to walk up from, so it can never
+        // locate tools.jar this way (the daemon-environment failure mode).
+        assert!(tools_jar_beside_bin(Path::new("java")).is_none());
+    }
+
+    #[test]
+    fn jdk9plus_home_with_lib_modules_does_not_need_tools_jar() {
+        let base =
+            std::env::temp_dir().join(format!("jdbg-jdk9-{}-{}", std::process::id(), line!()));
+        let lib = base.join("lib");
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(lib.join("modules"), b"fake modules image").unwrap();
+
+        assert!(!jdk_home_needs_tools_jar(&base));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn jdk8_home_without_lib_modules_needs_tools_jar() {
+        let base =
+            std::env::temp_dir().join(format!("jdbg-jdk8-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(base.join("lib")).unwrap();
+
+        assert!(jdk_home_needs_tools_jar(&base));
+
+        let _ = std::fs::remove_dir_all(&base);
     }
 }

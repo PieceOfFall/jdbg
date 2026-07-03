@@ -245,6 +245,11 @@ fn spawn_reader(
         while let Ok(msg) = read_framed_message(&mut stream) {
             dispatch_incoming(msg, &pending, &events);
         }
+        // The sidecar closed the connection (EOF) or the frame stream errored.
+        // Drop every in-flight response sender so waiting callers observe
+        // Disconnected immediately, instead of sitting out their full timeout
+        // and surfacing a misleading Timeout for a sidecar that actually died.
+        pending.lock().expect("pending mutex poisoned").clear();
     })
 }
 
@@ -428,6 +433,28 @@ mod tests {
             .unwrap();
 
         assert_eq!(result, json!({"ok": true}));
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn inflight_request_returns_disconnected_when_reader_dies() {
+        // Simulates the sidecar receiving a request and then crashing before
+        // it can respond (e.g. NoClassDefFoundError on JDK 8 without tools.jar).
+        // The in-flight request must fail fast with Disconnected, not sit out
+        // its full timeout and report a misleading Timeout.
+        let (client_stream, server_thread) = connected_fake_server(|mut stream| {
+            let request = read_test_message(&mut stream);
+            assert!(matches!(request, SidecarMessage::Request { .. }));
+            // Drop the connection without responding -> client reader hits EOF.
+        });
+        let client = SidecarTransport::start(SidecarStream::tcp_for_tests(client_stream)).unwrap();
+
+        let result = client.request("attach", json!({}), Duration::from_secs(3));
+
+        assert!(
+            matches!(result, Err(SidecarTransportError::Disconnected)),
+            "expected Disconnected after reader death, got {result:?}"
+        );
         server_thread.join().unwrap();
     }
 

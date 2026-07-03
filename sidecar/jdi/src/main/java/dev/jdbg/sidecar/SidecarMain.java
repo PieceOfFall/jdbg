@@ -71,6 +71,16 @@ public final class SidecarMain {
                         "id", id,
                         "error", Json.object("code", "internal_error", "message", e.getMessage())
                 ));
+            } catch (Throwable e) {
+                // Errors (e.g. NoClassDefFoundError for com.sun.jdi when a JDK 8 sidecar
+                // is launched without tools.jar) are not Exceptions, so without this catch
+                // they would escape serve()/main() and crash the process silently -- which
+                // the client only sees as a request timeout. Report the real cause instead.
+                connection.writeMessage(Json.object(
+                        "type", "response",
+                        "id", id,
+                        "error", Json.object("code", "internal_error", "message", e.toString())
+                ));
             }
         }
     }
