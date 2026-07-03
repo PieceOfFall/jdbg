@@ -1,6 +1,7 @@
 //! JDI backend session backed by the Java sidecar.
 
 use std::collections::VecDeque;
+use std::path::Path;
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -9,7 +10,9 @@ use serde_json::{Value, json};
 
 use crate::error::{Error, Result};
 use crate::jdb::process::normalize_attach_host;
-use crate::jdi::lifecycle::{LaunchedSidecar, launch_sidecar, resolve_sidecar_paths};
+use crate::jdi::lifecycle::{
+    LaunchedSidecar, launch_sidecar, resolve_sidecar_paths, resolve_sidecar_paths_for_jdb,
+};
 use crate::jdi::transport::{SidecarEvent, SidecarTransportError};
 use crate::protocol::*;
 
@@ -61,8 +64,23 @@ impl JdiSession {
         id: String,
         name: Option<String>,
     ) -> Result<Self> {
+        Self::attach_with_jdb_path(host, port, sourcepath, id, name, None)
+    }
+
+    pub fn attach_with_jdb_path(
+        host: &str,
+        port: u16,
+        sourcepath: &[String],
+        id: String,
+        name: Option<String>,
+        jdb_path: Option<&Path>,
+    ) -> Result<Self> {
         let host = normalize_attach_host(host);
-        let sidecar = launch_sidecar(resolve_sidecar_paths()?, SIDECAR_START_TIMEOUT)?;
+        let paths = match jdb_path {
+            Some(path) => resolve_sidecar_paths_for_jdb(Some(path))?,
+            None => resolve_sidecar_paths()?,
+        };
+        let sidecar = launch_sidecar(paths, SIDECAR_START_TIMEOUT)?;
         let target = format!("{host}:{port}");
         let params = json!({
             "session": id,
@@ -103,7 +121,23 @@ impl JdiSession {
         id: String,
         name: Option<String>,
     ) -> Result<Self> {
-        let sidecar = launch_sidecar(resolve_sidecar_paths()?, SIDECAR_START_TIMEOUT)?;
+        Self::launch_with_jdb_path(main_class, classpath, sourcepath, app_args, id, name, None)
+    }
+
+    pub fn launch_with_jdb_path(
+        main_class: &str,
+        classpath: &[String],
+        sourcepath: &[String],
+        app_args: &[String],
+        id: String,
+        name: Option<String>,
+        jdb_path: Option<&Path>,
+    ) -> Result<Self> {
+        let paths = match jdb_path {
+            Some(path) => resolve_sidecar_paths_for_jdb(Some(path))?,
+            None => resolve_sidecar_paths()?,
+        };
+        let sidecar = launch_sidecar(paths, SIDECAR_START_TIMEOUT)?;
         let params = json!({
             "session": id,
             "mainClass": main_class,

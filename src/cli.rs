@@ -18,7 +18,7 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub timeout: Option<u64>,
 
-    /// Override path to jdb executable.
+    /// Override path to jdb executable. For JDI, this also selects the sidecar JDK.
     #[arg(long, global = true)]
     pub jdb_path: Option<String>,
 

@@ -4,7 +4,7 @@ description: "Use when you need a Java program's real runtime state instead of r
 compatibility: "Requires a JDK 8+ (provides the `jdb` command). Debugging is driven through the `jdbg` MCP server (tools named `launch`, `break_at`, `run`, `locals`, …). Native on Windows, Linux, macOS."
 allowed-tools: "mcp__jdbg__launch, mcp__jdbg__attach, mcp__jdbg__status, mcp__jdbg__list, mcp__jdbg__kill, mcp__jdbg__break_at, mcp__jdbg__break_in, mcp__jdbg__catch, mcp__jdbg__watch, mcp__jdbg__unwatch, mcp__jdbg__breakpoints, mcp__jdbg__clear, mcp__jdbg__run, mcp__jdbg__cont, mcp__jdbg__step, mcp__jdbg__next, mcp__jdbg__step_out, mcp__jdbg__where, mcp__jdbg__locals, mcp__jdbg__print, mcp__jdbg__dump, mcp__jdbg__eval, mcp__jdbg__threads, mcp__jdbg__classes, mcp__jdbg__methods, mcp__jdbg__thread, mcp__jdbg__frame, mcp__jdbg__list_source, mcp__jdbg__inspect, mcp__jdbg__raw, mcp__jdbg__suspend, mcp__jdbg__resume, mcp__jdbg__set, mcp__jdbg__force_return, mcp__jdbg__ignore, mcp__jdbg__lock, mcp__jdbg__threadlocks, Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "2.20"
+  version: "2.21"
 ---
 
 # jdbg — interactive Java debugging for agents
@@ -81,7 +81,8 @@ Start the target JVM with:
 Common arguments: any session tool accepts `session` (a session id; omit when exactly one session exists);
 execution-control tools (`run` / `cont` / `step` / `next` / `step_out`) also accept `timeout` (seconds,
 overrides the default). To force a specific JDK, pass `jdb_path` to `launch` / `attach` (jdb is otherwise
-found via `JAVA_HOME/bin` → PATH → common install dirs).
+found via `JAVA_HOME/bin` → PATH → common install dirs). On JDI sessions, `jdb_path` also selects the sidecar
+Java runtime when `JDBG_JDI_JAVA` is not set.
 
 ### Backend guidance
 
@@ -264,9 +265,10 @@ On JDI sessions, watchpoints are supported through the same blocking execution c
 - **JDI sidecar jar missing** → run `jdbg update` or reinstall from the official release archive. Do not
   globally search for `jdbg-jdi-sidecar.jar` or copy one from a source checkout; it may not match the installed
   binary.
-- **JDI `attach`/`launch` times out (`sidecar request … timed out`) on JDK 8** → the sidecar needs `tools.jar`
-  (JDK 8 ships JDI only there; JDK 9+ bundles it in the runtime). jdbg auto-discovers it via `JAVA_HOME`/PATH;
-  if it cannot, set `JDBG_JDI_TOOLS_JAR` to `<jdk8>/lib/tools.jar`, or point `JAVA_HOME` at a JDK 8 that has it.
+- **JDI `attach`/`launch` fails or times out on JDK 8** → the sidecar needs `tools.jar`
+  (JDK 8 ships JDI only there; JDK 9+ bundles it in the runtime). jdbg auto-discovers it via `jdb_path`,
+  `JAVA_HOME`, or PATH; if it cannot, set `JDBG_JDI_TOOLS_JAR` to `<jdk8>/lib/tools.jar`, or point `JAVA_HOME`
+  at a JDK 8 that has it.
   JDK 9+ is unaffected.
 - **`attach` "connection refused" / "not reachable" on a port that IS listening** → dual-stack address
   mismatch: `localhost` resolves to IPv6 `[::1]` but JDWP listens on IPv4 `0.0.0.0` (check `netstat`). jdbg

@@ -21,6 +21,10 @@ use crate::jdi::transport::{
 };
 
 pub const SIDECAR_JAR_NAME: &str = "jdbg-jdi-sidecar.jar";
+#[cfg(windows)]
+const JAVA_EXE: &str = "java.exe";
+#[cfg(not(windows))]
+const JAVA_EXE: &str = "java";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SidecarEndpoint {
@@ -105,14 +109,16 @@ impl Drop for LaunchedSidecar {
 }
 
 pub fn resolve_sidecar_paths() -> std::io::Result<SidecarPaths> {
-    let java_path = std::env::var_os("JDBG_JDI_JAVA")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("java"));
+    resolve_sidecar_paths_for_jdb(None)
+}
+
+pub fn resolve_sidecar_paths_for_jdb(jdb_path: Option<&Path>) -> std::io::Result<SidecarPaths> {
+    let java_path = resolve_sidecar_java_path(jdb_path);
     let jar_path = match std::env::var_os("JDBG_JDI_SIDECAR_JAR") {
         Some(p) => PathBuf::from(p),
         None => default_sidecar_jar_path()?,
     };
-    let tools_jar = resolve_tools_jar(&java_path);
+    let tools_jar = resolve_tools_jar(&java_path, jdb_path);
     Ok(SidecarPaths {
         java_path,
         jar_path,
@@ -402,14 +408,35 @@ fn take_stderr(stderr: &Arc<Mutex<String>>) -> Option<String> {
     }
 }
 
-fn resolve_tools_jar(java_path: &Path) -> Option<PathBuf> {
+fn resolve_sidecar_java_path(jdb_path: Option<&Path>) -> PathBuf {
+    std::env::var_os("JDBG_JDI_JAVA")
+        .map(PathBuf::from)
+        .or_else(|| jdb_path.and_then(java_beside_jdb))
+        .or_else(java_from_java_home)
+        .unwrap_or_else(default_java_path)
+}
+
+fn resolve_tools_jar(java_path: &Path, jdb_path: Option<&Path>) -> Option<PathBuf> {
+    resolve_tools_jar_from(
+        std::env::var_os("JDBG_JDI_TOOLS_JAR").map(PathBuf::from),
+        std::env::var_os("JAVA_HOME").map(PathBuf::from),
+        java_path,
+        jdb_path,
+    )
+}
+
+fn resolve_tools_jar_from(
+    explicit_tools_jar: Option<PathBuf>,
+    java_home: Option<PathBuf>,
+    java_path: &Path,
+    jdb_path: Option<&Path>,
+) -> Option<PathBuf> {
     // 1. Explicit override.
-    if let Some(path) = std::env::var_os("JDBG_JDI_TOOLS_JAR").map(PathBuf::from) {
+    if let Some(path) = explicit_tools_jar {
         return path.is_file().then_some(path);
     }
     // 2. JAVA_HOME/lib/tools.jar.
-    if let Some(path) = std::env::var_os("JAVA_HOME")
-        .map(PathBuf::from)
+    if let Some(path) = java_home
         .map(|home| home.join("lib").join("tools.jar"))
         .filter(|path| path.is_file())
     {
@@ -420,7 +447,12 @@ fn resolve_tools_jar(java_path: &Path) -> Option<PathBuf> {
     if let Some(path) = tools_jar_beside_bin(java_path) {
         return Some(path);
     }
-    // 4. Fall back to jdb discovery (JAVA_HOME -> PATH -> common install dirs). This
+    // 4. Beside an explicit jdb executable passed by this client. JDI does not run
+    //    jdb, but the option still selects the intended JDK for the sidecar.
+    if let Some(path) = jdb_path.and_then(tools_jar_beside_bin) {
+        return Some(path);
+    }
+    // 5. Fall back to jdb discovery (JAVA_HOME -> PATH -> common install dirs). This
     //    is the key recovery for the daemon environment, where JAVA_HOME may be unset
     //    while a JDK 8 with tools.jar is on PATH: tools.jar sits in the same JDK as
     //    jdb (`<home>/lib/tools.jar` next to `<home>/bin/jdb`).
@@ -430,6 +462,29 @@ fn resolve_tools_jar(java_path: &Path) -> Option<PathBuf> {
         }
     }
     None
+}
+
+fn java_beside_jdb(jdb_path: &Path) -> Option<PathBuf> {
+    let candidate = jdb_path.parent().map(|bin| bin.join(JAVA_EXE))?;
+    candidate.is_file().then_some(candidate)
+}
+
+fn java_from_java_home() -> Option<PathBuf> {
+    let candidate = std::env::var_os("JAVA_HOME")
+        .map(PathBuf::from)?
+        .join("bin")
+        .join(JAVA_EXE);
+    candidate.is_file().then_some(candidate)
+}
+
+fn default_java_path() -> PathBuf {
+    if let Some(home) = macos_java_home() {
+        let java = home.join("bin").join(JAVA_EXE);
+        if java.is_file() {
+            return java;
+        }
+    }
+    PathBuf::from("java")
 }
 
 /// Given a path to an executable inside a JDK `bin/` directory (java, jdb, ...),
@@ -447,19 +502,48 @@ fn tools_jar_beside_bin(bin_exe: &Path) -> Option<PathBuf> {
 /// absolute `.../bin/java(.exe)` path and a bare `java` resolved via jdb discovery.
 fn jdk_home_for(java_path: &Path) -> Option<PathBuf> {
     if let Some(home) = java_path.parent().and_then(|bin| bin.parent()) {
-        if home.is_dir() {
+        if is_concrete_jdk_home(home) {
             return Some(home.to_path_buf());
         }
     }
+    if let Some(home) = macos_java_home().filter(|home| is_concrete_jdk_home(home)) {
+        return Some(home);
+    }
     crate::jdkpath::find_jdb(None)
         .ok()
-        .and_then(|jdb| jdb.parent().and_then(|bin| bin.parent()).map(Path::to_path_buf))
+        .and_then(|jdb| {
+            jdb.parent()
+                .and_then(|bin| bin.parent())
+                .map(Path::to_path_buf)
+        })
+        .filter(|home| is_concrete_jdk_home(home))
 }
 
 /// True when a JDK home is pre-9 and therefore needs tools.jar for JDI. JDK 9+ ships
 /// a modular runtime image file at `<home>/lib/modules`; JDK 8 and earlier do not.
 fn jdk_home_needs_tools_jar(home: &Path) -> bool {
     !home.join("lib").join("modules").is_file()
+}
+
+fn is_concrete_jdk_home(home: &Path) -> bool {
+    home.join("release").is_file()
+        || home.join("lib").join("modules").is_file()
+        || home.join("lib").join("tools.jar").is_file()
+}
+
+#[cfg(target_os = "macos")]
+fn macos_java_home() -> Option<PathBuf> {
+    let output = Command::new("/usr/libexec/java_home").output().ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let home = PathBuf::from(String::from_utf8_lossy(&output.stdout).trim());
+    home.is_dir().then_some(home)
+}
+
+#[cfg(not(target_os = "macos"))]
+fn macos_java_home() -> Option<PathBuf> {
+    None
 }
 
 fn classpath_separator() -> char {
@@ -598,6 +682,43 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_java_path_can_be_derived_from_explicit_jdb() {
+        let base = temp_jdk("explicit-jdb-java", true, false);
+        let jdb = base.join("bin").join(jdb_exe());
+        let java = base.join("bin").join(JAVA_EXE);
+
+        assert_eq!(resolve_sidecar_java_path(Some(&jdb)), java);
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn tools_jar_resolution_can_use_explicit_jdb_path() {
+        let base = temp_jdk("explicit-jdb-tools", true, true);
+        let jdb = base.join("bin").join(jdb_exe());
+        let tools = base.join("lib").join("tools.jar");
+
+        assert_eq!(
+            resolve_tools_jar_from(None, None, Path::new("java"), Some(&jdb)),
+            Some(tools)
+        );
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn non_jdk_shim_home_is_not_concrete_jdk_home() {
+        let base =
+            std::env::temp_dir().join(format!("jdbg-shim-home-{}-{}", std::process::id(), line!()));
+        std::fs::create_dir_all(base.join("bin")).unwrap();
+        std::fs::write(base.join("bin").join(JAVA_EXE), b"fake java").unwrap();
+
+        assert!(!is_concrete_jdk_home(&base));
+
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
     fn jdk9plus_home_with_lib_modules_does_not_need_tools_jar() {
         let base =
             std::env::temp_dir().join(format!("jdbg-jdk9-{}-{}", std::process::id(), line!()));
@@ -619,5 +740,26 @@ mod tests {
         assert!(jdk_home_needs_tools_jar(&base));
 
         let _ = std::fs::remove_dir_all(&base);
+    }
+
+    fn temp_jdk(label: &str, with_java: bool, with_tools: bool) -> PathBuf {
+        let base =
+            std::env::temp_dir().join(format!("jdbg-{label}-{}-{}", std::process::id(), line!()));
+        let bin = base.join("bin");
+        let lib = base.join("lib");
+        std::fs::create_dir_all(&bin).unwrap();
+        std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(bin.join(jdb_exe()), b"fake jdb").unwrap();
+        if with_java {
+            std::fs::write(bin.join(JAVA_EXE), b"fake java").unwrap();
+        }
+        if with_tools {
+            std::fs::write(lib.join("tools.jar"), b"fake tools").unwrap();
+        }
+        base
+    }
+
+    fn jdb_exe() -> &'static str {
+        if cfg!(windows) { "jdb.exe" } else { "jdb" }
     }
 }

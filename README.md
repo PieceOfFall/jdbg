@@ -376,7 +376,7 @@ Global flags:
 | `--session <id>` | Target a specific debug session. Defaults to the sole live session when unambiguous. |
 | `--json` | Emit machine-readable JSON instead of human-readable text. |
 | `--timeout <secs>` | Override per-command timeout. |
-| `--jdb-path <path>` | Use an explicit `jdb` executable. |
+| `--jdb-path <path>` | Use an explicit `jdb` executable. For JDI, this also selects the sidecar JDK. |
 
 Backend selection is made only when creating a session. The default `jdb` backend is the compatibility path
 and supports the full command surface. The `jdi` backend can `launch` or `attach` through a local Java sidecar
@@ -449,8 +449,9 @@ For JDWP attach on JDK 8, start the target with `address=5005` or `address=local
 When building from source, `cargo build` runs the Gradle wrapper in `sidecar/jdi`, builds the fat jar
 `jdbg-jdi-sidecar.jar`, and copies it next to the `jdbg` binary. Set `JDBG_GRADLE_JAVA_HOME` when the build
 JDK is different from the target/debuggee JDK. Override sidecar discovery with `JDBG_JDI_SIDECAR_JAR` or the
-Java runtime with `JDBG_JDI_JAVA`. Set `JDBG_SKIP_JDI_SIDECAR_BUILD` only when a suitable sidecar jar is already
-available through `JDBG_JDI_SIDECAR_JAR` or next to the `jdbg` binary.
+Java runtime with `JDBG_JDI_JAVA`. For JDI sessions, `--jdb-path` also selects the sidecar JDK and lets JDK 8
+`tools.jar` be found next to that JDK. Set `JDBG_SKIP_JDI_SIDECAR_BUILD` only when a suitable sidecar jar is
+already available through `JDBG_JDI_SIDECAR_JAR` or next to the `jdbg` binary.
 
 `classes` works without a pattern, but that lists every loaded class; pass a pattern in real application
 servers. `watch --mode all` creates separate access and modification watchpoints on both backends, so

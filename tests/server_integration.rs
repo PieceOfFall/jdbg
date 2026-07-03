@@ -2267,6 +2267,7 @@ fn mcp_jdi_launch_breakpoint_run_locals_smoke() {
     let guard = TestDaemonGuard::new("mcp-jdi-launch-smoke");
     let sourcepath = fixture_dir().display().to_string();
     let classpath = fixture_dir().display().to_string();
+    let explicit_jdb_path = jdb_path().display().to_string();
     let line = fixture_line("JdiLaunchTest.java", "System.out.println(label");
     let messages = vec![
         json!({
@@ -2290,7 +2291,8 @@ fn mcp_jdi_launch_breakpoint_run_locals_smoke() {
                     "backend": "jdi",
                     "main_class": "JdiLaunchTest",
                     "classpath": classpath,
-                    "sourcepath": sourcepath
+                    "sourcepath": sourcepath,
+                    "jdb_path": explicit_jdb_path
                 }
             }
         }),

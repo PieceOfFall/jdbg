@@ -37,7 +37,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "app_args": {"type": "array", "items": {"type": "string"}, "description": "Arguments passed to the program's main()."},
                 "jdb_args": {"type": "array", "items": {"type": "string"}, "description": "Extra raw arguments passed to jdb."},
                 "name": {"type": "string", "description": "Optional session display name."},
-                "jdb_path": {"type": "string", "description": "Override path to the jdb executable."}
+                "jdb_path": {"type": "string", "description": "Override path to the jdb executable. For JDI, this also selects the sidecar JDK."}
             }),
             &["main_class"],
             false,
@@ -53,7 +53,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
                 "backend": {"type": "string", "enum": ["jdb", "jdi"], "description": "Debug backend (default jdb). JDI support is selected only at session creation."},
                 "sourcepath": {"type": "string", "description": "Source path for line info."},
                 "name": {"type": "string", "description": "Optional session display name."},
-                "jdb_path": {"type": "string", "description": "Override path to the jdb executable."}
+                "jdb_path": {"type": "string", "description": "Override path to the jdb executable. For JDI, this also selects the sidecar JDK."}
             }),
             &[],
             false,

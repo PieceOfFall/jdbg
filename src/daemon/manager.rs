@@ -26,6 +26,26 @@ fn gen_session_id() -> String {
         .collect()
 }
 
+fn resolve_jdb_path(jdb_path: Option<&str>) -> Result<PathBuf> {
+    match jdb_path {
+        Some(p) => {
+            let path = PathBuf::from(p);
+            jdkpath::find_jdb(Some(&path))
+        }
+        None => jdkpath::find_jdb(None),
+    }
+}
+
+fn resolve_explicit_jdb_path(jdb_path: Option<&str>) -> Result<Option<PathBuf>> {
+    match jdb_path {
+        Some(p) => {
+            let path = PathBuf::from(p);
+            Ok(Some(jdkpath::find_jdb(Some(&path))?))
+        }
+        None => Ok(None),
+    }
+}
+
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, DebugSession>>,
     registry: Registry,
@@ -66,13 +86,7 @@ impl SessionManager {
         let id = gen_session_id();
         let session = match params.backend {
             BackendKind::Jdb => {
-                let jdb_path = match params.jdb_path {
-                    Some(ref p) => {
-                        let path = PathBuf::from(p);
-                        jdkpath::find_jdb(Some(&path))?
-                    }
-                    None => jdkpath::find_jdb(None)?,
-                };
+                let jdb_path = resolve_jdb_path(params.jdb_path.as_deref())?;
 
                 let config = LaunchConfig {
                     main_class: params.main_class,
@@ -95,13 +109,15 @@ impl SessionManager {
                             .into(),
                     ));
                 }
-                DebugSession::Jdi(Arc::new(JdiSession::launch(
+                let jdb_path = resolve_explicit_jdb_path(params.jdb_path.as_deref())?;
+                DebugSession::Jdi(Arc::new(JdiSession::launch_with_jdb_path(
                     &params.main_class,
                     &params.classpath,
                     &params.sourcepath,
                     &params.app_args,
                     id.clone(),
                     params.name,
+                    jdb_path.as_deref(),
                 )?))
             }
         };
@@ -140,13 +156,7 @@ impl SessionManager {
         let id = gen_session_id();
         let session = match params.backend {
             BackendKind::Jdb => {
-                let jdb_path = match params.jdb_path {
-                    Some(ref p) => {
-                        let path = PathBuf::from(p);
-                        jdkpath::find_jdb(Some(&path))?
-                    }
-                    None => jdkpath::find_jdb(None)?,
-                };
+                let jdb_path = resolve_jdb_path(params.jdb_path.as_deref())?;
                 let config = AttachConfig {
                     host: params.host,
                     port: params.port,
@@ -159,13 +169,17 @@ impl SessionManager {
                     params.name,
                 )?))
             }
-            BackendKind::Jdi => DebugSession::Jdi(Arc::new(JdiSession::attach(
-                &params.host,
-                params.port,
-                &params.sourcepath,
-                id.clone(),
-                params.name,
-            )?)),
+            BackendKind::Jdi => {
+                let jdb_path = resolve_explicit_jdb_path(params.jdb_path.as_deref())?;
+                DebugSession::Jdi(Arc::new(JdiSession::attach_with_jdb_path(
+                    &params.host,
+                    params.port,
+                    &params.sourcepath,
+                    id.clone(),
+                    params.name,
+                    jdb_path.as_deref(),
+                )?))
+            }
         };
 
         let mut map = self.sessions.lock().expect("sessions mutex poisoned");
