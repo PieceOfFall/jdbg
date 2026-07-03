@@ -815,17 +815,7 @@ mod tests {
             } => {
                 assert_eq!(host, "localhost");
                 assert_eq!(port, 5005);
-                assert_eq!(
-                    sourcepath,
-                    vec![
-                        std::env::current_dir()
-                            .unwrap()
-                            .canonicalize()
-                            .unwrap()
-                            .to_string_lossy()
-                            .into_owned()
-                    ]
-                );
+                assert_eq!(sourcepath, sourcepath_or_current(None));
             }
             other => panic!("expected Attach, got {other:?}"),
         }
@@ -836,17 +826,7 @@ mod tests {
         let req = dispatch_tool("attach", &json!({"sourcepath": "."})).unwrap();
         match req.cmd {
             Command::Attach { sourcepath, .. } => {
-                assert_eq!(
-                    sourcepath,
-                    vec![
-                        std::env::current_dir()
-                            .unwrap()
-                            .canonicalize()
-                            .unwrap()
-                            .to_string_lossy()
-                            .into_owned()
-                    ]
-                );
+                assert_eq!(sourcepath, sourcepath_or_current(Some(".")));
             }
             other => panic!("expected Attach, got {other:?}"),
         }
