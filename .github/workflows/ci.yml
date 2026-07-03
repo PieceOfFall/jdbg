@@ -53,10 +53,5 @@ jobs:
           javac -version
           "${JDBG_GRADLE_JAVA_HOME}/bin/java" -version
 
-      - name: Run tests
-        if: runner.os != 'Windows'
-        run: cargo test
-
-      - name: Run tests (Windows serialized)
-        if: runner.os == 'Windows'
+      - name: Run tests (serialized to avoid JDWP/JDI fixture contention)
         run: cargo test -- --test-threads=1

@@ -163,8 +163,9 @@ platform, self-updates, and re-registers every coding agent that had already bee
 
 CI (`.github/workflows/ci.yml`) runs `cargo test` on Windows, Linux, and macOS across JDK 8, 11, 17, and 21. It
 installs JDK 17 first for the Gradle sidecar build, records that as `JDBG_GRADLE_JAVA_HOME`, then switches
-`JAVA_HOME` to the matrix JDK. Windows runs `cargo test -- --test-threads=1` to avoid JDWP/JDI fixture process
-contention; keep this when reproducing Windows-only CI failures.
+`JAVA_HOME` to the matrix JDK. All platforms run `cargo test -- --test-threads=1` to avoid JDWP/JDI fixture
+process contention (parallel fixtures each spawn a real JVM + sidecar and race on CI runners); keep this serial
+flag when reproducing CI integration failures.
 
 ## Build & test conventions
 
@@ -172,8 +173,8 @@ contention; keep this when reproducing Windows-only CI failures.
   **PowerShell** (the Bash tool is unavailable here).
 - For a full source build with JDI support, make sure a JDK 17+ is discoverable or set `JDBG_GRADLE_JAVA_HOME`.
   The debuggee/target JVM can still be JDK 8+.
-- When diagnosing Windows CI-only integration failures, also run `cargo test -- --test-threads=1`; Linux/macOS CI
-  use normal parallel `cargo test`.
+- When diagnosing CI-only integration failures, reproduce with `cargo test -- --test-threads=1`; all CI
+  platforms run the suite serially to avoid JDWP/JDI fixture process contention.
 - **TDD for pure logic** (parser, protocol mapping, jsonrpc/tools): write the failing test first, watch it fail,
   then implement. Platform side-effects (handle inheritance, real-jdb behavior) are the documented TDD
   exception — verify them with an end-to-end run instead.
