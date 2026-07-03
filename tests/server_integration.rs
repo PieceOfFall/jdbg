@@ -1795,13 +1795,26 @@ fn jdi_async_breakpoint_after_timeout_updates_status_and_resumes_cleanly() {
 
     let _guard = jdi_e2e_guard();
     compile_java_fixture("AsyncBreakpointTest.java");
+
+    // Gate file the target worker polls on. While it is absent the worker cannot
+    // reach the breakpoint, so the first `run` deterministically times out with the
+    // VM left Running — no dependence on how long launch/compile/JIT took. Creating
+    // the gate afterwards releases the worker into an asynchronous breakpoint hit.
+    let gate = std::env::temp_dir().join(format!(
+        "jdbg-async-gate-{}-{}.tmp",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_file(&gate);
+    let gate_arg = gate.to_string_lossy().replace('\\', "/");
+
     let classpath = vec![fixture_dir().display().to_string()];
     let sourcepath = vec![fixture_dir().display().to_string()];
     let session = JdiSession::launch(
         "AsyncBreakpointTest",
         &classpath,
         &sourcepath,
-        &[],
+        &[gate_arg],
         "jdi-async-breakpoint-timeout".into(),
         None,
     )
@@ -1812,9 +1825,11 @@ fn jdi_async_breakpoint_after_timeout_updates_status_and_resumes_cleanly() {
         .stop_at("AsyncBreakpointTest", line, None)
         .expect("JDI async breakpoint failed");
 
+    // Worker is still blocked on the gate, so this run cannot hit the breakpoint and
+    // must time out with the VM Running.
     let timed_out = session
         .run(Some(1))
-        .expect("JDI launch run should return timeout while worker sleeps");
+        .expect("JDI launch run should return timeout while worker is gated");
     assert!(
         matches!(
             timed_out.result,
@@ -1826,6 +1841,10 @@ fn jdi_async_breakpoint_after_timeout_updates_status_and_resumes_cleanly() {
         "expected initial run timeout, got {:?}",
         timed_out.result
     );
+
+    // Release the worker: it now runs into the breakpoint asynchronously while the
+    // session is Running, exercising async stop-event delivery.
+    std::fs::write(&gate, b"go").expect("failed to create async gate file");
 
     let status = wait_for_jdi_breakpoint_status(&session, line);
     match status {
@@ -1901,6 +1920,7 @@ fn jdi_async_breakpoint_after_timeout_updates_status_and_resumes_cleanly() {
     );
 
     let _ = session.kill();
+    let _ = std::fs::remove_file(&gate);
 }
 
 #[test]

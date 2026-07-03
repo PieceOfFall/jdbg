@@ -48,7 +48,7 @@ impl SetupBackend {
     fn label(self) -> &'static str {
         match self {
             SetupBackend::Jdb => "JDB - full command surface, compatibility default",
-            SetupBackend::Jdi => "JDI - structured launch/attach inspect/events subset",
+            SetupBackend::Jdi => "JDI (experimental) - structured launch/attach inspect/events subset",
         }
     }
 
