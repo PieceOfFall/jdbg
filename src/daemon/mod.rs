@@ -23,6 +23,8 @@ use manager::SessionManager;
 /// Idempotent bind: if the socket is already in use because another daemon started first, return `Err`
 /// so the caller can exit 0.
 pub fn run_daemon() -> anyhow::Result<()> {
+    close_inherited_fds();
+
     let sock_name = registry::socket_name();
     let name = sock_name
         .clone()
@@ -88,8 +90,35 @@ pub fn run_daemon() -> anyhow::Result<()> {
 
     // Cleanup. Normally unreachable because incoming() is an infinite iterator.
     mgr.shutdown();
+    if let Ok(registry) = Registry::open() {
+        registry.remove_daemon();
+    }
+    remove_stale_socket(&sock_name);
     Ok(())
 }
+
+/// The daemon must not inherit arbitrary client file descriptors.
+///
+/// On Unix/macOS, a CLI client may be launched by a parent using `Command::output`,
+/// so inherited pipe write-ends can keep that parent blocked waiting for EOF even
+/// after the short-lived CLI client exits. Windows has a separate handle-inherit
+/// guard in the spawn path.
+#[cfg(unix)]
+fn close_inherited_fds() {
+    unsafe extern "C" {
+        fn close(fd: i32) -> i32;
+        fn getdtablesize() -> i32;
+    }
+
+    let max_fd = unsafe { getdtablesize() };
+    let max_fd = if max_fd > 0 { max_fd.min(8192) } else { 1024 };
+    for fd in 3..max_fd {
+        let _ = unsafe { close(fd) };
+    }
+}
+
+#[cfg(not(unix))]
+fn close_inherited_fds() {}
 
 /// Detached spawn helper used by the CLI to auto-start the daemon.
 ///
