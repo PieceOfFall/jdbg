@@ -47,38 +47,38 @@ impl SetupBackend {
 
     fn label(self) -> &'static str {
         match self {
-            SetupBackend::Jdb => "JDB - full command surface, compatibility default",
-            SetupBackend::Jdi => "JDI (experimental) - structured launch/attach inspect/events subset",
+            SetupBackend::Jdb => "JDB - literal raw jdb command stream and jdb-only commands",
+            SetupBackend::Jdi => "JDI - default structured launch/attach inspect/events backend",
         }
     }
 
     fn setup_block(self, mcp_skill: bool) -> String {
         match (self, mcp_skill) {
             (SetupBackend::Jdb, true) => concat!(
-                "> Setup preference: Preferred backend: JDB. Omit `backend` or pass ",
+                "> Setup preference: Preferred backend: JDB. Pass ",
                 r#""backend": "jdb""#,
-                " on `launch`/`attach` for the full command surface. Use ",
+                " on `launch`/`attach` when you need literal raw jdb stdin passthrough or jdb-only commands. Omit `backend` or pass ",
                 r#""backend": "jdi""#,
-                " for launch/attach workflows that need structured JDI inspect or method events."
+                " for the default JDI backend."
             )
             .into(),
             (SetupBackend::Jdb, false) => concat!(
-                "> Setup preference: Preferred backend: JDB. Omit `--backend` or pass ",
-                "`--backend jdb` on `launch`/`attach` for the full command surface. Use ",
-                "`--backend jdi` for launch/attach workflows that need structured JDI inspect or method events."
+                "> Setup preference: Preferred backend: JDB. Pass ",
+                "`--backend jdb` on `launch`/`attach` when you need literal raw jdb stdin passthrough or jdb-only commands. Omit `--backend` or pass ",
+                "`--backend jdi` for the default JDI backend."
             )
             .into(),
             (SetupBackend::Jdi, true) => concat!(
-                "> Setup preference: Preferred backend: JDI. For launch or JDWP attach workflows, pass ",
-                r#""backend": "jdi""#,
-                " to `launch`/`attach` unless you need an unsupported JDI command. ",
-                "Method breakpoints can use entry, exit, or both events on JDI."
+                "> Setup preference: Preferred backend: JDI. Omit `backend` on `launch`/`attach` for the default JDI backend; ",
+                "it falls back to jdb only when local JDI prerequisites are missing. Pass ",
+                r#""backend": "jdb""#,
+                " when you need literal raw jdb stdin passthrough or jdb-only commands."
             )
             .into(),
             (SetupBackend::Jdi, false) => concat!(
-                "> Setup preference: Preferred backend: JDI. For launch or JDWP attach workflows, run ",
-                "`jdbg launch --backend jdi ...` or `jdbg attach --backend jdi ...` unless you need an unsupported JDI command. ",
-                "Method breakpoints can use entry, exit, or both events on JDI."
+                "> Setup preference: Preferred backend: JDI. Omit `--backend` on `launch`/`attach` for the default JDI backend; ",
+                "it falls back to jdb only when local JDI prerequisites are missing. Pass ",
+                "`--backend jdb` when you need literal raw jdb stdin passthrough or jdb-only commands."
             )
             .into(),
         }
@@ -588,7 +588,7 @@ pub fn configured_targets_or_default() -> Result<Vec<TargetId>> {
 
 pub fn configured_backend_or_default() -> Result<SetupBackend> {
     let paths = Paths::new()?;
-    Ok(detect_backend_preference(&paths).unwrap_or(SetupBackend::Jdb))
+    Ok(detect_backend_preference(&paths).unwrap_or(SetupBackend::Jdi))
 }
 
 pub fn targets_to_arg(targets: &[TargetId]) -> String {
@@ -694,7 +694,7 @@ fn prompt_backend(default: SetupBackend) -> Result<SetupBackend> {
 fn prompt_backend_text(default: SetupBackend) -> Result<SetupBackend> {
     println!("Which backend should installed skills prefer?");
     for (idx, backend) in SETUP_BACKENDS.iter().enumerate() {
-        let checked = if *backend == default { "*" } else { " " };
+        let checked = if *backend == default { "\u{2713}" } else { " " };
         println!("  {}. ({}) {}", idx + 1, checked, backend.label());
     }
     print!(
@@ -739,7 +739,7 @@ fn prompt_targets(defaults: &[TargetId]) -> Result<Vec<TargetId>> {
 fn prompt_targets_text(defaults: &[TargetId]) -> Result<Vec<TargetId>> {
     println!("Which agents should jdbg configure?");
     for (idx, target) in ALL_TARGETS.iter().enumerate() {
-        let checked = if defaults.contains(target) { "x" } else { " " };
+        let checked = if defaults.contains(target) { "*" } else { " " };
         println!(
             "  {}. [{}] {} ({})",
             idx + 1,
@@ -820,7 +820,7 @@ fn select_backend(
     yes: bool,
     targets_empty: bool,
 ) -> Result<SetupBackend> {
-    let default = SetupBackend::Jdb;
+    let default = SetupBackend::Jdi;
     if let Some(value) = backend {
         return parse_setup_backend_flag(value);
     }
@@ -1468,8 +1468,9 @@ mod tests {
         let rendered = render_skill(MCP_SKILL_MD, SetupBackend::Jdi);
 
         assert!(rendered.contains("Preferred backend: JDI"));
-        assert!(rendered.contains(r#""backend": "jdi""#));
-        assert!(rendered.contains("Method breakpoints can use entry, exit, or both events on JDI"));
+        assert!(rendered.contains("Omit `backend`"));
+        assert!(rendered.contains(r#""backend": "jdb""#));
+        assert!(rendered.contains("literal raw jdb stdin passthrough"));
     }
 
     #[test]
@@ -1481,7 +1482,8 @@ mod tests {
 
         let installed = fs::read_to_string(paths.codex_skill_dir().join("SKILL.md")).unwrap();
         assert!(installed.contains("Preferred backend: JDI"));
-        assert!(installed.contains(r#""backend": "jdi""#));
+        assert!(installed.contains("Omit `backend`"));
+        assert!(installed.contains(r#""backend": "jdb""#));
 
         let _ = fs::remove_dir_all(home);
     }

@@ -336,10 +336,20 @@ jdbg setup --remove --target pi --yes      # removes only Pi CLI skill
 
 ## Current Addendum: rmcp + JDI Sidecar Backend
 
-This branch now keeps the existing prompt-aware `jdb` backend as the compatibility default and adds a backend boundary for a launch/attach JDI sidecar path.
+This branch uses the JDI sidecar as the default launch/attach backend while keeping the existing prompt-aware
+`jdb` backend as the compatibility fallback and literal raw-command backend.
 
 - `jdbg __mcp` is served through `rmcp` over stdio while preserving the same 37 tool names and routing every tool call through `client::send_request` plus `output::render`.
-- Session creation accepts `backend: jdb|jdi` on both CLI and MCP. `jdb` remains the default and supports literal jdb stdin passthrough. `jdi` supports launch, attach, threads, line breakpoints (with server-side conditional filtering), method entry/exit events (also conditional), exception catchpoints, field watchpoints, breakpoint listing/clearing, run for launched sessions, cont, step/next/step-out, where, frame selection, source listing, classes/methods, thread suspend/resume, lock inspection, safe JSON inspect, expression print/eval/dump, setValue, and non-void force return. JDI `raw` dispatches supported jdb-style aliases through the sidecar.
+- Session creation accepts `backend: jdb|jdi` on both CLI and MCP. Omitting `backend` selects JDI; if local
+  prerequisites are missing (sidecar jar absent, JDK 8 sidecar JVM without `tools.jar`, or sidecar startup
+  fails because `com.sun.jdi` is unavailable), the daemon falls back to `jdb` and returns a note. Explicit
+  `backend: jdi` does not fall back. `jdb` remains available for literal jdb stdin passthrough. `jdi` supports
+  launch, attach, threads, line breakpoints (with server-side conditional filtering), method entry/exit events
+  (also conditional), exception catchpoints, field watchpoints, breakpoint listing/clearing, run for launched
+  sessions, cont, step/next/step-out, where, frame selection, source listing, classes/methods, thread
+  suspend/resume, lock inspection, safe JSON inspect, expression print/eval/dump, setValue, and non-void force
+  return. JDI `raw` dispatches supported jdb-style aliases through the sidecar; use `backend: jdb` for literal
+  `monitor`/`redefine`/`trace` and other jdb-only commands.
 - JDI `launch` uses the sidecar's `CommandLineLaunch` connector. Because the connector spawns the target in the daemon's working directory, classpath entries are absolutized at the CLI/MCP boundary (`classpath_or_current`, defaulting to the caller's cwd), and the sidecar drains the launched process's stdout/stderr to its own stderr so a startup failure (e.g. missing main class) surfaces instead of a silent immediate VM exit.
 - JDI conditional breakpoints are evaluated server-side: the condition rides on the breakpoint/method-event request as a `jdbg.condition` property and is evaluated in the stopped frame at each hit; a false result resumes silently so `cont`/`run`/`step` only surface true hits. Evaluation is fail-open (bad/non-boolean conditions stop with a note). The `jdb` backend instead filters false hits with the Rust-side async settle mechanism.
 - `SessionManager` stores backend-neutral `DebugSession` handles. The existing `Session` type still owns only the `jdb` process/reader state; JDI state lives under `src/jdi/`.

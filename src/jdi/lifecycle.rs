@@ -151,7 +151,7 @@ pub fn generate_auth_token() -> String {
 
 pub fn launch_sidecar(paths: SidecarPaths, timeout: Duration) -> Result<LaunchedSidecar> {
     if !paths.jar_path.is_file() {
-        return Err(Error::Jdi(format!(
+        return Err(Error::JdiUnavailable(format!(
             "JDI sidecar jar not found at {}. Set JDBG_JDI_SIDECAR_JAR or place {SIDECAR_JAR_NAME} next to jdbg.",
             paths.jar_path.display()
         )));
@@ -165,7 +165,7 @@ pub fn launch_sidecar(paths: SidecarPaths, timeout: Duration) -> Result<Launched
     if paths.tools_jar.is_none() {
         if let Some(home) = jdk_home_for(&paths.java_path) {
             if jdk_home_needs_tools_jar(&home) {
-                return Err(Error::Jdi(format!(
+                return Err(Error::JdiUnavailable(format!(
                     "JDI backend needs tools.jar for the JDK 8 sidecar JVM at {}, but none was found. \
                      Set JDBG_JDI_TOOLS_JAR to <jdk8>/lib/tools.jar, or point JAVA_HOME at a JDK 8 that has it.",
                     home.display()
@@ -311,10 +311,11 @@ fn accept_sidecar(
         if let Some(status) = child.try_wait()? {
             nudge_accept(&endpoint);
             let detail = take_stderr(stderr).unwrap_or_else(|| "no sidecar stderr".into());
-            return Err(Error::Jdi(format!(
+            let message = format!(
                 "JDI sidecar exited before connecting back (status {status}): {}",
                 detail.trim()
-            )));
+            );
+            return Err(classify_sidecar_start_failure(message, &detail));
         }
         if Instant::now() >= deadline {
             nudge_accept(&endpoint);
@@ -324,6 +325,19 @@ fn accept_sidecar(
                 detail.trim()
             )));
         }
+    }
+}
+
+fn classify_sidecar_start_failure(message: String, detail: &str) -> Error {
+    if detail.contains("com.sun.jdi")
+        || detail.contains("NoClassDefFoundError")
+        || detail.contains("ClassNotFoundException")
+    {
+        Error::JdiUnavailable(format!(
+            "{message}. This usually means the sidecar JVM cannot load JDI classes; on JDK 8, set JDBG_JDI_TOOLS_JAR to <jdk8>/lib/tools.jar or point JAVA_HOME at a full JDK."
+        ))
+    } else {
+        Error::Jdi(message)
     }
 }
 
@@ -743,6 +757,52 @@ mod tests {
         let _ = std::fs::remove_dir_all(&base);
     }
 
+    #[test]
+    fn missing_sidecar_jar_is_jdi_unavailable() {
+        let paths = SidecarPaths {
+            java_path: PathBuf::from("java"),
+            jar_path: PathBuf::from("definitely-missing-jdbg-jdi-sidecar.jar"),
+            tools_jar: None,
+        };
+
+        let err = match launch_sidecar(paths, Duration::from_millis(1)) {
+            Err(err) => err,
+            Ok(_) => panic!("missing sidecar jar should fail"),
+        };
+
+        assert!(err.is_jdi_unavailable(), "expected unavailable, got {err}");
+    }
+
+    #[test]
+    fn jdk8_without_tools_jar_is_jdi_unavailable() {
+        let base = temp_jdk("missing-tools", true, false);
+        let jar = base.join("jdbg-jdi-sidecar.jar");
+        std::fs::write(&jar, b"fake jar").unwrap();
+        let paths = SidecarPaths {
+            java_path: base.join("bin").join(JAVA_EXE),
+            jar_path: jar,
+            tools_jar: None,
+        };
+
+        let err = match launch_sidecar(paths, Duration::from_millis(1)) {
+            Err(err) => err,
+            Ok(_) => panic!("JDK 8 without tools.jar should fail"),
+        };
+
+        assert!(err.is_jdi_unavailable(), "expected unavailable, got {err}");
+        let _ = std::fs::remove_dir_all(&base);
+    }
+
+    #[test]
+    fn sidecar_com_sun_jdi_start_failure_is_jdi_unavailable() {
+        let err = classify_sidecar_start_failure(
+            "JDI sidecar exited before connecting back".into(),
+            "java.lang.NoClassDefFoundError: com/sun/jdi/Bootstrap",
+        );
+
+        assert!(err.is_jdi_unavailable(), "expected unavailable, got {err}");
+    }
+
     fn temp_jdk(label: &str, with_java: bool, with_tools: bool) -> PathBuf {
         let base =
             std::env::temp_dir().join(format!("jdbg-{label}-{}-{}", std::process::id(), line!()));
@@ -750,6 +810,7 @@ mod tests {
         let lib = base.join("lib");
         std::fs::create_dir_all(&bin).unwrap();
         std::fs::create_dir_all(&lib).unwrap();
+        std::fs::write(base.join("release"), b"JAVA_VERSION=\"1.8.0\"").unwrap();
         std::fs::write(bin.join(jdb_exe()), b"fake jdb").unwrap();
         if with_java {
             std::fs::write(bin.join(JAVA_EXE), b"fake java").unwrap();

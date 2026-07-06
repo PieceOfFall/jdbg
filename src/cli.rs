@@ -33,9 +33,9 @@ pub enum Commands {
     Launch {
         /// Fully qualified main class name.
         main_class: String,
-        /// Debug backend to use: jdb (compatibility default) or jdi.
-        #[arg(long, value_parser = ["jdb", "jdi"], default_value = "jdb")]
-        backend: String,
+        /// Debug backend to use: jdi (default) or jdb.
+        #[arg(long, value_parser = ["jdb", "jdi"])]
+        backend: Option<String>,
         /// Classpath entries (semicolon-separated on Windows).
         #[arg(long)]
         classpath: Option<String>,
@@ -55,9 +55,9 @@ pub enum Commands {
 
     /// Attach to a running JVM via JDWP.
     Attach {
-        /// Debug backend to use: jdb (compatibility default) or jdi.
-        #[arg(long, value_parser = ["jdb", "jdi"], default_value = "jdb")]
-        backend: String,
+        /// Debug backend to use: jdi (default) or jdb.
+        #[arg(long, value_parser = ["jdb", "jdi"])]
+        backend: Option<String>,
         /// Target host.
         #[arg(long, default_value = "localhost")]
         host: String,
@@ -328,4 +328,28 @@ pub enum DaemonAction {
     Stop,
     /// Show daemon status.
     Status,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Cli, Commands};
+    use clap::Parser;
+
+    #[test]
+    fn launch_backend_is_none_when_omitted() {
+        let cli = Cli::parse_from(["jdbg", "launch", "Main"]);
+        match cli.command {
+            Commands::Launch { backend, .. } => assert_eq!(backend, None),
+            other => panic!("expected launch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_backend_is_some_when_explicit() {
+        let cli = Cli::parse_from(["jdbg", "attach", "--backend", "jdb"]);
+        match cli.command {
+            Commands::Attach { backend, .. } => assert_eq!(backend.as_deref(), Some("jdb")),
+            other => panic!("expected attach, got {other:?}"),
+        }
+    }
 }

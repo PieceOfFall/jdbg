@@ -120,7 +120,8 @@ fn build_command(cli: &Cli) -> anyhow::Result<Command> {
             name,
         } => Command::Launch {
             main_class: main_class.clone(),
-            backend: backend.parse().map_err(|e: String| anyhow::anyhow!(e))?,
+            backend: parse_backend_or_default(backend.as_deref())?,
+            backend_explicit: backend.is_some(),
             classpath: classpath_or_current(classpath.as_deref()),
             sourcepath: sourcepath_or_current(sourcepath.as_deref()),
             app_args: app_args.clone(),
@@ -135,7 +136,8 @@ fn build_command(cli: &Cli) -> anyhow::Result<Command> {
             sourcepath,
             name,
         } => Command::Attach {
-            backend: backend.parse().map_err(|e: String| anyhow::anyhow!(e))?,
+            backend: parse_backend_or_default(backend.as_deref())?,
+            backend_explicit: backend.is_some(),
             host: host.clone(),
             port: *port,
             sourcepath: sourcepath_or_current(sourcepath.as_deref()),
@@ -239,6 +241,13 @@ fn build_command(cli: &Cli) -> anyhow::Result<Command> {
         Commands::Mcp_ => unreachable!("handled above"),
     };
     Ok(cmd)
+}
+
+fn parse_backend_or_default(raw: Option<&str>) -> anyhow::Result<BackendKind> {
+    match raw {
+        Some(value) => value.parse().map_err(|e: String| anyhow::anyhow!(e)),
+        None => Ok(BackendKind::default()),
+    }
 }
 
 fn wait_for_daemon_ready(timeout: Duration) -> anyhow::Result<()> {

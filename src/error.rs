@@ -55,6 +55,12 @@ pub enum Error {
     #[error("{0}")]
     Jdi(String),
 
+    /// The JDI backend cannot be started in this local installation/environment.
+    /// This is intentionally narrower than all JDI errors: implicit default-JDI
+    /// session creation may fall back to jdb for these cases only.
+    #[error("{0}")]
+    JdiUnavailable(String),
+
     /// Reading jdb output timed out completely and could not recover.
     #[error("timed out after {secs}s waiting for jdb")]
     Timeout { secs: u64 },
@@ -76,9 +82,14 @@ impl Error {
             Error::UnsupportedBackend { .. } => 5,
             Error::Connection(_) => 6,
             Error::Jdi(_) => 6,
+            Error::JdiUnavailable(_) => 6,
             Error::Timeout { .. } => 7,
             Error::Io(_) => 1,
         }
+    }
+
+    pub fn is_jdi_unavailable(&self) -> bool {
+        matches!(self, Error::JdiUnavailable(_))
     }
 }
 
@@ -92,7 +103,10 @@ mod tests {
         // not "jdb connection/launch failed: …" (it is neither jdb nor a connection fault).
         let err = Error::Jdi("JDI sidecar error method_not_found: no such method".into());
         let rendered = err.to_string();
-        assert_eq!(rendered, "JDI sidecar error method_not_found: no such method");
+        assert_eq!(
+            rendered,
+            "JDI sidecar error method_not_found: no such method"
+        );
         assert!(!rendered.contains("jdb connection/launch failed"));
         assert_eq!(err.exit_code(), 6);
     }

@@ -4,7 +4,7 @@ description: "Use the jdbg CLI to debug Java programs interactively from Pi when
 compatibility: "Requires a JDK 8+ with jdb available through JAVA_HOME, PATH, or --jdb-path. Requires the jdbg CLI on PATH. Native on Windows, Linux, and macOS."
 allowed-tools: "Bash(jdbg:*), Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "1.16"
+  version: "1.17"
 ---
 
 # jdbg CLI - interactive Java debugging for Pi
@@ -71,12 +71,16 @@ them, so source lookup is stable even when the daemon was started from another d
 source lookup also tries the target JVM's `user.dir` and Maven/Gradle module roots inferred from
 `java.class.path` (for example `mall-portal/target/classes` -> `mall-portal/src/main/java`).
 
-The default backend is `jdb`. The JDI backend supports the normal debugging surface too: line and method
+The default backend is `jdi`. If the local JDI prerequisites are missing (for example the sidecar jar is
+absent, or a JDK 8 sidecar JVM cannot find `tools.jar`), an omitted `--backend` automatically falls back to
+`jdb` and returns a note with the reason. Explicit `--backend jdi` means JDI is required and does not fall
+back. The JDI backend supports the normal debugging surface too: line and method
 breakpoints (including conditional breakpoints, evaluated server-side), exception catchpoints, watchpoints,
 stepping, stack frames, classes/methods, source listing, thread control, locks, safe JSON inspect, executable
 print/eval/dump, set, and non-void force-return. JDI `raw` dispatches supported jdb-style aliases through the
 sidecar rather than writing to a literal jdb stdin. The only things that require a `jdb` session are literal jdb
-stdin passthrough and void `force_return`; conditional breakpoints do **not** need `jdb`.
+stdin passthrough (`monitor`, `redefine`, `trace`, and other jdb-only commands) and void `force_return`;
+conditional breakpoints do **not** need `jdb`.
 
 If the JDK is not the one you need, pass:
 
@@ -153,7 +157,8 @@ jdbg attach --backend jdi --host localhost --port 5005
 - `--json` prints machine-readable results. Prefer it when parsing output programmatically.
 - `--timeout <secs>` overrides the per-command timeout, useful for long `run` or `cont`.
 - `--jdb-path <path>` forces a specific `jdb`. For JDI, it also selects the sidecar JDK.
-- `--backend jdb|jdi` is accepted only on `launch` and `attach`; omit it for the full `jdb` backend.
+- `--backend jdb|jdi` is accepted only on `launch` and `attach`; omit it for the default `jdi` backend.
+  Use `--backend jdb` when you need literal raw jdb stdin passthrough or jdb-only commands.
 
 Source builds create `jdbg-jdi-sidecar.jar` during `cargo build` by running the Gradle wrapper in
 `sidecar/jdi`; this requires a JDK 17+ build JVM. Debug targets still support JDK 8+. Set
@@ -163,7 +168,8 @@ sidecar also needs `tools.jar` (JDK 9+ bundles JDI); jdbg finds it via `--jdb-pa
 set `JDBG_JDI_TOOLS_JAR` to `<jdk8>/lib/tools.jar` if attach/launch fails because it cannot be found.
 Release updates install the official sidecar jar next to the `jdbg` binary. If it is missing, run
 `jdbg update` or reinstall from the official release archive; do not search the filesystem and copy a jar
-from a source checkout or unrelated build.
+from a source checkout or unrelated build. When `--backend` is omitted, missing JDI prerequisites fall back
+to `jdb` with a note; explicit `--backend jdi` reports the error.
 
 List sessions and inspect state:
 
@@ -368,8 +374,10 @@ note explaining that pending refresh.
 Use raw `jdb` commands only when no `jdbg` command covers the need:
 
 ```bash
+jdbg launch Main --backend jdb --classpath .
 jdbg raw help
 jdbg raw monitor where all
 ```
 
-Prefer structured `jdbg` commands first because they preserve better result parsing.
+Prefer structured `jdbg` commands first because they preserve better result parsing. On JDI sessions, `raw`
+only dispatches known aliases and cannot execute literal jdb stdin commands.

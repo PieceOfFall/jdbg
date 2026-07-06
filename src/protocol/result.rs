@@ -263,7 +263,7 @@ pub enum BackendKind {
 
 impl Default for BackendKind {
     fn default() -> Self {
-        Self::Jdb
+        Self::Jdi
     }
 }
 
@@ -345,4 +345,14 @@ pub struct CommandResponse {
     pub stderr: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::BackendKind;
+
+    #[test]
+    fn backend_default_is_jdi() {
+        assert_eq!(BackendKind::default(), BackendKind::Jdi);
+    }
 }

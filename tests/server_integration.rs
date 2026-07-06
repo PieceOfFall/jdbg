@@ -2451,6 +2451,8 @@ fn jdb_method_exit_break_in_is_explicitly_unsupported() {
 
     let launch = jdbg_command(&guard)
         .arg("launch")
+        .arg("--backend")
+        .arg("jdb")
         .arg("MethodEventTest")
         .arg("--classpath")
         .arg(&classpath)
@@ -2484,6 +2486,116 @@ fn jdb_method_exit_break_in_is_explicitly_unsupported() {
     assert!(
         stderr.contains("not supported") && stderr.contains("jdb") && stderr.contains("break_in"),
         "error should be explicit unsupported-backend message, got {stderr}"
+    );
+
+    let _ = jdbg_command(&guard).arg("kill").output();
+}
+
+#[test]
+fn cli_default_launch_falls_back_to_jdb_when_jdi_sidecar_missing() {
+    let guard = TestDaemonGuard::new("default-launch-jdi-fallback");
+    compile_java_fixture("JdiLaunchTest.java");
+    let missing_jar = guard.data_dir.join("missing-sidecar.jar");
+    let classpath = fixture_dir().display().to_string();
+    let sourcepath = fixture_dir().display().to_string();
+
+    let launch = jdbg_command(&guard)
+        .arg("launch")
+        .arg("JdiLaunchTest")
+        .arg("--classpath")
+        .arg(&classpath)
+        .arg("--sourcepath")
+        .arg(&sourcepath)
+        .env("JDBG_JDI_SIDECAR_JAR", &missing_jar)
+        .output()
+        .expect("spawn jdbg launch");
+
+    assert!(
+        launch.status.success(),
+        "fallback launch failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&launch.stdout),
+        String::from_utf8_lossy(&launch.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&launch.stdout);
+    assert!(
+        stdout.contains("(Jdb Launch"),
+        "expected jdb fallback, got {stdout}"
+    );
+    assert!(
+        stdout.contains("Default JDI backend is unavailable locally"),
+        "expected fallback note, got {stdout}"
+    );
+
+    let _ = jdbg_command(&guard).arg("kill").output();
+}
+
+#[test]
+fn cli_explicit_jdi_launch_does_not_fallback_when_sidecar_missing() {
+    let guard = TestDaemonGuard::new("explicit-jdi-no-fallback");
+    compile_java_fixture("JdiLaunchTest.java");
+    let missing_jar = guard.data_dir.join("missing-sidecar.jar");
+    let classpath = fixture_dir().display().to_string();
+    let sourcepath = fixture_dir().display().to_string();
+
+    let launch = jdbg_command(&guard)
+        .arg("launch")
+        .arg("--backend")
+        .arg("jdi")
+        .arg("JdiLaunchTest")
+        .arg("--classpath")
+        .arg(&classpath)
+        .arg("--sourcepath")
+        .arg(&sourcepath)
+        .env("JDBG_JDI_SIDECAR_JAR", &missing_jar)
+        .output()
+        .expect("spawn jdbg launch");
+
+    assert!(!launch.status.success(), "explicit JDI should fail");
+    let stderr = String::from_utf8_lossy(&launch.stderr);
+    assert!(
+        stderr.contains("JDI sidecar jar not found") && !stderr.contains("fell back to jdb"),
+        "expected missing-sidecar error without fallback, got {stderr}"
+    );
+}
+
+#[test]
+fn cli_default_attach_falls_back_to_jdb_and_preserves_host_note() {
+    let guard = TestDaemonGuard::new("default-attach-jdi-fallback");
+    compile_java_fixture("Main.java");
+    let target = start_jdwp_fixture("Main");
+    let missing_jar = guard.data_dir.join("missing-sidecar.jar");
+    let sourcepath = fixture_dir().display().to_string();
+
+    let attach = jdbg_command(&guard)
+        .arg("attach")
+        .arg("--host")
+        .arg("localhost")
+        .arg("--port")
+        .arg(target.port.to_string())
+        .arg("--sourcepath")
+        .arg(&sourcepath)
+        .env("JDBG_JDI_SIDECAR_JAR", &missing_jar)
+        .output()
+        .expect("spawn jdbg attach");
+
+    assert!(
+        attach.status.success(),
+        "fallback attach failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&attach.stdout),
+        String::from_utf8_lossy(&attach.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&attach.stdout);
+    assert!(
+        stdout.contains("(Jdb Attach"),
+        "expected jdb fallback, got {stdout}"
+    );
+    assert!(
+        stdout.contains("Default JDI backend is unavailable locally"),
+        "expected fallback note, got {stdout}"
+    );
+    assert!(
+        stdout.contains("normalized to 127.0.0.1"),
+        "expected host normalization note, got {stdout}"
     );
 
     let _ = jdbg_command(&guard).arg("kill").output();

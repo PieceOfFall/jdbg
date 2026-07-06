@@ -46,15 +46,28 @@ fn resolve_explicit_jdb_path(jdb_path: Option<&str>) -> Result<Option<PathBuf>> 
     }
 }
 
+fn jdi_fallback_note(reason: &str) -> String {
+    format!(
+        "Default JDI backend is unavailable locally, so this session fell back to jdb. Reason: {reason}"
+    )
+}
+
 pub struct SessionManager {
     sessions: Mutex<HashMap<String, DebugSession>>,
     registry: Registry,
 }
 
+pub struct CreatedSession {
+    pub session: DebugSession,
+    pub note: Option<String>,
+}
+
 /// Parameter bundle for `create_launch`.
+#[derive(Clone)]
 pub struct LaunchParams {
     pub main_class: String,
     pub backend: BackendKind,
+    pub backend_explicit: bool,
     pub classpath: Vec<String>,
     pub sourcepath: Vec<String>,
     pub app_args: Vec<String>,
@@ -64,8 +77,10 @@ pub struct LaunchParams {
 }
 
 /// Parameter bundle for `create_attach`.
+#[derive(Clone)]
 pub struct AttachParams {
     pub backend: BackendKind,
+    pub backend_explicit: bool,
     pub host: String,
     pub port: u16,
     pub sourcepath: Vec<String>,
@@ -82,25 +97,50 @@ impl SessionManager {
     }
 
     /// Create a launch session.
-    pub fn create_launch(&self, params: LaunchParams) -> Result<DebugSession> {
+    pub fn create_launch(&self, params: LaunchParams) -> Result<CreatedSession> {
         let id = gen_session_id();
-        let session = match params.backend {
+        let (session, note) = match self.build_launch_session(&params, &id) {
+            Ok(session) => (session, None),
+            Err(err)
+                if params.backend == BackendKind::Jdi
+                    && !params.backend_explicit
+                    && err.is_jdi_unavailable() =>
+            {
+                let mut fallback = params.clone();
+                fallback.backend = BackendKind::Jdb;
+                let reason = err.to_string();
+                let session = self.build_launch_session(&fallback, &id)?;
+                (session, Some(jdi_fallback_note(&reason)))
+            }
+            Err(err) => return Err(err),
+        };
+
+        let mut map = self.sessions.lock().expect("sessions mutex poisoned");
+        map.insert(id, session.clone());
+        drop(map);
+
+        self.persist_sessions();
+        Ok(CreatedSession { session, note })
+    }
+
+    fn build_launch_session(&self, params: &LaunchParams, id: &str) -> Result<DebugSession> {
+        match params.backend {
             BackendKind::Jdb => {
                 let jdb_path = resolve_jdb_path(params.jdb_path.as_deref())?;
 
                 let config = LaunchConfig {
-                    main_class: params.main_class,
-                    classpath: params.classpath.into_iter().map(PathBuf::from).collect(),
-                    sourcepath: params.sourcepath.into_iter().map(PathBuf::from).collect(),
-                    app_args: params.app_args,
-                    jdb_args: params.jdb_args,
+                    main_class: params.main_class.clone(),
+                    classpath: params.classpath.iter().map(PathBuf::from).collect(),
+                    sourcepath: params.sourcepath.iter().map(PathBuf::from).collect(),
+                    app_args: params.app_args.clone(),
+                    jdb_args: params.jdb_args.clone(),
                 };
-                DebugSession::Jdb(Arc::new(Session::launch(
+                Ok(DebugSession::Jdb(Arc::new(Session::launch(
                     &jdb_path,
                     &config,
-                    id.clone(),
-                    params.name,
-                )?))
+                    id.to_string(),
+                    params.name.clone(),
+                )?)))
             }
             BackendKind::Jdi => {
                 if !params.jdb_args.is_empty() {
@@ -110,24 +150,19 @@ impl SessionManager {
                     ));
                 }
                 let jdb_path = resolve_explicit_jdb_path(params.jdb_path.as_deref())?;
-                DebugSession::Jdi(Arc::new(JdiSession::launch_with_jdb_path(
-                    &params.main_class,
-                    &params.classpath,
-                    &params.sourcepath,
-                    &params.app_args,
-                    id.clone(),
-                    params.name,
-                    jdb_path.as_deref(),
-                )?))
+                Ok(DebugSession::Jdi(Arc::new(
+                    JdiSession::launch_with_jdb_path(
+                        &params.main_class,
+                        &params.classpath,
+                        &params.sourcepath,
+                        &params.app_args,
+                        id.to_string(),
+                        params.name.clone(),
+                        jdb_path.as_deref(),
+                    )?,
+                )))
             }
-        };
-
-        let mut map = self.sessions.lock().expect("sessions mutex poisoned");
-        map.insert(id, session.clone());
-        drop(map);
-
-        self.persist_sessions();
-        Ok(session)
+        }
     }
 
     /// Create an attach session connected to a running JVM's JDWP port.
@@ -135,7 +170,7 @@ impl SessionManager {
     /// Deduplication: if a live session already connects to the same host:port, reject creation and ask the
     /// caller to reuse it or kill it first. Two jdb clients on the same JDWP port interfere with each other
     /// because kill sends resume and can unfreeze the other client's breakpoint.
-    pub fn create_attach(&self, params: AttachParams) -> Result<DebugSession> {
+    pub fn create_attach(&self, params: AttachParams) -> Result<CreatedSession> {
         // Normalize the host so deduplication compares consistently (localhost → 127.0.0.1).
         let norm_host = crate::jdb::process::normalize_attach_host(&params.host);
         let target = format!("{}:{}", norm_host, params.port);
@@ -154,32 +189,20 @@ impl SessionManager {
         }
 
         let id = gen_session_id();
-        let session = match params.backend {
-            BackendKind::Jdb => {
-                let jdb_path = resolve_jdb_path(params.jdb_path.as_deref())?;
-                let config = AttachConfig {
-                    host: params.host,
-                    port: params.port,
-                    sourcepath: params.sourcepath.into_iter().map(PathBuf::from).collect(),
-                };
-                DebugSession::Jdb(Arc::new(Session::attach(
-                    &jdb_path,
-                    &config,
-                    id.clone(),
-                    params.name,
-                )?))
+        let (session, note) = match self.build_attach_session(&params, &id) {
+            Ok(session) => (session, None),
+            Err(err)
+                if params.backend == BackendKind::Jdi
+                    && !params.backend_explicit
+                    && err.is_jdi_unavailable() =>
+            {
+                let mut fallback = params.clone();
+                fallback.backend = BackendKind::Jdb;
+                let reason = err.to_string();
+                let session = self.build_attach_session(&fallback, &id)?;
+                (session, Some(jdi_fallback_note(&reason)))
             }
-            BackendKind::Jdi => {
-                let jdb_path = resolve_explicit_jdb_path(params.jdb_path.as_deref())?;
-                DebugSession::Jdi(Arc::new(JdiSession::attach_with_jdb_path(
-                    &params.host,
-                    params.port,
-                    &params.sourcepath,
-                    id.clone(),
-                    params.name,
-                    jdb_path.as_deref(),
-                )?))
-            }
+            Err(err) => return Err(err),
         };
 
         let mut map = self.sessions.lock().expect("sessions mutex poisoned");
@@ -187,7 +210,39 @@ impl SessionManager {
         drop(map);
 
         self.persist_sessions();
-        Ok(session)
+        Ok(CreatedSession { session, note })
+    }
+
+    fn build_attach_session(&self, params: &AttachParams, id: &str) -> Result<DebugSession> {
+        match params.backend {
+            BackendKind::Jdb => {
+                let jdb_path = resolve_jdb_path(params.jdb_path.as_deref())?;
+                let config = AttachConfig {
+                    host: params.host.clone(),
+                    port: params.port,
+                    sourcepath: params.sourcepath.iter().map(PathBuf::from).collect(),
+                };
+                Ok(DebugSession::Jdb(Arc::new(Session::attach(
+                    &jdb_path,
+                    &config,
+                    id.to_string(),
+                    params.name.clone(),
+                )?)))
+            }
+            BackendKind::Jdi => {
+                let jdb_path = resolve_explicit_jdb_path(params.jdb_path.as_deref())?;
+                Ok(DebugSession::Jdi(Arc::new(
+                    JdiSession::attach_with_jdb_path(
+                        &params.host,
+                        params.port,
+                        &params.sourcepath,
+                        id.to_string(),
+                        params.name.clone(),
+                        jdb_path.as_deref(),
+                    )?,
+                )))
+            }
+        }
     }
 
     /// Find a session by explicit id or by default unique live session.

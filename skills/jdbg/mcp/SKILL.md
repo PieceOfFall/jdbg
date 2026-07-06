@@ -4,7 +4,7 @@ description: "Use when you need a Java program's real runtime state instead of r
 compatibility: "Requires a JDK 8+ (provides the `jdb` command). Debugging is driven through the `jdbg` MCP server (tools named `launch`, `break_at`, `run`, `locals`, …). Native on Windows, Linux, macOS."
 allowed-tools: "mcp__jdbg__launch, mcp__jdbg__attach, mcp__jdbg__status, mcp__jdbg__list, mcp__jdbg__kill, mcp__jdbg__break_at, mcp__jdbg__break_in, mcp__jdbg__catch, mcp__jdbg__watch, mcp__jdbg__unwatch, mcp__jdbg__breakpoints, mcp__jdbg__clear, mcp__jdbg__run, mcp__jdbg__cont, mcp__jdbg__step, mcp__jdbg__next, mcp__jdbg__step_out, mcp__jdbg__where, mcp__jdbg__locals, mcp__jdbg__print, mcp__jdbg__dump, mcp__jdbg__eval, mcp__jdbg__threads, mcp__jdbg__classes, mcp__jdbg__methods, mcp__jdbg__thread, mcp__jdbg__frame, mcp__jdbg__list_source, mcp__jdbg__inspect, mcp__jdbg__raw, mcp__jdbg__suspend, mcp__jdbg__resume, mcp__jdbg__set, mcp__jdbg__force_return, mcp__jdbg__ignore, mcp__jdbg__lock, mcp__jdbg__threadlocks, Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "2.23"
+  version: "2.24"
 ---
 
 # jdbg — interactive Java debugging for agents
@@ -45,8 +45,9 @@ Returns a session id, state `loaded` (JVM not started yet). Set breakpoints, the
 ```
 attach { "host": "localhost", "port": 5005, "sourcepath": "src" }
 ```
-The default `jdb` backend returns state `suspended`. Set breakpoints, then call `cont` (attach has no `run`).
-For the JDI sidecar, pass `backend: "jdi"` on `launch` or `attach`; launched sessions use `run`, attached sessions use `cont`.
+The default JDI backend returns state `running` for attach; set breakpoints, then call `cont` (attach has no
+`run`). If local JDI prerequisites are missing, an omitted `backend` automatically falls back to `jdb` and
+returns a note; explicit `backend: "jdi"` means JDI is required and does not fall back.
 
 If `sourcepath` is omitted, jdbg uses the MCP server's current working directory as the source root and sends it
 to the daemon as an absolute path. On JDI sessions, source lookup also tries the target JVM's `user.dir` and
@@ -86,8 +87,9 @@ Java runtime when `JDBG_JDI_JAVA` is not set.
 
 ### Backend guidance
 
-- Omit `backend` for the mature `jdb` backend. It supports the full tool surface and keeps `raw` as an escape hatch.
-- Use `backend: "jdi"` when launching or attaching and you want structured sidecar data. JDI supports line and method breakpoints (including **conditional** breakpoints, evaluated server-side), exception catchpoints, watchpoints, `run` for launched sessions, `cont`, `step`/`next`/`step_out`, stack/frame navigation, class/method lookup, source listing, thread suspend/resume, locks, safe JSON `inspect`, executable `print`/`eval`/`dump`, `set`, and non-void `force_return`.
+- Omit `backend` for the default JDI backend. If the sidecar jar is missing or JDK 8 `tools.jar` cannot be found, jdbg falls back to `jdb` and returns a note explaining why.
+- Pass `backend: "jdi"` when you require JDI and want local prerequisite failures to surface instead of falling back. JDI supports line and method breakpoints (including **conditional** breakpoints, evaluated server-side), exception catchpoints, watchpoints, `run` for launched sessions, `cont`, `step`/`next`/`step_out`, stack/frame navigation, class/method lookup, source listing, thread suspend/resume, locks, safe JSON `inspect`, executable `print`/`eval`/`dump`, `set`, and non-void `force_return`.
+- Pass `backend: "jdb"` when you need literal jdb stdin passthrough through `raw` (`monitor`, `redefine`, `trace`, and other jdb-only commands).
 - JDI launch starts in state `loaded`; set breakpoints, then call `run`. JDI attach starts in state `running`; set a line or method breakpoint, then call `cont` to wait for the next stop.
 - JDI covers the full debugging surface — do **not** fall back to `jdb` for conditional breakpoints (JDI supports them). The only things JDI does not do are literal `jdb` stdin passthrough via `raw` (JDI `raw` only dispatches known jdb-style aliases) and void `force_return`. Use a `jdb` session only when you need one of those.
 - JDI uses `jdbg-jdi-sidecar.jar` next to the `jdbg` binary. Release updates install the official jar there; source builds create it during `cargo build`. If the jar is missing, run `jdbg update` or reinstall from the official release archive. Do not search the filesystem and copy a jar from a source checkout. Override with `JDBG_JDI_SIDECAR_JAR` or `JDBG_JDI_JAVA` only when necessary.
@@ -163,7 +165,7 @@ straight to `thread`/`suspend`/`threadlocks` — no need to scan `threads` for i
 | `list_source { line? }` | show source around a line |
 | `classes { pattern? }` | search loaded classes by substring — find CGLIB proxies, inner classes, or confirm a class is loaded |
 | `methods { class }` | list all methods of a loaded class (with param types) — find exact signature for `break_in` |
-| `raw { command }` | escape hatch: send a literal jdb command (`monitor`, `fields`, `redefine`, `trace`, …) |
+| `raw { command }` | escape hatch: on JDI, dispatch supported aliases only; use `backend: "jdb"` for literal jdb commands (`monitor`, `redefine`, `trace`, …) |
 
 ### Thread control · state mutation · locks
 | Tool | Purpose |
@@ -273,12 +275,13 @@ On JDI sessions, watchpoints are supported through the same blocking execution c
   JDK (e.g. JDK 8 vs JDK 21).
 - **JDI sidecar jar missing** → run `jdbg update` or reinstall from the official release archive. Do not
   globally search for `jdbg-jdi-sidecar.jar` or copy one from a source checkout; it may not match the installed
-  binary.
+  binary. When `backend` is omitted, jdbg falls back to `jdb` with a note; explicit `backend: "jdi"` reports
+  the error.
 - **JDI `attach`/`launch` fails or times out on JDK 8** → the sidecar needs `tools.jar`
   (JDK 8 ships JDI only there; JDK 9+ bundles it in the runtime). jdbg auto-discovers it via `jdb_path`,
   `JAVA_HOME`, or PATH; if it cannot, set `JDBG_JDI_TOOLS_JAR` to `<jdk8>/lib/tools.jar`, or point `JAVA_HOME`
   at a JDK 8 that has it.
-  JDK 9+ is unaffected.
+  JDK 9+ is unaffected. Omitted `backend` falls back to `jdb`; explicit `backend: "jdi"` reports the error.
 - **`attach` "connection refused" / "not reachable" on a port that IS listening** → dual-stack address
   mismatch: `localhost` resolves to IPv6 `[::1]` but JDWP listens on IPv4 `0.0.0.0` (check `netstat`). jdbg
   auto-normalizes `localhost`→`127.0.0.1`; if you passed some other hostname that still fails, retry with the

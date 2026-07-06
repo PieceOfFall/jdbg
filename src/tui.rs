@@ -128,7 +128,7 @@ fn render(
     }
     for (idx, label) in labels.iter().enumerate() {
         let pointer = if idx == cursor { ">" } else { " " };
-        let mark = if state[idx] { "\u{2714}" } else { " " };
+        let mark = if state[idx] { "*" } else { " " };
         // \r + clear-to-end so leftover characters from a longer prior line vanish.
         write!(out, "\r\x1b[K {pointer} [{mark}] {label}\r\n")?;
     }
@@ -147,7 +147,7 @@ fn render_single(
     }
     for (idx, label) in labels.iter().enumerate() {
         let pointer = if idx == cursor { ">" } else { " " };
-        let mark = if idx == selected { "*" } else { " " };
+        let mark = if idx == selected { "\u{2713}" } else { " " };
         write!(out, "\r\x1b[K {pointer} ({mark}) {label}\r\n")?;
     }
     out.flush()

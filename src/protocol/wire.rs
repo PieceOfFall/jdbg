@@ -58,6 +58,8 @@ pub enum Command {
         #[serde(default)]
         backend: BackendKind,
         #[serde(default)]
+        backend_explicit: bool,
+        #[serde(default)]
         classpath: Vec<String>,
         #[serde(default)]
         sourcepath: Vec<String>,
@@ -73,6 +75,8 @@ pub enum Command {
     Attach {
         #[serde(default)]
         backend: BackendKind,
+        #[serde(default)]
+        backend_explicit: bool,
         #[serde(default = "default_host")]
         host: String,
         #[serde(default = "default_port")]

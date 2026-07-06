@@ -50,6 +50,7 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>, shutdown: &AtomicBool) -> 
         Command::Launch {
             main_class,
             backend,
+            backend_explicit,
             classpath,
             sourcepath,
             app_args,
@@ -60,6 +61,7 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>, shutdown: &AtomicBool) -> 
             match mgr.create_launch(super::manager::LaunchParams {
                 main_class: main_class.clone(),
                 backend: *backend,
+                backend_explicit: *backend_explicit,
                 classpath: classpath.clone(),
                 sourcepath: sourcepath.clone(),
                 app_args: app_args.clone(),
@@ -67,7 +69,8 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>, shutdown: &AtomicBool) -> 
                 name: name.clone(),
                 jdb_path: jdb_path.clone(),
             }) {
-                Ok(session) => {
+                Ok(created) => {
+                    let session = created.session;
                     let result = CommandResult::SessionCreated {
                         session: session.id().to_string(),
                         mode: session.mode(),
@@ -80,7 +83,7 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>, shutdown: &AtomicBool) -> 
                         CommandResponse {
                             result,
                             stderr: None,
-                            note: None,
+                            note: created.note,
                         },
                     )
                 }
@@ -89,6 +92,7 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>, shutdown: &AtomicBool) -> 
         }
         Command::Attach {
             backend,
+            backend_explicit,
             host,
             port,
             sourcepath,
@@ -97,13 +101,15 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>, shutdown: &AtomicBool) -> 
         } => {
             match mgr.create_attach(super::manager::AttachParams {
                 backend: *backend,
+                backend_explicit: *backend_explicit,
                 host: host.clone(),
                 port: *port,
                 sourcepath: sourcepath.clone(),
                 name: name.clone(),
                 jdb_path: jdb_path.clone(),
             }) {
-                Ok(session) => {
+                Ok(created) => {
+                    let session = created.session;
                     let result = CommandResult::SessionCreated {
                         session: session.id().to_string(),
                         mode: session.mode(),
@@ -113,13 +119,17 @@ fn dispatch(req: &Request, mgr: &Arc<SessionManager>, shutdown: &AtomicBool) -> 
                     };
                     // If the entry point normalized localhost to 127.0.0.1, say so explicitly.
                     // On dual-stack machines localhost→::1 while JDWP often listens on IPv4; normalization avoids connection refused.
-                    let note = crate::jdb::process::normalize_attach_host(host)
+                    let mut note = created.note;
+                    let normalized_note = crate::jdb::process::normalize_attach_host(host)
                         .ne(host)
                         .then(|| format!(
                             "host '{host}' normalized to 127.0.0.1 (IPv4 loopback): on dual-stack \
                              hosts 'localhost' may resolve to IPv6 [::1] but JDWP usually listens \
                              only on IPv4. target shows the address actually connected."
                         ));
+                    if let Some(normalized_note) = normalized_note {
+                        append_note_text(&mut note, &normalized_note);
+                    }
                     Response::ok(
                         id,
                         CommandResponse {
@@ -611,12 +621,16 @@ fn dispatch_jdi_session_cmd(req: &Request, session: Arc<JdiSession>) -> Response
 
 /// Append one message to resp.note, separating multiple messages with newlines.
 fn append_note(resp: &mut CommandResponse, msg: &str) {
-    match &mut resp.note {
+    append_note_text(&mut resp.note, msg);
+}
+
+fn append_note_text(note: &mut Option<String>, msg: &str) {
+    match note {
         Some(existing) => {
             existing.push('\n');
             existing.push_str(msg);
         }
-        None => resp.note = Some(msg.to_string()),
+        None => *note = Some(msg.to_string()),
     }
 }
 

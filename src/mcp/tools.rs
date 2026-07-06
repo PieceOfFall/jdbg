@@ -31,7 +31,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
              (JVM not started yet) — set breakpoints, then call `run`.",
             json!({
                 "main_class": {"type": "string", "description": "Fully-qualified main class, e.g. com.example.Main."},
-                "backend": {"type": "string", "enum": ["jdb", "jdi"], "description": "Debug backend (default jdb). JDI support is selected only at session creation."},
+                "backend": {"type": "string", "enum": ["jdb", "jdi"], "description": "Debug backend (default jdi; falls back to jdb only when default JDI is unavailable locally). Backend is selected only at session creation."},
                 "classpath": {"type": "string", "description": "Classpath (OS-separated entries)."},
                 "sourcepath": {"type": "string", "description": "Source path; enables `list_source`/`locals` line info."},
                 "app_args": {"type": "array", "items": {"type": "string"}, "description": "Arguments passed to the program's main()."},
@@ -51,7 +51,7 @@ pub fn tool_specs() -> Vec<ToolSpec> {
             json!({
                 "host": {"type": "string", "description": "Target host (default localhost). 'localhost' is auto-normalized to 127.0.0.1 (IPv4 loopback) because on dual-stack hosts it may resolve to IPv6 [::1] while JDWP listens only on IPv4; pass '::1' to force IPv6."},
                 "port": {"type": "integer", "description": "Target JDWP port (default 5005)."},
-                "backend": {"type": "string", "enum": ["jdb", "jdi"], "description": "Debug backend (default jdb). JDI support is selected only at session creation."},
+                "backend": {"type": "string", "enum": ["jdb", "jdi"], "description": "Debug backend (default jdi; falls back to jdb only when default JDI is unavailable locally). Backend is selected only at session creation."},
                 "sourcepath": {"type": "string", "description": "Source path for line info."},
                 "name": {"type": "string", "description": "Optional session display name."},
                 "jdb_path": {"type": "string", "description": "Override path to the jdb executable. For JDI, this also selects the sidecar JDK."}
@@ -332,9 +332,9 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         tool(
             "raw",
-            "Escape hatch: send a literal jdb command (monitor, fields, methods, classes, redefine, trace, …) \
-             and return its raw output.",
-            json!({"command": {"type": "string", "description": "The literal jdb command string."}}),
+            "Escape hatch: on JDI sessions, dispatch supported jdb-style aliases; on jdb sessions, send \
+             a literal jdb command (monitor, fields, methods, classes, redefine, trace, …).",
+            json!({"command": {"type": "string", "description": "Raw command string. Use backend='jdb' when you need literal jdb stdin passthrough."}}),
             &["command"],
             true,
             false,
@@ -421,24 +421,32 @@ pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> 
     let timeout = args.get("timeout").and_then(Value::as_u64);
 
     let cmd = match name {
-        "launch" => Command::Launch {
-            main_class: require_str(args, "main_class")?,
-            backend: optional_backend(args)?,
-            classpath: classpath_or_current(optional_str(args, "classpath").as_deref()),
-            sourcepath: sourcepath_or_current(optional_str(args, "sourcepath").as_deref()),
-            app_args: optional_str_array(args, "app_args"),
-            jdb_args: optional_str_array(args, "jdb_args"),
-            name: optional_str(args, "name"),
-            jdb_path: optional_str(args, "jdb_path"),
-        },
-        "attach" => Command::Attach {
-            backend: optional_backend(args)?,
-            host: optional_str(args, "host").unwrap_or_else(|| "localhost".to_string()),
-            port: optional_u16(args, "port").unwrap_or(5005),
-            sourcepath: sourcepath_or_current(optional_str(args, "sourcepath").as_deref()),
-            name: optional_str(args, "name"),
-            jdb_path: optional_str(args, "jdb_path"),
-        },
+        "launch" => {
+            let (backend, backend_explicit) = optional_backend(args)?;
+            Command::Launch {
+                main_class: require_str(args, "main_class")?,
+                backend,
+                backend_explicit,
+                classpath: classpath_or_current(optional_str(args, "classpath").as_deref()),
+                sourcepath: sourcepath_or_current(optional_str(args, "sourcepath").as_deref()),
+                app_args: optional_str_array(args, "app_args"),
+                jdb_args: optional_str_array(args, "jdb_args"),
+                name: optional_str(args, "name"),
+                jdb_path: optional_str(args, "jdb_path"),
+            }
+        }
+        "attach" => {
+            let (backend, backend_explicit) = optional_backend(args)?;
+            Command::Attach {
+                backend,
+                backend_explicit,
+                host: optional_str(args, "host").unwrap_or_else(|| "localhost".to_string()),
+                port: optional_u16(args, "port").unwrap_or(5005),
+                sourcepath: sourcepath_or_current(optional_str(args, "sourcepath").as_deref()),
+                name: optional_str(args, "name"),
+                jdb_path: optional_str(args, "jdb_path"),
+            }
+        }
         "status" => Command::Status,
         "list" => Command::List,
         "kill" => Command::Kill,
@@ -638,12 +646,15 @@ fn optional_bool(args: &Value, key: &str) -> bool {
     args.get(key).and_then(Value::as_bool).unwrap_or(false)
 }
 
-fn optional_backend(args: &Value) -> Result<BackendKind, JsonRpcError> {
+fn optional_backend(args: &Value) -> Result<(BackendKind, bool), JsonRpcError> {
     match optional_str(args, "backend") {
-        Some(raw) => raw.parse().map_err(|e: String| {
-            JsonRpcError::new(INVALID_PARAMS, format!("invalid backend: {e}"))
-        }),
-        None => Ok(BackendKind::Jdb),
+        Some(raw) => raw
+            .parse()
+            .map(|backend| (backend, true))
+            .map_err(|e: String| {
+                JsonRpcError::new(INVALID_PARAMS, format!("invalid backend: {e}"))
+            }),
+        None => Ok((BackendKind::default(), false)),
     }
 }
 
@@ -709,7 +720,9 @@ mod tests {
                 // the launch does not depend on the long-lived daemon's directory.
                 assert_eq!(classpath, classpath_or_current(Some("out")));
                 assert!(
-                    classpath.iter().all(|p| std::path::Path::new(p).is_absolute()),
+                    classpath
+                        .iter()
+                        .all(|p| std::path::Path::new(p).is_absolute()),
                     "classpath entries should be absolute: {classpath:?}"
                 );
             }
@@ -748,16 +761,46 @@ mod tests {
         let req =
             dispatch_tool("launch", &json!({"main_class": "Main", "backend": "jdi"})).unwrap();
         match req.cmd {
-            Command::Launch { backend, .. } => assert_eq!(backend, BackendKind::Jdi),
+            Command::Launch {
+                backend,
+                backend_explicit,
+                ..
+            } => {
+                assert_eq!(backend, BackendKind::Jdi);
+                assert!(backend_explicit);
+            }
             other => panic!("expected Launch, got {other:?}"),
         }
     }
 
     #[test]
-    fn attach_backend_defaults_to_jdb() {
+    fn attach_backend_defaults_to_jdi() {
         let req = dispatch_tool("attach", &json!({})).unwrap();
         match req.cmd {
-            Command::Attach { backend, .. } => assert_eq!(backend, BackendKind::Jdb),
+            Command::Attach {
+                backend,
+                backend_explicit,
+                ..
+            } => {
+                assert_eq!(backend, BackendKind::Jdi);
+                assert!(!backend_explicit);
+            }
+            other => panic!("expected Attach, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn attach_explicit_jdb_marks_backend_explicit() {
+        let req = dispatch_tool("attach", &json!({"backend": "jdb"})).unwrap();
+        match req.cmd {
+            Command::Attach {
+                backend,
+                backend_explicit,
+                ..
+            } => {
+                assert_eq!(backend, BackendKind::Jdb);
+                assert!(backend_explicit);
+            }
             other => panic!("expected Attach, got {other:?}"),
         }
     }
