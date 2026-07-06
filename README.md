@@ -250,7 +250,7 @@ jdbg update
 When `--sourcepath` is omitted, jdbg uses the current working directory as the source root and sends it to
 the daemon as an absolute path. Relative `--sourcepath` values are absolutized before session creation.
 
-`jdbg update` detects which agents already had `jdbg` configured, installs the latest release, installs the official JDI sidecar jar next to the `jdbg` binary, then re-registers the same targets.
+`jdbg update` stops any running jdbg daemon before replacing the binary. It detects which agents already had `jdbg` configured, installs the latest release, installs the official JDI sidecar jar next to the `jdbg` binary, then re-registers the same targets.
 
 ## MCP Server
 
