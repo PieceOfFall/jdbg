@@ -543,13 +543,7 @@ fn dispatch_jdi_session_cmd(req: &Request, session: Arc<JdiSession>) -> Response
             line,
             condition,
             suspend,
-        } => {
-            if condition.is_some() {
-                Err(session.unsupported("conditional break_at"))
-            } else {
-                session.stop_at(class, *line, suspend.as_deref())
-            }
-        }
+        } => session.stop_at(class, *line, condition.as_deref(), suspend.as_deref()),
         Command::BreakIn {
             class,
             method,
@@ -557,13 +551,14 @@ fn dispatch_jdi_session_cmd(req: &Request, session: Arc<JdiSession>) -> Response
             args,
             condition,
             suspend,
-        } => {
-            if condition.is_some() {
-                Err(session.unsupported("conditional break_in"))
-            } else {
-                session.break_in(class, method, args.as_deref(), *event, suspend.as_deref())
-            }
-        }
+        } => session.break_in(
+            class,
+            method,
+            args.as_deref(),
+            *event,
+            condition.as_deref(),
+            suspend.as_deref(),
+        ),
         Command::Run | Command::Cont | Command::Step | Command::Next | Command::StepOut => {
             let result = match &req.cmd {
                 Command::Run => session.run(req.timeout),

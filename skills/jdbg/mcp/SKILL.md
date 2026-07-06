@@ -4,7 +4,7 @@ description: "Use when you need a Java program's real runtime state instead of r
 compatibility: "Requires a JDK 8+ (provides the `jdb` command). Debugging is driven through the `jdbg` MCP server (tools named `launch`, `break_at`, `run`, `locals`, …). Native on Windows, Linux, macOS."
 allowed-tools: "mcp__jdbg__launch, mcp__jdbg__attach, mcp__jdbg__status, mcp__jdbg__list, mcp__jdbg__kill, mcp__jdbg__break_at, mcp__jdbg__break_in, mcp__jdbg__catch, mcp__jdbg__watch, mcp__jdbg__unwatch, mcp__jdbg__breakpoints, mcp__jdbg__clear, mcp__jdbg__run, mcp__jdbg__cont, mcp__jdbg__step, mcp__jdbg__next, mcp__jdbg__step_out, mcp__jdbg__where, mcp__jdbg__locals, mcp__jdbg__print, mcp__jdbg__dump, mcp__jdbg__eval, mcp__jdbg__threads, mcp__jdbg__classes, mcp__jdbg__methods, mcp__jdbg__thread, mcp__jdbg__frame, mcp__jdbg__list_source, mcp__jdbg__inspect, mcp__jdbg__raw, mcp__jdbg__suspend, mcp__jdbg__resume, mcp__jdbg__set, mcp__jdbg__force_return, mcp__jdbg__ignore, mcp__jdbg__lock, mcp__jdbg__threadlocks, Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "2.21"
+  version: "2.22"
 ---
 
 # jdbg — interactive Java debugging for agents
@@ -118,7 +118,9 @@ Java runtime when `JDBG_JDI_JAVA` is not set.
 break_at { "class": "com.example.CartService", "line": 42, "condition": "userId == 1619458289" }
 ```
 The condition is evaluated each time the breakpoint fires; execution automatically continues if false.
-For an already-running attached JVM, if the breakpoint fires before your next blocking command, the next
+Backend differences: the **JDI** backend evaluates the condition server-side in the sidecar, so `cont`/`run`/`step`
+only stop when it holds (a bad or non-boolean condition stops with a note). For the **jdb** backend on an
+already-running attached JVM, if the breakpoint fires before your next blocking command, the next
 inspection command (`threads`, `where`, `print`, `locals`, etc.) first resolves any false conditional hit and
 continues automatically.
 
@@ -196,17 +198,19 @@ Every tool returns a typed result. The ones that drive the next move:
 Use `inspect` instead of manually looping `print expr.get(0)`, `print expr.get(1)`, etc.:
 ```
 inspect { "expr": "myList" }               → shows size + all elements (up to 10)
-inspect { "expr": "map.keySet()", "max_elements": 20 }  → first 20 keys
+inspect { "expr": "myMap", "max_elements": 20 }  → first 20 entries (inspect the map itself, not map.keySet())
 ```
 On JDI sessions, safe JSON `inspect` reads fields directly and does not invoke getters; it covers common
 `ArrayList`, `LinkedList`, `ArrayDeque`, `HashSet`, `LinkedHashSet`, `TreeMap`, `TreeSet`, `HashMap`,
-`LinkedHashMap`, unmodifiable wrappers, arrays, and ordinary objects. On jdb sessions, `inspect` keeps the
-classic collection/array summary behavior. Results include size/entries/elements and truncation metadata
-where available.
+`LinkedHashMap`, unmodifiable wrappers, arrays, and ordinary objects. It resolves locals, `this`, instance and
+static fields, field chains, and array access, but **rejects method calls** (e.g. `map.keySet()`,
+`System.getProperties()`) with a `method_invocation_not_allowed` error pointing you to `print`/`eval`. On jdb
+sessions, `inspect` keeps the classic collection/array summary behavior. Results include size/entries/elements
+and truncation metadata where available.
 
 On JDI sessions, `print`, `eval`, `dump`, `set`, and `force_return` are executable capabilities. They may
-invoke methods in the target JVM and can have side effects. Use `inspect` when you need safe field-reading
-without getters or method calls.
+invoke methods in the target JVM and can have side effects. Use `print`/`eval` for anything with a method call
+(`obj.getX()`, `System.getProperties()`); use `inspect` when you need safe field-reading without getters.
 
 After JDI `force_return`, the target VM applies the forced return when the thread resumes. A `where` call before
 the next `cont`/`step` may still show the old frame and include a note explaining that pending refresh.

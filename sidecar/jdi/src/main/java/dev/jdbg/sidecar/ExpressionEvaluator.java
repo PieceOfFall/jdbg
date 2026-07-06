@@ -59,11 +59,21 @@ final class ExpressionEvaluator {
     private final List<LocalSnapshot> locals = new ArrayList<>();
     private final ObjectReference thisObject;
     private final boolean localsUnavailable;
+    private final boolean allowInvoke;
 
     ExpressionEvaluator(VirtualMachine vm, ThreadReference thread, StackFrame frame) {
+        this(vm, thread, frame, true);
+    }
+
+    /// When {@code allowInvoke} is false the evaluator runs in read-only mode:
+    /// names, fields (instance and static), array access and literals resolve as
+    /// usual, but any method call is rejected with {@code method_invocation_not_allowed}.
+    /// This backs {@code inspect}, which must never invoke target code (getters).
+    ExpressionEvaluator(VirtualMachine vm, ThreadReference thread, StackFrame frame, boolean allowInvoke) {
         this.vm = vm;
         this.thread = thread;
         this.thisObject = frame.thisObject();
+        this.allowInvoke = allowInvoke;
         boolean unavailable = false;
         try {
             for (LocalVariable variable : frame.visibleVariables()) {
@@ -154,6 +164,12 @@ final class ExpressionEvaluator {
             return resolveArrayAccess((ArrayAccessExpr) expr);
         }
         if (expr instanceof MethodCallExpr) {
+            if (!allowInvoke) {
+                throw new RpcException(
+                        "method_invocation_not_allowed",
+                        "inspect does not invoke methods (getters may have side effects); use print/eval for '"
+                                + expr + "'");
+            }
             return Resolved.value(invoke((MethodCallExpr) expr));
         }
         if (expr instanceof CastExpr) {

@@ -1,6 +1,6 @@
 [package]
 name = "java-agent-debugger"
-version = "2.0.16"
+version = "2.0.17"
 edition = "2024"
 repository = "https://github.com/PieceOfFall/jdbg"
 description = "Cross-platform CLI debugger for Java, wrapping jdb with prompt-aware control"

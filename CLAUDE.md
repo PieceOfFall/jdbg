@@ -88,14 +88,25 @@ These are settled decisions. Changing them needs explicit user sign-off.
 
 ## JDI sidecar rules
 
-- **JDI session creation is attach-only for now.** `jdb` remains the default and supports launch. JDI launch mode
-  is still future work; `launch --backend jdi` must fail explicitly rather than silently falling back.
+- **JDI supports both launch and attach.** `jdb` remains the default backend. JDI `launch --backend jdi` starts
+  the target through the sidecar's `CommandLineLaunch` connector (state `loaded`; set breakpoints, then `run`).
+  Because the connector spawns the target in the long-lived daemon's working directory, classpath entries are
+  absolutized at the CLI/MCP boundary (`classpath_or_current`) and the sidecar drains the target's
+  stdout/stderr so a startup failure (e.g. "could not find or load main class") is visible rather than a silent
+  immediate VM exit.
 - **Sidecar protocol stays length-prefixed JSON over platform-local transport.** Windows uses two one-way Named
   Pipes; Linux/macOS use an AF_UNIX socketpair. Do not put protocol messages on stdout and do not replace this
   with gRPC/protobuf/direct Rust JDWP without explicit user sign-off.
 - **Safe inspect vs executable evaluation is a hard semantic split.** JDI `inspect` reads fields/collections
-  without invoking getters. JDI `print`, `eval`, `dump`, `set`, and `force_return` may execute target code and
-  can have side effects; keep docs, skills, and errors explicit about this.
+  (instance and static) without invoking getters; it shares the full expression grammar with `print`/`eval` but
+  runs in a no-invoke mode that rejects method calls with `method_invocation_not_allowed` pointing to
+  `print`/`eval`. JDI `print`, `eval`, `dump`, `set`, and `force_return` may execute target code and can have
+  side effects; keep docs, skills, and errors explicit about this.
+- **JDI conditional breakpoints are evaluated server-side in the sidecar event loop.** The condition rides on the
+  `BreakpointRequest`/method-event request as the `jdbg.condition` property; at each hit the sidecar evaluates it
+  in the stopped frame and resumes silently when false, so `cont`/`run`/`step` only surface a stop when the
+  condition holds. Evaluation is fail-open (a bad or non-boolean condition stops with a note). This differs from
+  the `jdb` backend, which filters false conditional hits with the Rust-side async settle mechanism.
 - **Mutation requires a suspended stop site.** JDI eval/set/force-return must fail clearly for running, dead, or
   exited sessions. `force_return` currently supports non-void values only; void force return is unsupported.
 

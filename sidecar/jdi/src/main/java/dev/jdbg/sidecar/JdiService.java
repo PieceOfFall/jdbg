@@ -3,6 +3,7 @@ package dev.jdbg.sidecar;
 import com.sun.jdi.AbsentInformationException;
 import com.sun.jdi.ArrayReference;
 import com.sun.jdi.Bootstrap;
+import com.sun.jdi.BooleanValue;
 import com.sun.jdi.ClassType;
 import com.sun.jdi.Field;
 import com.sun.jdi.IncompatibleThreadStateException;
@@ -46,6 +47,7 @@ import com.sun.jdi.request.StepRequest;
 
 import java.io.IOException;
 import java.io.File;
+import java.io.InputStream;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
@@ -199,6 +201,7 @@ final class JdiService {
         VirtualMachine vm = connector.launch(args);
         DebugSession session = new DebugSession(id, vm, stringList(params, "sourcepath"));
         sessions.put(id, session);
+        session.startOutputForwarders();
         session.startEventLoop();
         return Json.object("ok", true, "session", id);
     }
@@ -338,6 +341,49 @@ final class JdiService {
             thread.start();
         }
 
+        // The CommandLineLaunch connector spawns the target JVM as a child process whose
+        // stdout/stderr must be drained continuously: an unread pipe eventually fills and
+        // blocks the target, and a startup failure such as "Could not find or load main
+        // class X" is written there and would otherwise be invisible (the VM just exits).
+        // Forward both streams to the sidecar's stderr, which the Rust side surfaces via
+        // take_stderr() on the next command response.
+        void startOutputForwarders() {
+            Process process;
+            try {
+                process = vm.process();
+            } catch (UnsupportedOperationException e) {
+                return; // attach sessions and some connectors have no child process
+            }
+            if (process == null) {
+                return;
+            }
+            forwardStream(process.getInputStream(), "stdout");
+            forwardStream(process.getErrorStream(), "stderr");
+        }
+
+        private void forwardStream(InputStream stream, String label) {
+            if (stream == null) {
+                return;
+            }
+            Thread thread = new Thread(() -> {
+                byte[] buffer = new byte[4096];
+                try {
+                    int read;
+                    while ((read = stream.read(buffer)) != -1) {
+                        if (read > 0) {
+                            System.err.write(("[target " + label + "] ").getBytes(StandardCharsets.UTF_8));
+                            System.err.write(buffer, 0, read);
+                            System.err.flush();
+                        }
+                    }
+                } catch (IOException ignored) {
+                    // Stream closed on target exit; nothing more to forward.
+                }
+            }, "jdbg-jdi-target-" + label + "-" + id);
+            thread.setDaemon(true);
+            thread.start();
+        }
+
         Object threads() {
             List<Object> threads = Json.array();
             for (ThreadReference thread : vm.allThreads()) {
@@ -406,16 +452,17 @@ final class JdiService {
             String className = Json.string(params, "class");
             int line = Json.intValue(params, "line", 0);
             String suspend = Json.optionalString(params, "suspend", "all");
+            String condition = Json.optionalString(params, "condition", null);
             int suspendPolicy = "thread".equals(suspend)
                     ? EventRequest.SUSPEND_EVENT_THREAD
                     : EventRequest.SUSPEND_ALL;
             List<ReferenceType> loaded = vm.classesByName(className);
             if (!loaded.isEmpty()) {
-                createBreakpoint(loaded.get(0), line, suspendPolicy, className + ":" + line);
+                createBreakpoint(loaded.get(0), line, suspendPolicy, className + ":" + line, condition);
                 return Json.object("spec", className + ":" + line, "deferred", false);
             }
 
-            PendingBreakpoint pending = new PendingBreakpoint(className, line, suspendPolicy);
+            PendingBreakpoint pending = new PendingBreakpoint(className, line, suspendPolicy, condition);
             pendingBreakpoints.add(pending);
             ClassPrepareRequest request = vm.eventRequestManager().createClassPrepareRequest();
             request.addClassFilter(className);
@@ -533,11 +580,16 @@ final class JdiService {
             int suspendPolicy = "thread".equals(spec.suspend)
                     ? EventRequest.SUSPEND_EVENT_THREAD
                     : EventRequest.SUSPEND_ALL;
+            String condition = Json.optionalString(params, "condition", null);
+            boolean hasCondition = condition != null && !condition.trim().isEmpty();
             if ("entry".equals(spec.eventKind) || "both".equals(spec.eventKind)) {
                 MethodEntryRequest request = vm.eventRequestManager().createMethodEntryRequest();
                 request.addClassFilter(spec.className);
                 request.setSuspendPolicy(suspendPolicy);
                 request.putProperty("jdbg.methodSpec", spec);
+                if (hasCondition) {
+                    request.putProperty("jdbg.condition", condition);
+                }
                 request.enable();
                 activeMethodEvents.add(new ActiveMethodEvent(spec, "entry", request));
             }
@@ -546,6 +598,9 @@ final class JdiService {
                 request.addClassFilter(spec.className);
                 request.setSuspendPolicy(suspendPolicy);
                 request.putProperty("jdbg.methodSpec", spec);
+                if (hasCondition) {
+                    request.putProperty("jdbg.condition", condition);
+                }
                 request.enable();
                 activeMethodEvents.add(new ActiveMethodEvent(spec, "exit", request));
             }
@@ -956,7 +1011,10 @@ final class JdiService {
         Object inspect(Map<String, Object> params) throws RpcException {
             String expr = Json.string(params, "expr");
             Map<String, Object> limits = Json.asObject(params.get("limits"), "limits");
-            Value value = resolveExpression(expr);
+            // inspect is read-only: reuse the full expression grammar (static fields,
+            // field chains, array access) but reject method calls so no getter runs.
+            EvaluationContext context = evaluationContext();
+            Value value = new ExpressionEvaluator(vm, context.thread, context.frame, false).evaluate(expr);
             return Json.object(
                     "expr", expr,
                     "value", ValueRenderer.render(value, limits)
@@ -1075,8 +1133,13 @@ final class JdiService {
                             shouldResume = false;
                             handleWatchStop(eventSet, (WatchpointEvent) event, "accessed");
                         } else if (event instanceof BreakpointEvent) {
-                            shouldResume = false;
-                            handleStop(eventSet, "breakpoint", ((BreakpointEvent) event).thread(), ((BreakpointEvent) event).location(), null);
+                            BreakpointEvent bp = (BreakpointEvent) event;
+                            String[] note = new String[1];
+                            if (conditionHolds(bp.request(), bp.thread(), note)) {
+                                shouldResume = false;
+                                handleStop(eventSet, "breakpoint", bp.thread(), bp.location(), note[0]);
+                            }
+                            // Condition false → leave shouldResume true so the set resumes silently.
                         } else if (event instanceof StepEvent) {
                             shouldResume = false;
                             StepEvent step = (StepEvent) event;
@@ -1149,7 +1212,11 @@ final class JdiService {
             if (spec == null || !spec.matches(event.method())) {
                 return false;
             }
-            handleStop(eventSet, "methodEntry", event.thread(), event.location(), null);
+            String[] note = new String[1];
+            if (!conditionHolds(event.request(), event.thread(), note)) {
+                return false;
+            }
+            handleStop(eventSet, "methodEntry", event.thread(), event.location(), note[0]);
             return true;
         }
 
@@ -1158,7 +1225,11 @@ final class JdiService {
             if (spec == null || !spec.matches(event.method())) {
                 return false;
             }
-            Map<String, Object> stop = stopPayload("methodExit", event.thread(), event.location(), null);
+            String[] note = new String[1];
+            if (!conditionHolds(event.request(), event.thread(), note)) {
+                return false;
+            }
+            Map<String, Object> stop = stopPayload("methodExit", event.thread(), event.location(), note[0]);
             Value value = event.returnValue();
             stop.put("returnValue", ValueRenderer.display(value));
             stop.put("returnType", value == null ? event.method().returnTypeName() : value.type().name());
@@ -1176,6 +1247,39 @@ final class JdiService {
         private MethodSpec methodSpec(EventRequest request) {
             Object value = request.getProperty("jdbg.methodSpec");
             return value instanceof MethodSpec ? (MethodSpec) value : null;
+        }
+
+        /// Evaluate a breakpoint's condition (if any) at the hit site.
+        ///
+        /// Returns true when the breakpoint should suspend — i.e. no condition is
+        /// attached, or the condition evaluates to boolean true. Returns false when a
+        /// condition is present and evaluates to false, so the caller resumes silently
+        /// without reporting a stop. On evaluation error or a non-boolean result the
+        /// breakpoint stops (fail-open) and the reason is written to {@code noteOut[0]}
+        /// so the agent sees why. Conditions may invoke target methods, just like jdb.
+        private boolean conditionHolds(EventRequest request, ThreadReference thread, String[] noteOut) {
+            Object raw = request.getProperty("jdbg.condition");
+            if (!(raw instanceof String)) {
+                return true;
+            }
+            String condition = ((String) raw).trim();
+            if (condition.isEmpty()) {
+                return true;
+            }
+            try {
+                StackFrame frame = thread.frame(0);
+                Value value = new ExpressionEvaluator(vm, thread, frame, true).evaluate(condition);
+                if (value instanceof BooleanValue) {
+                    return ((BooleanValue) value).booleanValue();
+                }
+                noteOut[0] = "condition \"" + condition
+                        + "\" did not evaluate to a boolean; stopping.";
+                return true;
+            } catch (Exception e) {
+                noteOut[0] = "condition \"" + condition + "\" evaluation failed ("
+                        + e.getMessage() + "); stopping.";
+                return true;
+            }
         }
 
         private void handleVmStart(EventSet eventSet) {
@@ -1291,7 +1395,7 @@ final class JdiService {
             while (it.hasNext()) {
                 PendingBreakpoint pending = it.next();
                 if (pending.className.equals(name)) {
-                    createBreakpoint(event.referenceType(), pending.line, pending.suspendPolicy, pending.spec());
+                    createBreakpoint(event.referenceType(), pending.line, pending.suspendPolicy, pending.spec(), pending.condition);
                     if (pending.prepareRequest != null) {
                         vm.eventRequestManager().deleteEventRequest(pending.prepareRequest);
                     }
@@ -1311,13 +1415,16 @@ final class JdiService {
             }
         }
 
-        private void createBreakpoint(ReferenceType type, int line, int suspendPolicy, String spec) throws Exception {
+        private void createBreakpoint(ReferenceType type, int line, int suspendPolicy, String spec, String condition) throws Exception {
             List<Location> locations = type.locationsOfLine(line);
             if (locations.isEmpty()) {
                 throw new RpcException("no_executable_line", "no executable location at " + type.name() + ":" + line);
             }
             BreakpointRequest request = vm.eventRequestManager().createBreakpointRequest(locations.get(0));
             request.setSuspendPolicy(suspendPolicy);
+            if (condition != null && !condition.trim().isEmpty()) {
+                request.putProperty("jdbg.condition", condition);
+            }
             request.enable();
             activeBreakpoints.add(new ActiveBreakpoint(spec, type.name(), line, request));
         }
@@ -1811,12 +1918,14 @@ final class JdiService {
         final String className;
         final int line;
         final int suspendPolicy;
+        final String condition;
         ClassPrepareRequest prepareRequest;
 
-        PendingBreakpoint(String className, int line, int suspendPolicy) {
+        PendingBreakpoint(String className, int line, int suspendPolicy, String condition) {
             this.className = className;
             this.line = line;
             this.suspendPolicy = suspendPolicy;
+            this.condition = condition;
         }
 
         String spec() {

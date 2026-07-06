@@ -302,6 +302,7 @@ impl JdiSession {
         &self,
         class: &str,
         line: u32,
+        condition: Option<&str>,
         suspend: Option<&str>,
     ) -> Result<CommandResponse> {
         let _guard = self
@@ -316,6 +317,7 @@ impl JdiSession {
                 "session": self.meta.id,
                 "class": class,
                 "line": line,
+                "condition": condition,
                 "suspend": suspend.unwrap_or("all"),
             }),
             SIDECAR_REQUEST_TIMEOUT,
@@ -339,6 +341,7 @@ impl JdiSession {
         method: &str,
         args: Option<&str>,
         event: MethodEventKind,
+        condition: Option<&str>,
         suspend: Option<&str>,
     ) -> Result<CommandResponse> {
         let _guard = self
@@ -355,6 +358,7 @@ impl JdiSession {
                 "method": method,
                 "args": args,
                 "event": event,
+                "condition": condition,
                 "suspend": suspend.unwrap_or("all"),
             }),
             SIDECAR_REQUEST_TIMEOUT,
@@ -722,7 +726,9 @@ impl JdiSession {
             result: CommandResult::Raw { text },
             stderr: self.sidecar.take_stderr(),
             note: Some(
-                "JDI inspect returns a structured JSON value; getters are not invoked.".into(),
+                "JDI inspect is read-only (structured JSON; getters/methods are not invoked). \
+                 For method calls like obj.getX() use print/eval instead."
+                    .into(),
             ),
         })
     }
@@ -1041,13 +1047,6 @@ impl JdiSession {
             stderr: self.sidecar.take_stderr(),
             note: Some("Use a first-class jdbg command or a supported JDI raw alias.".into()),
         })
-    }
-
-    pub fn unsupported(&self, operation: &str) -> Error {
-        Error::UnsupportedBackend {
-            backend: "jdi".into(),
-            operation: operation.into(),
-        }
     }
 
     fn resume_like(&self, method: &str, timeout: Option<u64>) -> Result<CommandResponse> {

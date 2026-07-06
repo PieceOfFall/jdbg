@@ -942,7 +942,7 @@ fn jdi_inspect_renders_structured_value_kinds() {
         "System.out.println(root.name);",
     );
     let breakpoint = session
-        .stop_at("StructuredInspectTest", inspect_line, None)
+        .stop_at("StructuredInspectTest", inspect_line, None, None)
         .expect("JDI structured breakpoint failed");
     assert!(
         matches!(
@@ -1004,7 +1004,7 @@ fn jdi_inspect_specializes_advanced_collections_and_maps() {
         "System.out.println(holder.linkedList.size());",
     );
     session
-        .stop_at("AdvancedCollectionsTest", inspect_line, None)
+        .stop_at("AdvancedCollectionsTest", inspect_line, None, None)
         .expect("JDI advanced breakpoint failed");
     let stop = session.cont(Some(30)).expect("JDI cont failed");
     assert!(
@@ -1182,7 +1182,7 @@ fn jdi_step_over_returns_step_event_with_stack_and_locals() {
         "System.out.println(root.name);",
     );
     session
-        .stop_at("StructuredInspectTest", inspect_line, None)
+        .stop_at("StructuredInspectTest", inspect_line, None, None)
         .expect("JDI step breakpoint failed");
     let stop = session.cont(Some(30)).expect("JDI cont failed");
     assert!(
@@ -1246,7 +1246,7 @@ fn jdi_command_surface_supports_metadata_source_raw_and_array_length() {
 
     let line = fixture_line("JdiLaunchTest.java", "System.out.println(label");
     session
-        .stop_at("JdiLaunchTest", line, None)
+        .stop_at("JdiLaunchTest", line, None, None)
         .expect("JDI launch breakpoint failed");
 
     let breakpoints = session.breakpoints().expect("JDI breakpoints failed");
@@ -1269,7 +1269,7 @@ fn jdi_command_surface_supports_metadata_source_raw_and_array_length() {
         clear.result
     );
     session
-        .stop_at("JdiLaunchTest", line, None)
+        .stop_at("JdiLaunchTest", line, None, None)
         .expect("JDI launch breakpoint reset failed");
 
     let stop = session.run(Some(30)).expect("JDI launch run failed");
@@ -1407,7 +1407,7 @@ public class MavenSourcePathTest {
     )
     .expect("JDI attach failed");
     session
-        .stop_at("com.example.web.MavenSourcePathTest", line, None)
+        .stop_at("com.example.web.MavenSourcePathTest", line, None, None)
         .expect("JDI Maven source breakpoint failed");
     let stop = session
         .cont(Some(30))
@@ -1461,7 +1461,7 @@ fn jdi_frame_step_out_suspend_and_lock_commands_work() {
 
     let compute_line = fixture_line("EvalMutationTest.java", "int before = box.add(values[1]);");
     session
-        .stop_at("EvalMutationTest", compute_line, None)
+        .stop_at("EvalMutationTest", compute_line, None, None)
         .expect("JDI compute breakpoint failed");
     let stop = session.cont(Some(30)).expect("JDI cont to compute failed");
     assert!(
@@ -1642,7 +1642,7 @@ fn jdi_eval_set_and_force_return_execute_in_stopped_frame() {
 
     let compute_line = fixture_line("EvalMutationTest.java", "int before = box.add(values[1]);");
     session
-        .stop_at("EvalMutationTest", compute_line, None)
+        .stop_at("EvalMutationTest", compute_line, None, None)
         .expect("JDI compute breakpoint failed");
     let stop = session.cont(Some(30)).expect("JDI cont to compute failed");
     match &stop.result {
@@ -1679,7 +1679,7 @@ fn jdi_eval_set_and_force_return_execute_in_stopped_frame() {
         .expect("JDI array set failed");
     let post_return_line = fixture_line("EvalMutationTest.java", "System.out.println(\"result=\"");
     session
-        .stop_at("EvalMutationTest", post_return_line, None)
+        .stop_at("EvalMutationTest", post_return_line, None, None)
         .expect("JDI post-return breakpoint failed");
     session
         .force_return("123")
@@ -1750,7 +1750,7 @@ fn jdi_launch_breakpoint_run_locals_and_cont() {
 
     let line = fixture_line("JdiLaunchTest.java", "System.out.println(label");
     session
-        .stop_at("JdiLaunchTest", line, None)
+        .stop_at("JdiLaunchTest", line, None, None)
         .expect("JDI launch breakpoint failed");
 
     let stop = session.run(Some(30)).expect("JDI launch run failed");
@@ -1790,6 +1790,107 @@ fn jdi_launch_breakpoint_run_locals_and_cont() {
 }
 
 #[test]
+fn jdi_conditional_breakpoint_stops_only_when_condition_true() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("JdiLaunchTest.java");
+    let classpath = vec![fixture_dir().display().to_string()];
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::launch(
+        "JdiLaunchTest",
+        &classpath,
+        &sourcepath,
+        &[],
+        "jdi-conditional-break".into(),
+        None,
+    )
+    .expect("JDI launch failed");
+
+    // The loop body `sum += i;` is hit for i = 0, 1, 2; the sidecar must evaluate the
+    // condition at each hit and only suspend when it holds.
+    let line = fixture_line("JdiLaunchTest.java", "sum += i");
+    session
+        .stop_at("JdiLaunchTest", line, Some("i == 2"), None)
+        .expect("JDI conditional breakpoint failed");
+
+    let stop = session.run(Some(30)).expect("JDI conditional run failed");
+    match &stop.result {
+        CommandResult::Stopped {
+            event: Event::Breakpoint { .. },
+            location,
+            ..
+        } => assert_eq!(location.line, line),
+        other => panic!("expected conditional breakpoint stop, got {other:?}"),
+    }
+
+    let locals = session.locals().expect("JDI conditional locals failed");
+    match &locals.result {
+        CommandResult::Locals { vars } => assert!(
+            vars.iter().any(|var| var.name == "i" && var.value == "2"),
+            "conditional breakpoint should stop when i == 2, got {vars:?}"
+        ),
+        other => panic!("expected locals at conditional stop, got {other:?}"),
+    }
+
+    let exited = session.cont(Some(30)).expect("JDI conditional cont failed");
+    assert!(
+        matches!(exited.result, CommandResult::VmExited { .. }),
+        "expected VM to exit after the single conditional hit, got {:?}",
+        exited.result
+    );
+
+    let _ = session.kill();
+}
+
+#[test]
+fn jdi_inspect_rejects_method_calls_with_guidance() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("JdiLaunchTest.java");
+    let classpath = vec![fixture_dir().display().to_string()];
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::launch(
+        "JdiLaunchTest",
+        &classpath,
+        &sourcepath,
+        &[],
+        "jdi-inspect-reject".into(),
+        None,
+    )
+    .expect("JDI launch failed");
+
+    let line = fixture_line("JdiLaunchTest.java", "System.out.println(label");
+    session
+        .stop_at("JdiLaunchTest", line, None, None)
+        .expect("JDI breakpoint failed");
+    session.run(Some(30)).expect("JDI run failed");
+
+    // inspect is read-only: a method call must be rejected with a clear pointer to print/eval.
+    let err = session
+        .inspect("label.length()", 10)
+        .expect_err("inspect of a method call should be rejected");
+    let msg = err.to_string();
+    assert!(
+        msg.contains("method_invocation_not_allowed") && msg.contains("print/eval"),
+        "inspect method-call error should guide to print/eval, got: {msg}"
+    );
+
+    // A plain field/variable reference still inspects fine.
+    let ok = session
+        .inspect("label", 10)
+        .expect("inspect of a variable should still work");
+    assert!(
+        matches!(ok.result, CommandResult::Raw { .. }),
+        "expected structured inspect value, got {:?}",
+        ok.result
+    );
+
+    let _ = session.kill();
+}
+
+#[test]
 fn jdi_async_breakpoint_after_timeout_updates_status_and_resumes_cleanly() {
     use java_agent_debugger::jdi::session::JdiSession;
 
@@ -1822,7 +1923,7 @@ fn jdi_async_breakpoint_after_timeout_updates_status_and_resumes_cleanly() {
 
     let line = fixture_line("AsyncBreakpointTest.java", "ASYNC_BREAKPOINT");
     session
-        .stop_at("AsyncBreakpointTest", line, None)
+        .stop_at("AsyncBreakpointTest", line, None, None)
         .expect("JDI async breakpoint failed");
 
     // Worker is still blocked on the gate, so this run cannot hit the breakpoint and
@@ -1953,6 +2054,7 @@ fn jdi_cont_waits_for_thread_suspend_breakpoint_triggered_while_running() {
         .stop_at(
             "ExternalTriggerBreakpointTest$Handler",
             line,
+            None,
             Some("thread"),
         )
         .expect("JDI external trigger breakpoint failed");
@@ -2137,6 +2239,7 @@ fn jdi_method_entry_and_exit_events_stop_with_return_value() {
             "work",
             Some("int,java.lang.String"),
             MethodEventKind::Entry,
+            None,
             Some("thread"),
         )
         .expect("JDI method entry breakpoint failed");
@@ -2179,6 +2282,7 @@ fn jdi_method_entry_and_exit_events_stop_with_return_value() {
             "work",
             Some("int,java.lang.String"),
             MethodEventKind::Exit,
+            None,
             Some("thread"),
         )
         .expect("JDI method exit breakpoint failed");
@@ -2228,6 +2332,7 @@ fn jdi_method_both_stops_on_entry_then_exit() {
             "work",
             Some("int,java.lang.String"),
             MethodEventKind::Both,
+            None,
             None,
         )
         .expect("JDI method both breakpoint failed");
@@ -2418,7 +2523,7 @@ fn jdi_concurrent_state_probe_repro() {
             .expect("JDI attach failed"),
         );
         session
-            .stop_at("JdiLaunchTest", line, None)
+            .stop_at("JdiLaunchTest", line, None, None)
             .expect("break-at failed");
 
         // Background hammer: mimic other clients sweeping this session's state().

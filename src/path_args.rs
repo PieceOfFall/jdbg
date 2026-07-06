@@ -7,6 +7,24 @@ use std::path::{Path, PathBuf};
 /// The daemon and sidecar are long-lived, so relative paths from a later CLI/MCP
 /// request may otherwise be resolved against an older daemon working directory.
 pub fn sourcepath_or_current(raw: Option<&str>) -> Vec<String> {
+    absolutize_path_list(raw)
+}
+
+/// Build classpath entries for a launched target VM.
+///
+/// The sidecar/`jdb` launches the target via a long-lived daemon, so relative
+/// classpath entries (e.g. `.` or `out`) would otherwise resolve against the
+/// daemon's working directory rather than the caller's — the class is then not
+/// found and the VM exits immediately. Absolutize every entry against the CLI's
+/// current directory (and default to it when none is supplied) so the launch is
+/// independent of the daemon cwd.
+pub fn classpath_or_current(raw: Option<&str>) -> Vec<String> {
+    absolutize_path_list(raw)
+}
+
+/// Split an OS-path-separated list, absolutize each entry against the current
+/// directory, and default to the current directory when the list is empty.
+fn absolutize_path_list(raw: Option<&str>) -> Vec<String> {
     let paths: Vec<PathBuf> = match raw.filter(|s| !s.trim().is_empty()) {
         Some(value) => std::env::split_paths(value).collect(),
         None => vec![std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."))],
@@ -64,6 +82,26 @@ mod tests {
 
         assert_eq!(
             paths,
+            vec![protocol_path_string(
+                std::env::current_dir().unwrap().canonicalize().unwrap()
+            )]
+        );
+    }
+
+    #[test]
+    fn classpath_defaults_to_current_dir() {
+        assert_eq!(
+            classpath_or_current(None),
+            vec![protocol_path_string(
+                std::env::current_dir().unwrap().canonicalize().unwrap()
+            )]
+        );
+    }
+
+    #[test]
+    fn relative_classpath_is_absolutized() {
+        assert_eq!(
+            classpath_or_current(Some(".")),
             vec![protocol_path_string(
                 std::env::current_dir().unwrap().canonicalize().unwrap()
             )]

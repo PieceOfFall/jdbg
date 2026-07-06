@@ -9,7 +9,7 @@ use serde::Serialize;
 use serde_json::{Map, Value, json};
 
 use super::jsonrpc::{INVALID_PARAMS, JsonRpcError, METHOD_NOT_FOUND};
-use crate::path_args::sourcepath_or_current;
+use crate::path_args::{classpath_or_current, sourcepath_or_current};
 use crate::protocol::{BackendKind, Command, MethodEventKind, Request};
 
 /// Public description of a tool, serialized into `tools/list`.
@@ -423,7 +423,7 @@ pub fn dispatch_tool(name: &str, args: &Value) -> Result<Request, JsonRpcError> 
         "launch" => Command::Launch {
             main_class: require_str(args, "main_class")?,
             backend: optional_backend(args)?,
-            classpath: str_to_vec(optional_str(args, "classpath")),
+            classpath: classpath_or_current(optional_str(args, "classpath").as_deref()),
             sourcepath: sourcepath_or_current(optional_str(args, "sourcepath").as_deref()),
             app_args: optional_str_array(args, "app_args"),
             jdb_args: optional_str_array(args, "jdb_args"),
@@ -667,11 +667,6 @@ fn optional_str_array(args: &Value, key: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-/// classpath: MCP accepts a single string and wraps it in a Vec of length <= 1, matching `main.rs`.
-fn str_to_vec(opt: Option<String>) -> Vec<String> {
-    opt.map(|s| vec![s]).unwrap_or_default()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -699,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn launch_maps_classpath_string_to_vec() {
+    fn launch_absolutizes_classpath() {
         let req =
             dispatch_tool("launch", &json!({"main_class": "Main", "classpath": "out"})).unwrap();
         match req.cmd {
@@ -709,7 +704,24 @@ mod tests {
                 ..
             } => {
                 assert_eq!(main_class, "Main");
-                assert_eq!(classpath, vec!["out".to_string()]);
+                // Relative classpath entries are absolutized against the CLI cwd so
+                // the launch does not depend on the long-lived daemon's directory.
+                assert_eq!(classpath, classpath_or_current(Some("out")));
+                assert!(
+                    classpath.iter().all(|p| std::path::Path::new(p).is_absolute()),
+                    "classpath entries should be absolute: {classpath:?}"
+                );
+            }
+            other => panic!("expected Launch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn launch_defaults_classpath_to_current_dir() {
+        let req = dispatch_tool("launch", &json!({"main_class": "Main"})).unwrap();
+        match req.cmd {
+            Command::Launch { classpath, .. } => {
+                assert_eq!(classpath, classpath_or_current(None));
             }
             other => panic!("expected Launch, got {other:?}"),
         }

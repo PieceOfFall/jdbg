@@ -10,7 +10,7 @@ use java_agent_debugger::client;
 use java_agent_debugger::daemon;
 use java_agent_debugger::mcp;
 use java_agent_debugger::output;
-use java_agent_debugger::path_args::sourcepath_or_current;
+use java_agent_debugger::path_args::{classpath_or_current, sourcepath_or_current};
 use java_agent_debugger::protocol::*;
 use java_agent_debugger::setup;
 use java_agent_debugger::update;
@@ -121,10 +121,7 @@ fn build_command(cli: &Cli) -> anyhow::Result<Command> {
         } => Command::Launch {
             main_class: main_class.clone(),
             backend: backend.parse().map_err(|e: String| anyhow::anyhow!(e))?,
-            classpath: classpath
-                .as_deref()
-                .map(|s| vec![s.to_string()])
-                .unwrap_or_default(),
+            classpath: classpath_or_current(classpath.as_deref()),
             sourcepath: sourcepath_or_current(sourcepath.as_deref()),
             app_args: app_args.clone(),
             jdb_args: jdb_args.clone(),

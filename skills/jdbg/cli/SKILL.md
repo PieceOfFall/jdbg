@@ -4,7 +4,7 @@ description: "Use the jdbg CLI to debug Java programs interactively from Pi when
 compatibility: "Requires a JDK 8+ with jdb available through JAVA_HOME, PATH, or --jdb-path. Requires the jdbg CLI on PATH. Native on Windows, Linux, and macOS."
 allowed-tools: "Bash(jdbg:*), Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "1.14"
+  version: "1.15"
 ---
 
 # jdbg CLI - interactive Java debugging for Pi
@@ -192,9 +192,10 @@ Conditional breakpoint:
 jdbg break-at com.example.Service 87 --condition "userId == 123"
 ```
 
-False conditional hits auto-continue. In an already-running attached JVM, if a conditional breakpoint fires
-before your next blocking command, the next inspection command (`threads`, `where`, `print`, `locals`, etc.)
-first resolves the condition.
+False conditional hits auto-continue. On the **JDI** backend the condition is evaluated server-side, so
+`cont`/`run`/`step` only stop when it holds. On the **jdb** backend against an already-running attached JVM, if a
+conditional breakpoint fires before your next blocking command, the next inspection command (`threads`, `where`,
+`print`, `locals`, etc.) first resolves the condition.
 
 Thread-only breakpoint, useful in servers:
 
@@ -267,11 +268,13 @@ jdbg inspect "items" --max-elements 20
 
 On JDI sessions, safe JSON `inspect` reads fields directly and does not invoke getters. It covers common
 `ArrayList`, `LinkedList`, `ArrayDeque`, `HashSet`, `LinkedHashSet`, `TreeMap`, `TreeSet`, `HashMap`,
-`LinkedHashMap`, unmodifiable wrappers, arrays, and ordinary objects.
+`LinkedHashMap`, unmodifiable wrappers, arrays, and ordinary objects. It resolves locals, `this`, instance and
+static fields, field chains, and array access, but rejects method calls (e.g. `map.keySet()`) with a
+`method_invocation_not_allowed` error — use `print`/`eval` for those.
 
 On JDI sessions, `print`, `eval`, `dump`, `set`, and `force-return` are executable capabilities. They may
-invoke methods in the target JVM and can have side effects. Use `inspect` when you need safe field-reading
-without getters or method calls.
+invoke methods in the target JVM and can have side effects. Use `print`/`eval` for anything with a method call;
+use `inspect` when you need safe field-reading without getters.
 
 Source context:
 
