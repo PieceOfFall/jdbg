@@ -220,7 +220,7 @@ impl JdiSession {
             SIDECAR_REQUEST_TIMEOUT,
         )?;
         let mut payload: ThreadsPayload = serde_json::from_value(value)
-            .map_err(|e| Error::Connection(format!("invalid JDI threads response: {e}")))?;
+            .map_err(|e| Error::Jdi(format!("invalid JDI threads response: {e}")))?;
         if let Some(filter) = filter.filter(|f| !f.is_empty()) {
             let needle = filter.to_lowercase();
             payload
@@ -250,7 +250,7 @@ impl JdiSession {
                 SIDECAR_REQUEST_TIMEOUT,
             )?;
             let payload: StacksPayload = serde_json::from_value(value)
-                .map_err(|e| Error::Connection(format!("invalid JDI stacks response: {e}")))?;
+                .map_err(|e| Error::Jdi(format!("invalid JDI stacks response: {e}")))?;
             return Ok(CommandResponse {
                 result: CommandResult::ThreadStackTrace {
                     threads: payload.threads,
@@ -267,7 +267,7 @@ impl JdiSession {
             SIDECAR_REQUEST_TIMEOUT,
         )?;
         let payload: StackPayload = serde_json::from_value(value)
-            .map_err(|e| Error::Connection(format!("invalid JDI stack response: {e}")))?;
+            .map_err(|e| Error::Jdi(format!("invalid JDI stack response: {e}")))?;
         Ok(CommandResponse {
             result: CommandResult::StackTrace {
                 frames: payload.frames,
@@ -290,7 +290,7 @@ impl JdiSession {
             SIDECAR_REQUEST_TIMEOUT,
         )?;
         let payload: LocalsPayload = serde_json::from_value(value)
-            .map_err(|e| Error::Connection(format!("invalid JDI locals response: {e}")))?;
+            .map_err(|e| Error::Jdi(format!("invalid JDI locals response: {e}")))?;
         Ok(CommandResponse {
             result: CommandResult::Locals { vars: payload.vars },
             stderr: self.sidecar.take_stderr(),
@@ -323,7 +323,7 @@ impl JdiSession {
             SIDECAR_REQUEST_TIMEOUT,
         )?;
         let payload: BreakpointPayload = serde_json::from_value(value)
-            .map_err(|e| Error::Connection(format!("invalid JDI breakpoint response: {e}")))?;
+            .map_err(|e| Error::Jdi(format!("invalid JDI breakpoint response: {e}")))?;
         Ok(CommandResponse {
             result: CommandResult::BreakpointSet {
                 spec: payload.spec,
@@ -364,7 +364,7 @@ impl JdiSession {
             SIDECAR_REQUEST_TIMEOUT,
         )?;
         let payload: BreakpointPayload = serde_json::from_value(value)
-            .map_err(|e| Error::Connection(format!("invalid JDI method event response: {e}")))?;
+            .map_err(|e| Error::Jdi(format!("invalid JDI method event response: {e}")))?;
         Ok(CommandResponse {
             result: CommandResult::BreakpointSet {
                 spec: payload.spec,
@@ -393,7 +393,7 @@ impl JdiSession {
             SIDECAR_REQUEST_TIMEOUT,
         )?;
         let payload: WatchpointPayload = serde_json::from_value(value)
-            .map_err(|e| Error::Connection(format!("invalid JDI watchpoint response: {e}")))?;
+            .map_err(|e| Error::Jdi(format!("invalid JDI watchpoint response: {e}")))?;
         Ok(CommandResponse {
             result: CommandResult::WatchSet {
                 spec: payload.spec,
@@ -443,7 +443,7 @@ impl JdiSession {
             SIDECAR_REQUEST_TIMEOUT,
         )?;
         let payload: BreakpointsPayload = serde_json::from_value(value)
-            .map_err(|e| Error::Connection(format!("invalid JDI breakpoints response: {e}")))?;
+            .map_err(|e| Error::Jdi(format!("invalid JDI breakpoints response: {e}")))?;
         Ok(CommandResponse {
             result: CommandResult::BreakpointList {
                 breakpoints: payload.breakpoints,
@@ -466,7 +466,7 @@ impl JdiSession {
             SIDECAR_REQUEST_TIMEOUT,
         )?;
         let payload: RemovedPayload = serde_json::from_value(value)
-            .map_err(|e| Error::Connection(format!("invalid JDI clear response: {e}")))?;
+            .map_err(|e| Error::Jdi(format!("invalid JDI clear response: {e}")))?;
         Ok(CommandResponse {
             result: CommandResult::Raw {
                 text: format!(
@@ -492,7 +492,7 @@ impl JdiSession {
             SIDECAR_REQUEST_TIMEOUT,
         )?;
         let payload: BreakpointPayload = serde_json::from_value(value)
-            .map_err(|e| Error::Connection(format!("invalid JDI catch response: {e}")))?;
+            .map_err(|e| Error::Jdi(format!("invalid JDI catch response: {e}")))?;
         Ok(CommandResponse {
             result: CommandResult::BreakpointSet {
                 spec: payload.spec,
@@ -517,7 +517,7 @@ impl JdiSession {
             SIDECAR_REQUEST_TIMEOUT,
         )?;
         let payload: RemovedPayload = serde_json::from_value(value)
-            .map_err(|e| Error::Connection(format!("invalid JDI ignore response: {e}")))?;
+            .map_err(|e| Error::Jdi(format!("invalid JDI ignore response: {e}")))?;
         Ok(CommandResponse {
             result: CommandResult::Raw {
                 text: format!(
@@ -552,7 +552,7 @@ impl JdiSession {
         {
             let inner = self.inner.lock().expect("jdi session mutex poisoned");
             if inner.state != RunState::Loaded {
-                return Err(Error::Connection(format!(
+                return Err(Error::Jdi(format!(
                     "JDI run is only valid before a launched VM starts; current state is {:?}",
                     inner.state
                 )));
@@ -598,7 +598,7 @@ impl JdiSession {
             SIDECAR_REQUEST_TIMEOUT,
         )?;
         let payload: ClassesPayload = serde_json::from_value(value)
-            .map_err(|e| Error::Connection(format!("invalid JDI classes response: {e}")))?;
+            .map_err(|e| Error::Jdi(format!("invalid JDI classes response: {e}")))?;
         Ok(CommandResponse {
             result: CommandResult::Classes {
                 classes: payload.classes,
@@ -621,7 +621,7 @@ impl JdiSession {
             SIDECAR_REQUEST_TIMEOUT,
         )?;
         let payload: MethodsPayload = serde_json::from_value(value)
-            .map_err(|e| Error::Connection(format!("invalid JDI methods response: {e}")))?;
+            .map_err(|e| Error::Jdi(format!("invalid JDI methods response: {e}")))?;
         Ok(CommandResponse {
             result: CommandResult::Methods {
                 class: payload.class,
@@ -666,7 +666,7 @@ impl JdiSession {
             SIDECAR_REQUEST_TIMEOUT,
         )?;
         let payload: TextPayload = serde_json::from_value(value)
-            .map_err(|e| Error::Connection(format!("invalid JDI frame response: {e}")))?;
+            .map_err(|e| Error::Jdi(format!("invalid JDI frame response: {e}")))?;
         Ok(CommandResponse {
             result: CommandResult::Raw { text: payload.text },
             stderr: self.sidecar.take_stderr(),
@@ -687,7 +687,7 @@ impl JdiSession {
             SIDECAR_REQUEST_TIMEOUT,
         )?;
         let payload: SourcePayload = serde_json::from_value(value)
-            .map_err(|e| Error::Connection(format!("invalid JDI source response: {e}")))?;
+            .map_err(|e| Error::Jdi(format!("invalid JDI source response: {e}")))?;
         Ok(CommandResponse {
             result: CommandResult::Source {
                 around_line: payload.around_line,
@@ -749,7 +749,7 @@ impl JdiSession {
             SIDECAR_REQUEST_TIMEOUT,
         )?;
         let payload: EvalPayload = serde_json::from_value(value)
-            .map_err(|e| Error::Connection(format!("invalid JDI evaluate response: {e}")))?;
+            .map_err(|e| Error::Jdi(format!("invalid JDI evaluate response: {e}")))?;
         Ok(CommandResponse {
             result: CommandResult::Value {
                 expr: payload.expr,
@@ -809,7 +809,7 @@ impl JdiSession {
             SIDECAR_REQUEST_TIMEOUT,
         )?;
         let payload: SetPayload = serde_json::from_value(value)
-            .map_err(|e| Error::Connection(format!("invalid JDI setValue response: {e}")))?;
+            .map_err(|e| Error::Jdi(format!("invalid JDI setValue response: {e}")))?;
         Ok(CommandResponse {
             result: CommandResult::Raw {
                 text: format!("{} = {}", payload.lvalue, payload.value),
@@ -837,7 +837,7 @@ impl JdiSession {
             SIDECAR_REQUEST_TIMEOUT,
         )?;
         let payload: ForceReturnPayload = serde_json::from_value(value)
-            .map_err(|e| Error::Connection(format!("invalid JDI forceReturn response: {e}")))?;
+            .map_err(|e| Error::Jdi(format!("invalid JDI forceReturn response: {e}")))?;
         Ok(CommandResponse {
             result: CommandResult::Raw {
                 text: format!("Forced current method to return {}", payload.value),
@@ -863,7 +863,7 @@ impl JdiSession {
             SIDECAR_REQUEST_TIMEOUT,
         )?;
         let payload: TextPayload = serde_json::from_value(value)
-            .map_err(|e| Error::Connection(format!("invalid JDI suspend response: {e}")))?;
+            .map_err(|e| Error::Jdi(format!("invalid JDI suspend response: {e}")))?;
         if id.is_none() {
             self.inner.lock().expect("jdi session mutex poisoned").state = RunState::Suspended;
         }
@@ -887,7 +887,7 @@ impl JdiSession {
             SIDECAR_REQUEST_TIMEOUT,
         )?;
         let payload: TextPayload = serde_json::from_value(value)
-            .map_err(|e| Error::Connection(format!("invalid JDI resume response: {e}")))?;
+            .map_err(|e| Error::Jdi(format!("invalid JDI resume response: {e}")))?;
         if id.is_none() {
             self.inner.lock().expect("jdi session mutex poisoned").state = RunState::Running;
         }
@@ -911,7 +911,7 @@ impl JdiSession {
             SIDECAR_REQUEST_TIMEOUT,
         )?;
         let payload: TextPayload = serde_json::from_value(value)
-            .map_err(|e| Error::Connection(format!("invalid JDI lock response: {e}")))?;
+            .map_err(|e| Error::Jdi(format!("invalid JDI lock response: {e}")))?;
         Ok(CommandResponse {
             result: CommandResult::Raw { text: payload.text },
             stderr: self.sidecar.take_stderr(),
@@ -932,7 +932,7 @@ impl JdiSession {
             SIDECAR_REQUEST_TIMEOUT,
         )?;
         let payload: TextPayload = serde_json::from_value(value)
-            .map_err(|e| Error::Connection(format!("invalid JDI threadLocks response: {e}")))?;
+            .map_err(|e| Error::Jdi(format!("invalid JDI threadLocks response: {e}")))?;
         Ok(CommandResponse {
             result: CommandResult::Raw { text: payload.text },
             stderr: self.sidecar.take_stderr(),
@@ -1087,7 +1087,7 @@ impl JdiSession {
                 "session {} is {:?}",
                 self.meta.id, state
             ))),
-            other => Err(Error::Connection(format!(
+            other => Err(Error::Jdi(format!(
                 "JDI {operation} requires a suspended stop site; current state is {other:?}"
             ))),
         }
@@ -1123,7 +1123,7 @@ impl JdiSession {
         }
 
         let payload: StopPayload = serde_json::from_value(value)
-            .map_err(|e| Error::Connection(format!("invalid JDI stop response: {e}")))?;
+            .map_err(|e| Error::Jdi(format!("invalid JDI stop response: {e}")))?;
         self.command_response_from_stop_payload(payload, StopDelivery::Direct)
     }
 
@@ -1415,7 +1415,7 @@ fn event_from_stop_payload(payload: &StopPayload) -> Result<(Event, RunState)> {
             RunState::Suspended,
         )),
         "vmDisconnected" => Ok((Event::VmExit, RunState::Exited)),
-        other => Err(Error::Connection(format!(
+        other => Err(Error::Jdi(format!(
             "unsupported JDI stop event '{other}'"
         ))),
     }
@@ -1571,9 +1571,9 @@ fn request(
 fn sidecar_error(error: SidecarTransportError) -> Error {
     match error {
         SidecarTransportError::Remote { code, message } => {
-            Error::Connection(format!("JDI sidecar error {code}: {message}"))
+            Error::Jdi(format!("JDI sidecar error {code}: {message}"))
         }
-        other => Error::Connection(other.to_string()),
+        other => Error::Jdi(format!("JDI sidecar transport failed: {other}")),
     }
 }
 

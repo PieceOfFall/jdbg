@@ -47,6 +47,14 @@ pub enum Error {
     #[error("jdb connection/launch failed: {0}")]
     Connection(String),
 
+    /// A JDI-backend error surfaced by the sidecar: either a semantic error the
+    /// sidecar returned (e.g. `method_not_found`, `source_not_found`,
+    /// `method_invocation_not_allowed`) or a sidecar transport/handshake failure.
+    /// Kept distinct from [`Error::Connection`] so JDI messages are not mislabeled
+    /// "jdb connection/launch failed"; the payload is already self-describing.
+    #[error("{0}")]
+    Jdi(String),
+
     /// Reading jdb output timed out completely and could not recover.
     #[error("timed out after {secs}s waiting for jdb")]
     Timeout { secs: u64 },
@@ -67,8 +75,33 @@ impl Error {
             Error::DuplicateTarget { .. } => 5,
             Error::UnsupportedBackend { .. } => 5,
             Error::Connection(_) => 6,
+            Error::Jdi(_) => 6,
             Error::Timeout { .. } => 7,
             Error::Io(_) => 1,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn jdi_error_is_not_mislabeled_as_jdb_connection() {
+        // A JDI sidecar semantic error must render as its own self-describing message,
+        // not "jdb connection/launch failed: …" (it is neither jdb nor a connection fault).
+        let err = Error::Jdi("JDI sidecar error method_not_found: no such method".into());
+        let rendered = err.to_string();
+        assert_eq!(rendered, "JDI sidecar error method_not_found: no such method");
+        assert!(!rendered.contains("jdb connection/launch failed"));
+        assert_eq!(err.exit_code(), 6);
+    }
+
+    #[test]
+    fn jdb_connection_error_keeps_its_prefix() {
+        assert_eq!(
+            Error::Connection("Unable to attach".into()).to_string(),
+            "jdb connection/launch failed: Unable to attach"
+        );
     }
 }

@@ -151,7 +151,7 @@ pub fn generate_auth_token() -> String {
 
 pub fn launch_sidecar(paths: SidecarPaths, timeout: Duration) -> Result<LaunchedSidecar> {
     if !paths.jar_path.is_file() {
-        return Err(Error::Connection(format!(
+        return Err(Error::Jdi(format!(
             "JDI sidecar jar not found at {}. Set JDBG_JDI_SIDECAR_JAR or place {SIDECAR_JAR_NAME} next to jdbg.",
             paths.jar_path.display()
         )));
@@ -165,7 +165,7 @@ pub fn launch_sidecar(paths: SidecarPaths, timeout: Duration) -> Result<Launched
     if paths.tools_jar.is_none() {
         if let Some(home) = jdk_home_for(&paths.java_path) {
             if jdk_home_needs_tools_jar(&home) {
-                return Err(Error::Connection(format!(
+                return Err(Error::Jdi(format!(
                     "JDI backend needs tools.jar for the JDK 8 sidecar JVM at {}, but none was found. \
                      Set JDBG_JDI_TOOLS_JAR to <jdk8>/lib/tools.jar, or point JAVA_HOME at a JDK 8 that has it.",
                     home.display()
@@ -302,7 +302,7 @@ fn accept_sidecar(
             Ok(Err(e)) => return Err(e.into()),
             Err(mpsc::RecvTimeoutError::Timeout) => {}
             Err(mpsc::RecvTimeoutError::Disconnected) => {
-                return Err(Error::Connection(
+                return Err(Error::Jdi(
                     "JDI sidecar local transport accept thread disconnected".into(),
                 ));
             }
@@ -311,7 +311,7 @@ fn accept_sidecar(
         if let Some(status) = child.try_wait()? {
             nudge_accept(&endpoint);
             let detail = take_stderr(stderr).unwrap_or_else(|| "no sidecar stderr".into());
-            return Err(Error::Connection(format!(
+            return Err(Error::Jdi(format!(
                 "JDI sidecar exited before connecting back (status {status}): {}",
                 detail.trim()
             )));
@@ -319,7 +319,7 @@ fn accept_sidecar(
         if Instant::now() >= deadline {
             nudge_accept(&endpoint);
             let detail = take_stderr(stderr).unwrap_or_else(|| "no sidecar stderr".into());
-            return Err(Error::Connection(format!(
+            return Err(Error::Jdi(format!(
                 "timed out waiting for JDI sidecar connection: {}",
                 detail.trim()
             )));
@@ -334,19 +334,19 @@ fn complete_handshake(
 ) -> Result<SidecarTransport> {
     let msg = read_framed_message(stream).map_err(sidecar_transport_error)?;
     let SidecarMessage::Request { id, method, params } = msg else {
-        return Err(Error::Connection(
+        return Err(Error::Jdi(
             "JDI sidecar sent non-request handshake frame".into(),
         ));
     };
     if method != "handshake" {
-        return Err(Error::Connection(format!(
+        return Err(Error::Jdi(format!(
             "JDI sidecar sent unexpected handshake method '{method}'"
         )));
     }
-    let request: HandshakeRequest =
-        serde_json::from_value(params).map_err(|e| Error::Connection(e.to_string()))?;
-    let response =
-        validate_handshake(&request, token).map_err(|e| Error::Connection(e.to_string()))?;
+    let request: HandshakeRequest = serde_json::from_value(params)
+        .map_err(|e| Error::Jdi(format!("JDI sidecar handshake decode failed: {e}")))?;
+    let response = validate_handshake(&request, token)
+        .map_err(|e| Error::Jdi(format!("JDI sidecar handshake rejected: {e}")))?;
     write_framed_message(
         stream,
         &SidecarMessage::Response {
@@ -356,7 +356,8 @@ fn complete_handshake(
         },
     )
     .map_err(sidecar_transport_error)?;
-    SidecarTransport::start(stream.try_clone()?).map_err(|e| Error::Connection(e.to_string()))
+    SidecarTransport::start(stream.try_clone()?)
+        .map_err(|e| Error::Jdi(format!("JDI sidecar transport start failed: {e}")))
 }
 
 #[cfg(windows)]
@@ -374,7 +375,7 @@ fn nudge_accept(endpoint: &SidecarEndpoint) {
 fn nudge_accept(_endpoint: &SidecarEndpoint) {}
 
 fn sidecar_transport_error(e: SidecarTransportError) -> Error {
-    Error::Connection(e.to_string())
+    Error::Jdi(format!("JDI sidecar transport failed: {e}"))
 }
 
 fn spawn_stderr_drain(stderr: std::process::ChildStderr) -> (Arc<Mutex<String>>, JoinHandle<()>) {

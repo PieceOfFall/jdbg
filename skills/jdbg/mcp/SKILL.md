@@ -4,7 +4,7 @@ description: "Use when you need a Java program's real runtime state instead of r
 compatibility: "Requires a JDK 8+ (provides the `jdb` command). Debugging is driven through the `jdbg` MCP server (tools named `launch`, `break_at`, `run`, `locals`, …). Native on Windows, Linux, macOS."
 allowed-tools: "mcp__jdbg__launch, mcp__jdbg__attach, mcp__jdbg__status, mcp__jdbg__list, mcp__jdbg__kill, mcp__jdbg__break_at, mcp__jdbg__break_in, mcp__jdbg__catch, mcp__jdbg__watch, mcp__jdbg__unwatch, mcp__jdbg__breakpoints, mcp__jdbg__clear, mcp__jdbg__run, mcp__jdbg__cont, mcp__jdbg__step, mcp__jdbg__next, mcp__jdbg__step_out, mcp__jdbg__where, mcp__jdbg__locals, mcp__jdbg__print, mcp__jdbg__dump, mcp__jdbg__eval, mcp__jdbg__threads, mcp__jdbg__classes, mcp__jdbg__methods, mcp__jdbg__thread, mcp__jdbg__frame, mcp__jdbg__list_source, mcp__jdbg__inspect, mcp__jdbg__raw, mcp__jdbg__suspend, mcp__jdbg__resume, mcp__jdbg__set, mcp__jdbg__force_return, mcp__jdbg__ignore, mcp__jdbg__lock, mcp__jdbg__threadlocks, Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "2.22"
+  version: "2.23"
 ---
 
 # jdbg — interactive Java debugging for agents
@@ -87,9 +87,9 @@ Java runtime when `JDBG_JDI_JAVA` is not set.
 ### Backend guidance
 
 - Omit `backend` for the mature `jdb` backend. It supports the full tool surface and keeps `raw` as an escape hatch.
-- Use `backend: "jdi"` when launching or attaching and you want structured sidecar data. JDI supports breakpoints, exception catchpoints, watchpoints, `run` for launched sessions, `cont`, `step`/`next`/`step_out`, stack/frame navigation, class/method lookup, source listing, thread suspend/resume, locks, safe JSON `inspect`, executable `print`/`eval`/`dump`, `set`, and non-void `force_return`.
+- Use `backend: "jdi"` when launching or attaching and you want structured sidecar data. JDI supports line and method breakpoints (including **conditional** breakpoints, evaluated server-side), exception catchpoints, watchpoints, `run` for launched sessions, `cont`, `step`/`next`/`step_out`, stack/frame navigation, class/method lookup, source listing, thread suspend/resume, locks, safe JSON `inspect`, executable `print`/`eval`/`dump`, `set`, and non-void `force_return`.
 - JDI launch starts in state `loaded`; set breakpoints, then call `run`. JDI attach starts in state `running`; set a line or method breakpoint, then call `cont` to wait for the next stop.
-- JDI `raw` dispatches supported jdb-style aliases through the sidecar; use a `jdb` session only when you need literal jdb stdin passthrough for an obscure jdb-only command.
+- JDI covers the full debugging surface — do **not** fall back to `jdb` for conditional breakpoints (JDI supports them). The only things JDI does not do are literal `jdb` stdin passthrough via `raw` (JDI `raw` only dispatches known jdb-style aliases) and void `force_return`. Use a `jdb` session only when you need one of those.
 - JDI uses `jdbg-jdi-sidecar.jar` next to the `jdbg` binary. Release updates install the official jar there; source builds create it during `cargo build`. If the jar is missing, run `jdbg update` or reinstall from the official release archive. Do not search the filesystem and copy a jar from a source checkout. Override with `JDBG_JDI_SIDECAR_JAR` or `JDBG_JDI_JAVA` only when necessary.
 
 ### Session
@@ -192,6 +192,11 @@ Every tool returns a typed result. The ones that drive the next move:
 - A **`[note]` about line mismatch** means the JVM rounded the breakpoint to the nearest line with executable
   bytecode — this is normal for lines that are comments, blank, or declarations-only.
 - A **`[note]` about `-g`** means the class lacks local-variable debug info → recompile with `javac -g`.
+- On **JDI**, stopping in a class whose source is not on `sourcepath` (e.g. a framework class like Tomcat's
+  `CoyoteAdapter`) attaches two benign `WARNING:` lines — `failed to enrich JDI source context: … source_not_found`
+  and `could not retrieve JDI source context (is sourcepath set…)`. These are **noise, not failures**: the stop,
+  `locals`, `print`, `eval`, and `inspect` all still work. Add the framework's sources to `sourcepath` if you want
+  the source snippet; otherwise ignore them.
 
 ## Inspecting collections efficiently
 

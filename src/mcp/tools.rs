@@ -45,8 +45,9 @@ pub fn tool_specs() -> Vec<ToolSpec> {
         ),
         tool(
             "attach",
-            "Attach to an already-running JVM started with JDWP. Returns state 'suspended' — \
-             set breakpoints, then call `cont` (attach has no `run`).",
+            "Attach to an already-running JVM started with JDWP. The jdb backend returns state 'suspended'; \
+             the JDI backend returns state 'running'. Either way, set breakpoints, then call `cont` \
+             (attach has no `run`).",
             json!({
                 "host": {"type": "string", "description": "Target host (default localhost). 'localhost' is auto-normalized to 127.0.0.1 (IPv4 loopback) because on dual-stack hosts it may resolve to IPv6 [::1] while JDWP listens only on IPv4; pass '::1' to force IPv6."},
                 "port": {"type": "integer", "description": "Target JDWP port (default 5005)."},
