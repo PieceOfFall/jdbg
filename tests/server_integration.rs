@@ -1923,7 +1923,7 @@ fn jdi_async_breakpoint_after_timeout_updates_status_and_resumes_cleanly() {
 
     let line = fixture_line("AsyncBreakpointTest.java", "ASYNC_BREAKPOINT");
     session
-        .stop_at("AsyncBreakpointTest", line, None, None)
+        .stop_at("AsyncBreakpointTest", line, None, Some("thread"))
         .expect("JDI async breakpoint failed");
 
     // Worker is still blocked on the gate, so this run cannot hit the breakpoint and
@@ -1976,6 +1976,21 @@ fn jdi_async_breakpoint_after_timeout_updates_status_and_resumes_cleanly() {
         other => panic!("expected stack trace after async stop, got {other:?}"),
     }
 
+    let threads = session
+        .threads(Some("delayed-worker"))
+        .expect("JDI threads should work after async thread-suspend breakpoint");
+    match threads.result {
+        CommandResult::Threads { threads } => {
+            assert_eq!(threads.len(), 1, "expected the delayed worker only");
+            assert!(
+                threads[0].state.contains("at breakpoint"),
+                "thread-suspend stop must be visible in threads: {:?}",
+                threads[0]
+            );
+        }
+        other => panic!("expected threads after async stop, got {other:?}"),
+    }
+
     let this_value = session
         .evaluate("this")
         .expect("JDI print this should work after async stop event");
@@ -2022,6 +2037,241 @@ fn jdi_async_breakpoint_after_timeout_updates_status_and_resumes_cleanly() {
 
     let _ = session.kill();
     let _ = std::fs::remove_file(&gate);
+}
+
+#[test]
+fn jdi_async_thread_method_breakpoint_is_visible_before_cont() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("ExternalTriggerBreakpointTest.java");
+    let trigger_port = free_loopback_port();
+    let target = start_jdwp_target_with_args(
+        fixture_dir(),
+        "ExternalTriggerBreakpointTest",
+        &[trigger_port.to_string()],
+    );
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::attach(
+        "127.0.0.1",
+        target.port,
+        &sourcepath,
+        "jdi-async-thread-method-status".into(),
+        None,
+    )
+    .expect("JDI attach failed");
+
+    session
+        .break_in(
+            "ExternalTriggerBreakpointTest$Handler",
+            "handleRequest",
+            None,
+            MethodEventKind::Entry,
+            None,
+            Some("thread"),
+        )
+        .expect("JDI thread method breakpoint failed");
+    assert!(
+        matches!(
+            session
+                .cont(Some(1))
+                .expect("initial continue failed")
+                .result,
+            CommandResult::Timeout {
+                state: RunState::Running,
+                ..
+            }
+        ),
+        "target should be running before the external trigger"
+    );
+
+    let trigger = trigger_external_request_after_delay(trigger_port);
+    trigger
+        .recv_timeout(Duration::from_secs(2))
+        .expect("external trigger should finish")
+        .expect("external trigger should connect");
+
+    let deadline = Instant::now() + Duration::from_secs(6);
+    loop {
+        match session.status() {
+            CommandResult::Status {
+                state: RunState::Suspended,
+                last_event: Some(Event::MethodEntry { thread, .. }),
+                ..
+            } if thread == "external-trigger-worker" => break,
+            status if Instant::now() < deadline => {
+                let _ = status;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            status => panic!("method entry did not become visible through status: {status:?}"),
+        }
+    }
+
+    let threads = session
+        .threads(Some("external-trigger-worker"))
+        .expect("threads should inspect the async method stop");
+    assert!(
+        matches!(
+            threads.result,
+            CommandResult::Threads { ref threads }
+                if threads.len() == 1 && threads[0].state.contains("at breakpoint")
+        ),
+        "async method stop must remain inspectable: {:?}",
+        threads.result
+    );
+    assert!(
+        matches!(
+            session.stack(false).expect("stack should work").result,
+            CommandResult::StackTrace { .. }
+        ),
+        "stack should inspect the async method stop"
+    );
+    assert!(
+        matches!(
+            session
+                .evaluate("this")
+                .expect("eval this should work")
+                .result,
+            CommandResult::Value { .. }
+        ),
+        "eval should inspect the event-suspended thread"
+    );
+
+    let _ = session.kill();
+}
+
+#[test]
+fn jdi_blocking_eval_timeout_keeps_recovery_commands_available() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("BlockingEvalTest.java");
+    let gate = std::env::temp_dir().join(format!(
+        "jdbg-blocking-eval-gate-{}-{}.tmp",
+        std::process::id(),
+        line!()
+    ));
+    let _ = fs::remove_file(&gate);
+    let target = start_jdwp_target_with_args(
+        fixture_dir(),
+        "BlockingEvalTest",
+        &[gate.to_string_lossy().replace('\\', "/")],
+    );
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::attach(
+        "127.0.0.1",
+        target.port,
+        &sourcepath,
+        "jdi-blocking-eval-recovery".into(),
+        None,
+    )
+    .expect("JDI attach failed");
+    let line = fixture_line("BlockingEvalTest.java", "BLOCKING_EVAL_STOP");
+    session
+        .stop_at("BlockingEvalTest", line, None, None)
+        .expect("blocking-eval breakpoint failed");
+    assert!(
+        matches!(
+            session
+                .cont(Some(10))
+                .expect("continue to blocking-eval stop failed")
+                .result,
+            CommandResult::Stopped { .. }
+        ),
+        "fixture must stop before evaluating"
+    );
+
+    let timed_out = session
+        .evaluate("this.waitForGate()")
+        .expect_err("blocking eval must time out at the Rust request boundary");
+    assert!(
+        timed_out.to_string().contains("timed out"),
+        "expected an eval timeout, got: {timed_out}"
+    );
+
+    let retry_started = Instant::now();
+    let retry = session
+        .evaluate("missingIdentifier")
+        .expect_err("a second executable eval must be rejected while the first is still running");
+    assert!(
+        retry_started.elapsed() < Duration::from_secs(2),
+        "second eval waited instead of failing immediately: {:?}",
+        retry_started.elapsed()
+    );
+    assert!(
+        retry.to_string().contains("evaluation_in_progress"),
+        "expected evaluation_in_progress, got: {retry}"
+    );
+
+    let recovery_started = Instant::now();
+    session
+        .clear(&format!("BlockingEvalTest:{line}"))
+        .expect("clear must remain available after eval timeout");
+    session
+        .resume(None)
+        .expect("resume must remain available after eval timeout");
+    assert!(
+        recovery_started.elapsed() < Duration::from_secs(2),
+        "recovery commands were blocked by eval: {:?}",
+        recovery_started.elapsed()
+    );
+
+    fs::write(&gate, b"release").expect("release blocking eval gate");
+    session
+        .threads(None)
+        .expect("sidecar must still accept inspection after releasing the eval gate");
+
+    let _ = session.kill();
+    let _ = fs::remove_file(&gate);
+}
+
+#[test]
+fn jdi_manual_suspend_rejects_executable_eval_with_actionable_error() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("ThreadTest.java");
+    let target = start_jdwp_fixture("ThreadTest");
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::attach(
+        "127.0.0.1",
+        target.port,
+        &sourcepath,
+        "jdi-manual-suspend-eval".into(),
+        None,
+    )
+    .expect("JDI attach failed");
+    let _ = session.cont(Some(1)).expect("initial continue failed");
+    let worker_id = match session
+        .threads(Some("worker"))
+        .expect("list worker thread")
+        .result
+    {
+        CommandResult::Threads { threads } => threads
+            .first()
+            .expect("worker thread must exist")
+            .id
+            .clone(),
+        other => panic!("expected thread list, got {other:?}"),
+    };
+    session
+        .suspend(Some(&worker_id))
+        .expect("manual thread suspend failed");
+    session
+        .select_thread(&worker_id)
+        .expect("select manually suspended thread failed");
+
+    let error = session
+        .evaluate("this")
+        .expect_err("manual suspend must not become an executable eval site");
+    assert!(
+        error.to_string().contains("event-suspended stop")
+            && error.to_string().contains("manual suspend"),
+        "manual suspend error must explain the JDI constraint: {error}"
+    );
+
+    let _ = session.resume(Some(&worker_id));
+    let _ = session.kill();
 }
 
 #[test]

@@ -65,6 +65,7 @@ import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 
 final class JdiService {
@@ -79,6 +80,11 @@ final class JdiService {
     private final FrameConnection connection;
     private final Map<String, DebugSession> sessions = new ConcurrentHashMap<>();
     private final AtomicLong eventSeq = new AtomicLong(1);
+
+    @FunctionalInterface
+    private interface EvaluationOperation {
+        Object run() throws Exception;
+    }
 
     JdiService(FrameConnection connection) {
         this.connection = connection;
@@ -145,14 +151,22 @@ final class JdiService {
                 return session(params).listSource(optionalInteger(params, "line"));
             case "inspect":
                 return session(params).inspect(params);
-            case "evaluateExpression":
-                return session(params).evaluateExpression(params);
-            case "renderExpression":
-                return session(params).renderExpression(params);
-            case "setValue":
-                return session(params).setValue(params);
-            case "forceReturn":
-                return session(params).forceReturn(params);
+            case "evaluateExpression": {
+                DebugSession session = session(params);
+                return session.runExecutableEvaluation(() -> session.evaluateExpression(params));
+            }
+            case "renderExpression": {
+                DebugSession session = session(params);
+                return session.runExecutableEvaluation(() -> session.renderExpression(params));
+            }
+            case "setValue": {
+                DebugSession session = session(params);
+                return session.runExecutableEvaluation(() -> session.setValue(params));
+            }
+            case "forceReturn": {
+                DebugSession session = session(params);
+                return session.runExecutableEvaluation(() -> session.forceReturn(params));
+            }
             case "suspend":
                 return session(params).suspendThread(Json.optionalString(params, "threadId", null));
             case "resume":
@@ -167,6 +181,13 @@ final class JdiService {
             default:
                 throw new RpcException("unknown_method", "unknown method: " + method);
         }
+    }
+
+    boolean isExecutableEvaluation(String method) {
+        return "evaluateExpression".equals(method)
+                || "renderExpression".equals(method)
+                || "setValue".equals(method)
+                || "forceReturn".equals(method);
     }
 
     private Object attach(Map<String, Object> params) throws Exception {
@@ -323,6 +344,7 @@ final class JdiService {
         final List<ActiveWatchpoint> activeWatchpoints = new ArrayList<>();
         final List<ActiveMethodEvent> activeMethodEvents = new ArrayList<>();
         final List<ActiveExceptionRequest> activeExceptionRequests = new ArrayList<>();
+        final AtomicBoolean executableEvaluationInFlight = new AtomicBoolean();
         volatile String currentThreadId;
         volatile int currentFrameIndex;
         volatile EventSet currentStopSet;
@@ -333,6 +355,21 @@ final class JdiService {
             this.id = id;
             this.vm = vm;
             this.sourcePaths = sourcePaths;
+        }
+
+        Object runExecutableEvaluation(EvaluationOperation operation) throws Exception {
+            if (!executableEvaluationInFlight.compareAndSet(false, true)) {
+                throw new RpcException(
+                        "evaluation_in_progress",
+                        "an executable JDI evaluation is still running; use clear, resume, threads, "
+                                + "breakpoints, or kill to recover before evaluating again"
+                );
+            }
+            try {
+                return operation.run();
+            } finally {
+                executableEvaluationInFlight.set(false);
+            }
         }
 
         void startEventLoop() {

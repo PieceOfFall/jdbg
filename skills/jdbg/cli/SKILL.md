@@ -4,7 +4,7 @@ description: "Use the jdbg CLI to debug Java programs interactively from Pi when
 compatibility: "Requires a JDK 8+ with jdb available through JAVA_HOME, PATH, or --jdb-path. Requires the jdbg CLI on PATH. Native on Windows, Linux, and macOS."
 allowed-tools: "Bash(jdbg:*), Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "1.17"
+  version: "1.18"
 ---
 
 # jdbg CLI - interactive Java debugging for Pi
@@ -283,6 +283,12 @@ static fields, field chains, and array access, but rejects method calls (e.g. `m
 On JDI sessions, `print`, `eval`, `dump`, `set`, and `force-return` are executable capabilities. They may
 invoke methods in the target JVM and can have side effects. Use `print`/`eval` for anything with a method call;
 use `inspect` when you need safe field-reading without getters.
+
+An executable evaluation can block in target code. If it times out, do not retry it: `evaluation_in_progress`
+means the first call is still running. Use `jdbg threads`, `jdbg clear ...`, `jdbg resume`, or `jdbg kill` to
+recover; JDI cannot cancel the original method call. Executable evaluation requires a breakpoint/step/exception
+stop. A manually suspended thread is not an evaluation site, so set a breakpoint in the target method and wait
+for `Stopped` instead.
 
 Source context:
 

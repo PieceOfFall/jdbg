@@ -738,7 +738,7 @@ impl JdiSession {
             .command_lock
             .lock()
             .expect("jdi command mutex poisoned");
-        self.require_suspended("evaluate expression")?;
+        self.require_event_suspended("evaluate expression")?;
         let value = request(
             &self.sidecar,
             "evaluateExpression",
@@ -766,7 +766,7 @@ impl JdiSession {
             .command_lock
             .lock()
             .expect("jdi command mutex poisoned");
-        self.require_suspended("dump expression")?;
+        self.require_event_suspended("dump expression")?;
         let value = request(
             &self.sidecar,
             "renderExpression",
@@ -797,7 +797,7 @@ impl JdiSession {
             .command_lock
             .lock()
             .expect("jdi command mutex poisoned");
-        self.require_suspended("set value")?;
+        self.require_event_suspended("set value")?;
         let value = request(
             &self.sidecar,
             "setValue",
@@ -826,7 +826,7 @@ impl JdiSession {
             .command_lock
             .lock()
             .expect("jdi command mutex poisoned");
-        self.require_suspended("force return")?;
+        self.require_event_suspended("force return")?;
         let value = request(
             &self.sidecar,
             "forceReturn",
@@ -1089,6 +1089,28 @@ impl JdiSession {
             ))),
             other => Err(Error::Jdi(format!(
                 "JDI {operation} requires a suspended stop site; current state is {other:?}"
+            ))),
+        }
+    }
+
+    /// JDI only permits method invocation on a thread stopped by a debugger event.
+    /// `VirtualMachine.suspend()` and `ThreadReference.suspend()` make a thread look
+    /// suspended, but cannot safely serve as an evaluation site.
+    fn require_event_suspended(&self, operation: &str) -> Result<()> {
+        self.drain_events();
+        let inner = self.inner.lock().expect("jdi session mutex poisoned");
+        match inner.state {
+            RunState::Dead | RunState::Exited => Err(Error::SessionDead(format!(
+                "session {} is {:?}",
+                self.meta.id, inner.state
+            ))),
+            RunState::Suspended
+                if inner.delivered_stop.is_some() || !inner.pending_stops.is_empty() =>
+            {
+                Ok(())
+            }
+            _ => Err(Error::Jdi(format!(
+                "JDI {operation} requires an event-suspended stop; manual suspend cannot run executable expressions. Set a breakpoint in the target method and wait for Stopped."
             ))),
         }
     }
@@ -1415,9 +1437,7 @@ fn event_from_stop_payload(payload: &StopPayload) -> Result<(Event, RunState)> {
             RunState::Suspended,
         )),
         "vmDisconnected" => Ok((Event::VmExit, RunState::Exited)),
-        other => Err(Error::Jdi(format!(
-            "unsupported JDI stop event '{other}'"
-        ))),
+        other => Err(Error::Jdi(format!("unsupported JDI stop event '{other}'"))),
     }
 }
 

@@ -49,6 +49,36 @@ public final class SidecarMain {
             String id = Json.string(message, "id");
             String method = Json.string(message, "method");
             Map<String, Object> params = Json.asObject(message.get("params"), "params");
+            if (service.isExecutableEvaluation(method)) {
+                Thread worker = new Thread(
+                        () -> respond(connection, service, id, method, params),
+                        "jdbg-jdi-eval-" + id
+                );
+                // An invocation may be permanently blocked in the target. It must not
+                // keep the sidecar process alive after the client has shut it down.
+                worker.setDaemon(true);
+                worker.start();
+                continue;
+            }
+            respond(connection, service, id, method, params);
+            if ("shutdown".equals(method)) {
+                running = false;
+            }
+        }
+    }
+
+    /**
+     * Send one response without letting a slow target invocation block the request reader.
+     * FrameConnection serializes writes, so async evaluation responses and debugger events
+     * cannot interleave their length-prefixed frames.
+     */
+    private static void respond(
+            FrameConnection connection,
+            JdiService service,
+            String id,
+            String method,
+            Map<String, Object> params
+    ) {
             try {
                 Object result = service.call(method, params);
                 connection.writeMessage(Json.object(
@@ -56,34 +86,30 @@ public final class SidecarMain {
                         "id", id,
                         "result", result
                 ));
-                if ("shutdown".equals(method)) {
-                    running = false;
-                }
             } catch (RpcException e) {
-                connection.writeMessage(Json.object(
-                        "type", "response",
-                        "id", id,
-                        "error", Json.object("code", e.code, "message", e.getMessage())
-                ));
+                writeError(connection, id, e.code, e.getMessage());
             } catch (Exception e) {
-                connection.writeMessage(Json.object(
-                        "type", "response",
-                        "id", id,
-                        "error", Json.object("code", "internal_error", "message", e.getMessage())
-                ));
+                writeError(connection, id, "internal_error", e.getMessage());
             } catch (Throwable e) {
                 // Errors (e.g. NoClassDefFoundError for com.sun.jdi when a JDK 8 sidecar
                 // is launched without tools.jar) are not Exceptions, so without this catch
                 // they would escape serve()/main() and crash the process silently -- which
                 // the client only sees as a request timeout. Report the real cause instead.
-                connection.writeMessage(Json.object(
-                        "type", "response",
-                        "id", id,
-                        "error", Json.object("code", "internal_error", "message", e.toString())
-                ));
+                writeError(connection, id, "internal_error", e.toString());
+            }
+    }
+
+    private static void writeError(FrameConnection connection, String id, String code, String message) {
+        try {
+            connection.writeMessage(Json.object(
+                    "type", "response",
+                    "id", id,
+                    "error", Json.object("code", code, "message", message)
+            ));
+        } catch (Exception ignored) {
+            // The client has already disconnected; there is no response channel left to recover.
             }
         }
-    }
 
     static final class Config {
         final String transport;

@@ -4,7 +4,7 @@ description: "Use when you need a Java program's real runtime state instead of r
 compatibility: "Requires a JDK 8+ (provides the `jdb` command). Debugging is driven through the `jdbg` MCP server (tools named `launch`, `break_at`, `run`, `locals`, …). Native on Windows, Linux, macOS."
 allowed-tools: "mcp__jdbg__launch, mcp__jdbg__attach, mcp__jdbg__status, mcp__jdbg__list, mcp__jdbg__kill, mcp__jdbg__break_at, mcp__jdbg__break_in, mcp__jdbg__catch, mcp__jdbg__watch, mcp__jdbg__unwatch, mcp__jdbg__breakpoints, mcp__jdbg__clear, mcp__jdbg__run, mcp__jdbg__cont, mcp__jdbg__step, mcp__jdbg__next, mcp__jdbg__step_out, mcp__jdbg__where, mcp__jdbg__locals, mcp__jdbg__print, mcp__jdbg__dump, mcp__jdbg__eval, mcp__jdbg__threads, mcp__jdbg__classes, mcp__jdbg__methods, mcp__jdbg__thread, mcp__jdbg__frame, mcp__jdbg__list_source, mcp__jdbg__inspect, mcp__jdbg__raw, mcp__jdbg__suspend, mcp__jdbg__resume, mcp__jdbg__set, mcp__jdbg__force_return, mcp__jdbg__ignore, mcp__jdbg__lock, mcp__jdbg__threadlocks, Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "2.24"
+  version: "2.25"
 ---
 
 # jdbg — interactive Java debugging for agents
@@ -218,6 +218,12 @@ and truncation metadata where available.
 On JDI sessions, `print`, `eval`, `dump`, `set`, and `force_return` are executable capabilities. They may
 invoke methods in the target JVM and can have side effects. Use `print`/`eval` for anything with a method call
 (`obj.getX()`, `System.getProperties()`); use `inspect` when you need safe field-reading without getters.
+
+An executable evaluation can block in target code. If it times out, do not retry it: `evaluation_in_progress`
+means the first call is still running. The session control path stays available, so use `threads`, `clear`,
+`resume`, or `kill` to recover. JDI cannot cancel the original method call. Executable evaluation requires a
+breakpoint/step/exception stop; manually suspending a thread is not an evaluation site. Set a breakpoint in the
+target method and wait for `Stopped` instead.
 
 After JDI `force_return`, the target VM applies the forced return when the thread resumes. A `where` call before
 the next `cont`/`step` may still show the old frame and include a note explaining that pending refresh.
