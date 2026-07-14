@@ -4,7 +4,7 @@ description: "Use when you need a Java program's real runtime state instead of r
 compatibility: "Requires a JDK 8+ (provides the `jdb` command). Debugging is driven through the `jdbg` MCP server (tools named `launch`, `break_at`, `run`, `locals`, …). Native on Windows, Linux, macOS."
 allowed-tools: "mcp__jdbg__launch, mcp__jdbg__attach, mcp__jdbg__status, mcp__jdbg__list, mcp__jdbg__kill, mcp__jdbg__break_at, mcp__jdbg__break_in, mcp__jdbg__catch, mcp__jdbg__watch, mcp__jdbg__unwatch, mcp__jdbg__breakpoints, mcp__jdbg__clear, mcp__jdbg__run, mcp__jdbg__cont, mcp__jdbg__step, mcp__jdbg__next, mcp__jdbg__step_out, mcp__jdbg__where, mcp__jdbg__locals, mcp__jdbg__print, mcp__jdbg__dump, mcp__jdbg__eval, mcp__jdbg__threads, mcp__jdbg__classes, mcp__jdbg__methods, mcp__jdbg__thread, mcp__jdbg__frame, mcp__jdbg__list_source, mcp__jdbg__inspect, mcp__jdbg__raw, mcp__jdbg__suspend, mcp__jdbg__resume, mcp__jdbg__set, mcp__jdbg__force_return, mcp__jdbg__ignore, mcp__jdbg__lock, mcp__jdbg__threadlocks, Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "2.26"
+  version: "2.27"
 ---
 
 # jdbg — interactive Java debugging for agents
@@ -104,6 +104,8 @@ Java runtime when `JDBG_JDI_JAVA` is not set.
 
 For JDI sessions, `status` changes as soon as a stop event reaches the sidecar. `pending_stops > 0` means a
 stop is waiting for an execution-control command to consume it, rather than an idle VM that is still running.
+Calling `resume` without an id discards all pending JDI stops and clears `last_event` when intentionally
+continuing past an asynchronous hit.
 
 > Daemon management is automatic: the daemon starts on the first tool call and persists. There is no MCP tool
 > to start/stop it — it is an implementation detail, not part of the debugging surface.

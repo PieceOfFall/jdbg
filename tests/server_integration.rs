@@ -2144,6 +2144,22 @@ fn jdi_async_thread_method_breakpoint_is_visible_before_cont() {
         "eval should inspect the event-suspended thread"
     );
 
+    session
+        .resume(None)
+        .expect("resume all should discard the asynchronous stop");
+    assert!(
+        matches!(
+            session.status(),
+            CommandResult::Status {
+                state: RunState::Running,
+                last_event: None,
+                pending_stops: 0,
+                ..
+            }
+        ),
+        "resume all must clear consumed stop state rather than retaining historical pending stops"
+    );
+
     let _ = session.kill();
 }
 

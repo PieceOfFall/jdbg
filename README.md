@@ -253,6 +253,7 @@ the daemon as an absolute path. Relative `--sourcepath` values are absolutized b
 JDI source snippets decode strict UTF-8 first and automatically fall back to GBK for legacy Chinese Java sources.
 For JDI sessions, `status` reflects an incoming stop as soon as the sidecar event arrives; `pending_stops > 0`
 means one or more stops are waiting to be consumed by an execution-control command.
+`resume` without a thread id explicitly discards all such outstanding stops and clears `last_event`.
 
 `jdbg update` stops any running jdbg daemon before replacing the binary. It detects which agents already had `jdbg` configured, installs the latest release, installs the official JDI sidecar jar next to the `jdbg` binary, then re-registers the same targets.
 

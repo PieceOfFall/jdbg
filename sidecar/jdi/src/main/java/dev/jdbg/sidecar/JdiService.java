@@ -1065,13 +1065,10 @@ final class JdiService {
 
         Object resumeThread(String id) throws RpcException {
             if (id == null || id.isEmpty()) {
-                EventSet stopSet = currentStopSet;
-                if (stopSet != null) {
-                    resumeStopSet(stopSet);
-                } else {
-                    vm.resume();
-                }
-                return Json.object("text", "Resumed all threads");
+                return Json.object(
+                        "text", "Resumed all threads",
+                        "discardedStopIds", discardStopsAndResumeAll()
+                );
             }
             ThreadReference thread = findThread(id);
             thread.resume();
@@ -1511,6 +1508,24 @@ final class JdiService {
 
         private synchronized void resumeStopSet(EventSet stopSet) {
             resumeStopSetLocked(stopSet);
+        }
+
+        private synchronized List<Object> discardStopsAndResumeAll() {
+            List<Object> stopIds = Json.array();
+            EventSet current = currentStopSet;
+            resumeStopSetLocked(current);
+            StopRecord stop;
+            while ((stop = stops.poll()) != null) {
+                Object stopId = stop.payload.get("stopId");
+                if (stopId != null) {
+                    stopIds.add(stopId.toString());
+                }
+                if (stop.eventSet != current) {
+                    resumeStopSetLocked(stop.eventSet);
+                }
+            }
+            vm.resume();
+            return stopIds;
         }
 
         private void resumeFromStopLocked() {

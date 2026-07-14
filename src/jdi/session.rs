@@ -891,10 +891,11 @@ impl JdiSession {
             json!({ "session": self.meta.id, "threadId": id }),
             SIDECAR_REQUEST_TIMEOUT,
         )?;
-        let payload: TextPayload = serde_json::from_value(value)
+        let payload: ResumePayload = serde_json::from_value(value)
             .map_err(|e| Error::Jdi(format!("invalid JDI resume response: {e}")))?;
         if id.is_none() {
-            self.inner.lock().expect("jdi session mutex poisoned").state = RunState::Running;
+            let mut inner = self.inner.lock().expect("jdi session mutex poisoned");
+            discard_stops_after_resume_all(&mut inner, &payload.discarded_stop_ids);
         }
         Ok(CommandResponse {
             result: CommandResult::Raw { text: payload.text },
@@ -1342,6 +1343,14 @@ struct TextPayload {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ResumePayload {
+    text: String,
+    #[serde(default)]
+    discarded_stop_ids: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct EvalPayload {
     expr: String,
     value: String,
@@ -1477,14 +1486,15 @@ fn apply_sidecar_event(inner: &mut JdiSessionInner, event: SidecarEvent, session
     let Ok((next_event, state)) = event_from_stop_payload(&payload) else {
         return;
     };
-    if !is_delivered_stop(inner, &payload, &next_event)
-        && !inner
+    if is_delivered_stop(inner, &payload, &next_event)
+        || inner
             .pending_stops
             .iter()
             .any(|pending| is_same_stop_payload(pending, &payload, &next_event))
     {
-        inner.pending_stops.push_back(payload);
+        return;
     }
+    inner.pending_stops.push_back(payload);
     inner.state = state;
     inner.last_event = Some(next_event);
 }
@@ -1567,6 +1577,26 @@ fn remember_delivered_stop_id(inner: &mut JdiSessionInner, stop_id: Option<&str>
     while inner.delivered_stop_ids.len() > 32 {
         inner.delivered_stop_ids.pop_front();
     }
+}
+
+/// `resume` without a thread id is an explicit acknowledgement that all outstanding stop
+/// notifications are no longer actionable. Preserve their ids so an event already in transit
+/// cannot revive a stale pending stop after the VM has resumed.
+fn discard_stops_after_resume_all(inner: &mut JdiSessionInner, discarded_stop_ids: &[String]) {
+    let pending_stop_ids: Vec<_> = inner
+        .pending_stops
+        .drain(..)
+        .filter_map(|payload| payload.stop_id)
+        .collect();
+    for stop_id in pending_stop_ids {
+        remember_delivered_stop_id(inner, Some(&stop_id));
+    }
+    for stop_id in discarded_stop_ids {
+        remember_delivered_stop_id(inner, Some(stop_id));
+    }
+    inner.state = RunState::Running;
+    inner.last_event = None;
+    inner.delivered_stop = None;
 }
 
 #[cfg(test)]
@@ -1938,6 +1968,61 @@ mod tests {
             }
             other => panic!("expected async breakpoint event, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn resume_all_discards_pending_stops_and_clears_last_event() {
+        let raw_payload = json!({
+            "event": "breakpoint",
+            "stopId": "stale-stop",
+            "thread": "worker",
+            "threadId": "7",
+            "location": {
+                "class": "Controller",
+                "method": "handle",
+                "file": "Controller.java",
+                "line": 42
+            }
+        });
+        let payload: StopPayload = serde_json::from_value(raw_payload.clone()).unwrap();
+        let (event, _) = event_from_stop_payload(&payload).unwrap();
+        let mut inner = JdiSessionInner {
+            state: RunState::Suspended,
+            last_event: Some(event.clone()),
+            delivered_stop: Some(event),
+            delivered_stop_ids: VecDeque::new(),
+            pending_stops: VecDeque::from([payload.clone()]),
+        };
+
+        discard_stops_after_resume_all(&mut inner, &["sidecar-only-stop".into()]);
+
+        assert_eq!(inner.state, RunState::Running);
+        assert!(inner.last_event.is_none());
+        assert!(inner.delivered_stop.is_none());
+        assert!(inner.pending_stops.is_empty());
+        assert!(inner.delivered_stop_ids.iter().any(|id| id == "stale-stop"));
+        assert!(
+            inner
+                .delivered_stop_ids
+                .iter()
+                .any(|id| id == "sidecar-only-stop")
+        );
+
+        apply_sidecar_event(
+            &mut inner,
+            SidecarEvent {
+                session: "s1".into(),
+                seq: 9,
+                event: "breakpoint".into(),
+                payload: raw_payload,
+            },
+            "s1",
+        );
+        assert!(
+            inner.pending_stops.is_empty(),
+            "a late discarded event must stay ignored"
+        );
+        assert!(inner.last_event.is_none());
     }
 
     #[test]
