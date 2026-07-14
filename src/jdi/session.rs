@@ -1068,6 +1068,7 @@ impl JdiSession {
                 )));
             }
             inner.state = RunState::Running;
+            inner.last_event = None;
             inner.delivered_stop = None;
         }
 
@@ -1495,8 +1496,10 @@ fn apply_sidecar_event(inner: &mut JdiSessionInner, event: SidecarEvent, session
         return;
     }
     inner.pending_stops.push_back(payload);
-    inner.state = state;
-    inner.last_event = Some(next_event);
+    if !matches!(inner.state, RunState::Suspended) || inner.last_event.is_none() {
+        inner.state = state;
+        inner.last_event = Some(next_event);
+    }
 }
 
 fn apply_sidecar_events(
@@ -1881,6 +1884,47 @@ mod tests {
             inner.pending_stops.is_empty(),
             "late twin with the delivered stopId must not be re-queued"
         );
+    }
+
+    #[test]
+    fn later_pending_stop_does_not_replace_current_last_event() {
+        let current: StopPayload = serde_json::from_value(json!({
+            "event": "breakpoint",
+            "stopId": "1",
+            "thread": "first-worker",
+            "threadId": "1",
+            "location": {"class": "Concurrent", "method": "hit", "file": "Concurrent.java", "line": 10}
+        }))
+        .unwrap();
+        let (current_event, state) = event_from_stop_payload(&current).unwrap();
+        let mut inner = JdiSessionInner {
+            state: RunState::Running,
+            last_event: None,
+            delivered_stop: None,
+            delivered_stop_ids: VecDeque::new(),
+            pending_stops: VecDeque::new(),
+        };
+        finalize_delivered_stop(&mut inner, &current, &current_event, state);
+
+        apply_sidecar_event(
+            &mut inner,
+            SidecarEvent {
+                session: "s1".into(),
+                seq: 2,
+                event: "breakpoint".into(),
+                payload: json!({
+                    "event": "breakpoint",
+                    "stopId": "2",
+                    "thread": "second-worker",
+                    "threadId": "2",
+                    "location": {"class": "Concurrent", "method": "hit", "file": "Concurrent.java", "line": 10}
+                }),
+            },
+            "s1",
+        );
+
+        assert_eq!(inner.pending_stops.len(), 1);
+        assert_eq!(inner.last_event, Some(current_event));
     }
 
     #[test]

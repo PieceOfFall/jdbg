@@ -4,7 +4,7 @@ description: "Use the jdbg CLI to debug Java programs interactively from Pi when
 compatibility: "Requires a JDK 8+ with jdb available through JAVA_HOME, PATH, or --jdb-path. Requires the jdbg CLI on PATH. Native on Windows, Linux, and macOS."
 allowed-tools: "Bash(jdbg:*), Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "1.20"
+  version: "1.21"
 ---
 
 # jdbg CLI - interactive Java debugging for Pi
@@ -189,6 +189,8 @@ jdbg daemon stop
 For JDI, `status` changes to `suspended` as soon as the sidecar receives a stop. In JSON,
 `pending_stops > 0` means a stop is waiting for an execution-control command to consume it, rather than an
 idle running VM. JDI source snippets read UTF-8 first and fall back to GBK for legacy Chinese Java files.
+With several thread-suspended hits, `last_event` and inspection commands refer to the current stop, while
+`pending_stops` counts that stop and the queued stops.
 `resume` without an id discards all pending JDI stops and clears `last_event`; use it when intentionally
 continuing past an asynchronously observed hit.
 

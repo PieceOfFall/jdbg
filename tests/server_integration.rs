@@ -2164,6 +2164,99 @@ fn jdi_async_thread_method_breakpoint_is_visible_before_cont() {
 }
 
 #[test]
+fn jdi_multiple_thread_stops_keep_status_and_current_thread_aligned() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("ConcurrentThreadStopTest.java");
+    let gate = std::env::temp_dir().join(format!(
+        "jdbg-concurrent-stop-gate-{}-{}.tmp",
+        std::process::id(),
+        line!()
+    ));
+    let _ = std::fs::remove_file(&gate);
+    let classpath = vec![fixture_dir().display().to_string()];
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::launch(
+        "ConcurrentThreadStopTest",
+        &classpath,
+        &sourcepath,
+        &[gate.to_string_lossy().replace('\\', "/")],
+        "jdi-concurrent-thread-stops".into(),
+        None,
+    )
+    .expect("JDI launch failed");
+    let line = fixture_line("ConcurrentThreadStopTest.java", "CONCURRENT_THREAD_STOP");
+    session
+        .stop_at("ConcurrentThreadStopTest", line, None, Some("thread"))
+        .expect("thread breakpoint failed");
+    assert!(matches!(
+        session.run(Some(1)).expect("initial run failed").result,
+        CommandResult::Timeout {
+            state: RunState::Running,
+            ..
+        }
+    ));
+    std::fs::write(&gate, b"go").expect("failed to release worker gate");
+
+    let deadline = Instant::now() + Duration::from_secs(6);
+    let current_thread = loop {
+        match session.status() {
+            CommandResult::Status {
+                state: RunState::Suspended,
+                last_event: Some(Event::Breakpoint { thread, .. }),
+                pending_stops: 2,
+                ..
+            } => break thread,
+            status if Instant::now() < deadline => {
+                let _ = status;
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            status => panic!("expected two pending thread stops, got {status:?}"),
+        }
+    };
+    let current_value = session
+        .evaluate("worker")
+        .expect("current stop should evaluate its worker local");
+    assert!(
+        matches!(current_value.result, CommandResult::Value { ref value, .. } if value.contains(&current_thread)),
+        "status thread {current_thread:?} and evaluation must refer to the same current stop: {:?}",
+        current_value.result
+    );
+
+    let first = session.cont(Some(1)).expect("first queued stop failed");
+    let first_thread = match first.result {
+        CommandResult::Stopped {
+            event: Event::Breakpoint { thread, .. },
+            ..
+        } => thread,
+        other => panic!("expected first queued breakpoint, got {other:?}"),
+    };
+    let second = session.cont(Some(1)).expect("second queued stop failed");
+    let second_thread = match second.result {
+        CommandResult::Stopped {
+            event: Event::Breakpoint { thread, .. },
+            ..
+        } => thread,
+        other => panic!("expected second queued breakpoint, got {other:?}"),
+    };
+    assert_ne!(first_thread, second_thread, "both workers must be observed");
+    let first_threads = session
+        .threads(Some(&first_thread))
+        .expect("threads should inspect the resumed first worker");
+    assert!(
+        matches!(first_threads.result, CommandResult::Threads { ref threads }
+            if threads.len() == 1 && !threads[0].state.contains("at breakpoint")),
+        "selecting the second stop must resume the first worker: {:?}",
+        first_threads.result
+    );
+
+    let _ = session.resume(None);
+    let _ = session.kill();
+    let _ = std::fs::remove_file(&gate);
+}
+
+#[test]
 fn jdi_blocking_eval_timeout_keeps_recovery_commands_available() {
     use java_agent_debugger::jdi::session::JdiSession;
 

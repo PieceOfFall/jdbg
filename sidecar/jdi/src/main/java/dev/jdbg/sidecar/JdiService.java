@@ -831,6 +831,9 @@ final class JdiService {
                 }
                 if (matched != null) {
                     stops.remove(matched);
+                    if (currentStopSet != null && currentStopSet != matched.eventSet) {
+                        resumeStopSetLocked(currentStopSet);
+                    }
                     selectStop(matched);
                 }
             }
@@ -1292,13 +1295,7 @@ final class JdiService {
 
         private void handleStop(EventSet eventSet, String kind, ThreadReference thread, Location location, String note) {
             Map<String, Object> stop = stopPayload(kind, thread, location, note);
-            synchronized (this) {
-                currentStopSet = eventSet;
-                currentThreadId = Long.toString(thread.uniqueID());
-                currentFrameIndex = 0;
-                forceReturnPending = false;
-                stops.offer(new StopRecord(stop, eventSet));
-            }
+            queueStop(new StopRecord(stop, eventSet));
             sendEvent(kind, stop);
         }
 
@@ -1306,13 +1303,7 @@ final class JdiService {
             Map<String, Object> stop = stopPayload("fieldWatch", event.thread(), event.location(), null);
             stop.put("field", event.field().declaringType().name() + "." + event.field().name());
             stop.put("accessType", accessType);
-            synchronized (this) {
-                currentStopSet = eventSet;
-                currentThreadId = Long.toString(event.thread().uniqueID());
-                currentFrameIndex = 0;
-                forceReturnPending = false;
-                stops.offer(new StopRecord(stop, eventSet));
-            }
+            queueStop(new StopRecord(stop, eventSet));
             sendEvent("fieldWatch", stop);
         }
 
@@ -1329,13 +1320,7 @@ final class JdiService {
             Map<String, Object> stop = stopPayload("exception", event.thread(), event.location(), null);
             stop.put("exception", exceptionName);
             stop.put("caught", event.catchLocation() != null);
-            synchronized (this) {
-                currentStopSet = eventSet;
-                currentThreadId = Long.toString(event.thread().uniqueID());
-                currentFrameIndex = 0;
-                forceReturnPending = false;
-                stops.offer(new StopRecord(stop, eventSet));
-            }
+            queueStop(new StopRecord(stop, eventSet));
             sendEvent("exception", stop);
             return true;
         }
@@ -1372,13 +1357,7 @@ final class JdiService {
             Value value = event.returnValue();
             stop.put("returnValue", ValueRenderer.display(value));
             stop.put("returnType", value == null ? event.method().returnTypeName() : value.type().name());
-            synchronized (this) {
-                currentStopSet = eventSet;
-                currentThreadId = Long.toString(event.thread().uniqueID());
-                currentFrameIndex = 0;
-                forceReturnPending = false;
-                stops.offer(new StopRecord(stop, eventSet));
-            }
+            queueStop(new StopRecord(stop, eventSet));
             sendEvent("methodExit", stop);
             return true;
         }
@@ -1491,6 +1470,14 @@ final class JdiService {
                 resumeFromStopLocked();
             }
             return stop;
+        }
+
+        private synchronized void queueStop(StopRecord stop) {
+            if (currentStopSet == null) {
+                selectStop(stop);
+                forceReturnPending = false;
+            }
+            stops.offer(stop);
         }
 
         private synchronized void selectStop(StopRecord stop) {
