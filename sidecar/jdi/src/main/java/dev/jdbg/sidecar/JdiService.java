@@ -45,9 +45,14 @@ import com.sun.jdi.request.MethodExitRequest;
 import com.sun.jdi.request.ModificationWatchpointRequest;
 import com.sun.jdi.request.StepRequest;
 
+import java.io.BufferedReader;
+import java.io.ByteArrayInputStream;
 import java.io.IOException;
+import java.io.InputStreamReader;
 import java.io.File;
 import java.io.InputStream;
+import java.nio.charset.Charset;
+import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.DirectoryStream;
 import java.nio.file.Files;
@@ -332,6 +337,39 @@ final class JdiService {
         return Json.intValue(params, key, 0);
     }
 
+    static List<String> readSourceLines(Path source) throws IOException {
+        byte[] bytes = Files.readAllBytes(source);
+        IOException utf8Failure;
+        try {
+            return decodeSourceLines(bytes, StandardCharsets.UTF_8);
+        } catch (IOException e) {
+            utf8Failure = e;
+        }
+        try {
+            return decodeSourceLines(bytes, Charset.forName("GBK"));
+        } catch (IOException gbkFailure) {
+            IOException combined = new IOException("source is neither valid UTF-8 nor GBK", gbkFailure);
+            combined.addSuppressed(utf8Failure);
+            throw combined;
+        }
+    }
+
+    private static List<String> decodeSourceLines(byte[] bytes, Charset charset) throws IOException {
+        List<String> lines = new ArrayList<>();
+        try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                new ByteArrayInputStream(bytes),
+                charset.newDecoder()
+                        .onMalformedInput(CodingErrorAction.REPORT)
+                        .onUnmappableCharacter(CodingErrorAction.REPORT)
+        ))) {
+            String line;
+            while ((line = reader.readLine()) != null) {
+                lines.add(line);
+            }
+        }
+        return lines;
+    }
+
     private final class DebugSession {
         final String id;
         final VirtualMachine vm;
@@ -348,6 +386,8 @@ final class JdiService {
         volatile String currentThreadId;
         volatile int currentFrameIndex;
         volatile EventSet currentStopSet;
+        volatile String activeStepThreadId;
+        volatile StepRequest activeStepRequest;
         volatile boolean forceReturnPending;
         volatile boolean disconnected;
 
@@ -770,6 +810,11 @@ final class JdiService {
                     stop = null;
                     continue;
                 }
+                if (!acceptsStopRecord(stop)) {
+                    resumeStopSet(stop.eventSet);
+                    stop = null;
+                    continue;
+                }
                 selectStop(stop);
                 return stop.payload;
             }
@@ -890,21 +935,60 @@ final class JdiService {
         private Object step(long timeoutMs, int depth) throws Exception {
             ThreadReference thread = currentThread();
             deleteStepRequests(thread);
+            String stepThreadId = Long.toString(thread.uniqueID());
             StepRequest request = vm.eventRequestManager().createStepRequest(
                     thread,
                     StepRequest.STEP_LINE,
                     depth
             );
             request.addCountFilter(1);
-            request.setSuspendPolicy(EventRequest.SUSPEND_ALL);
+            request.setSuspendPolicy(EventRequest.SUSPEND_EVENT_THREAD);
             request.enable();
-            return continueFor(timeoutMs);
+            synchronized (this) {
+                activeStepThreadId = stepThreadId;
+                activeStepRequest = request;
+                discardQueuedStopsForOtherThreads(stepThreadId);
+            }
+            try {
+                return continueFor(timeoutMs);
+            } finally {
+                synchronized (this) {
+                    if (activeStepRequest == request) {
+                        activeStepRequest = null;
+                        activeStepThreadId = null;
+                    }
+                }
+                try {
+                    vm.eventRequestManager().deleteEventRequest(request);
+                } catch (Exception ignored) {
+                    // A completed request is removed by the event loop before its stop is delivered.
+                }
+            }
         }
 
         private void deleteStepRequests(ThreadReference thread) {
             for (StepRequest request : vm.eventRequestManager().stepRequests()) {
                 if (request.thread().equals(thread)) {
                     vm.eventRequestManager().deleteEventRequest(request);
+                }
+            }
+        }
+
+        private synchronized boolean acceptsStopFrom(ThreadReference thread) {
+            return activeStepThreadId == null || activeStepThreadId.equals(Long.toString(thread.uniqueID()));
+        }
+
+        private synchronized boolean acceptsStopRecord(StopRecord stop) {
+            return activeStepThreadId == null || activeStepThreadId.equals(stop.payload.get("threadId"));
+        }
+
+        private void discardQueuedStopsForOtherThreads(String threadId) {
+            Iterator<StopRecord> it = stops.iterator();
+            while (it.hasNext()) {
+                StopRecord stop = it.next();
+                if (!threadId.equals(stop.payload.get("threadId"))) {
+                    it.remove();
+                    resumeStopSetLocked(stop.eventSet);
                 }
             }
         }
@@ -952,9 +1036,13 @@ final class JdiService {
             Path source = findSourcePath(location);
             List<String> sourceLines;
             try {
-                sourceLines = Files.readAllLines(source, StandardCharsets.UTF_8);
+                sourceLines = readSourceLines(source);
             } catch (IOException e) {
-                throw new RpcException("source_unreadable", "failed to read source file: " + source, e);
+                throw new RpcException(
+                        "source_unreadable",
+                        "failed to read source file as UTF-8 or GBK: " + source,
+                        e
+                );
             }
             int start = Math.max(1, center - 5);
             int end = Math.min(sourceLines.size(), center + 5);
@@ -1164,24 +1252,32 @@ final class JdiService {
                                 shouldResume = false;
                             }
                         } else if (event instanceof ModificationWatchpointEvent) {
-                            shouldResume = false;
-                            handleWatchStop(eventSet, (WatchpointEvent) event, "modified");
+                            WatchpointEvent watch = (WatchpointEvent) event;
+                            if (acceptsStopFrom(watch.thread())) {
+                                shouldResume = false;
+                                handleWatchStop(eventSet, watch, "modified");
+                            }
                         } else if (event instanceof AccessWatchpointEvent) {
-                            shouldResume = false;
-                            handleWatchStop(eventSet, (WatchpointEvent) event, "accessed");
+                            WatchpointEvent watch = (WatchpointEvent) event;
+                            if (acceptsStopFrom(watch.thread())) {
+                                shouldResume = false;
+                                handleWatchStop(eventSet, watch, "accessed");
+                            }
                         } else if (event instanceof BreakpointEvent) {
                             BreakpointEvent bp = (BreakpointEvent) event;
                             String[] note = new String[1];
-                            if (conditionHolds(bp.request(), bp.thread(), note)) {
+                            if (acceptsStopFrom(bp.thread()) && conditionHolds(bp.request(), bp.thread(), note)) {
                                 shouldResume = false;
                                 handleStop(eventSet, "breakpoint", bp.thread(), bp.location(), note[0]);
                             }
                             // Condition false → leave shouldResume true so the set resumes silently.
                         } else if (event instanceof StepEvent) {
-                            shouldResume = false;
                             StepEvent step = (StepEvent) event;
                             vm.eventRequestManager().deleteEventRequest(step.request());
-                            handleStop(eventSet, "step", step.thread(), step.location(), null);
+                            if (acceptsStopFrom(step.thread())) {
+                                shouldResume = false;
+                                handleStop(eventSet, "step", step.thread(), step.location(), null);
+                            }
                         } else if (event instanceof VMDisconnectEvent || event instanceof VMDeathEvent) {
                             disconnected = true;
                             shouldResume = false;
@@ -1224,6 +1320,9 @@ final class JdiService {
         }
 
         private boolean handleExceptionStop(EventSet eventSet, ExceptionEvent event) {
+            if (!acceptsStopFrom(event.thread())) {
+                return false;
+            }
             String exceptionName = event.exception().referenceType().name();
             for (ActiveExceptionRequest active : activeExceptionRequests) {
                 if (active.request == event.request() && !active.matchesException(exceptionName)) {
@@ -1245,6 +1344,9 @@ final class JdiService {
         }
 
         private boolean handleMethodEntryStop(EventSet eventSet, MethodEntryEvent event) {
+            if (!acceptsStopFrom(event.thread())) {
+                return false;
+            }
             MethodSpec spec = methodSpec(event.request());
             if (spec == null || !spec.matches(event.method())) {
                 return false;
@@ -1258,6 +1360,9 @@ final class JdiService {
         }
 
         private boolean handleMethodExitStop(EventSet eventSet, MethodExitEvent event) {
+            if (!acceptsStopFrom(event.thread())) {
+                return false;
+            }
             MethodSpec spec = methodSpec(event.request());
             if (spec == null || !spec.matches(event.method())) {
                 return false;

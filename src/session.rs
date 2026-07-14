@@ -305,6 +305,7 @@ impl Session {
             backend: self.meta.backend,
             state: inner.state,
             last_event: inner.last_event.clone(),
+            pending_stops: 0,
             jdb_alive,
         }
     }

@@ -19,6 +19,7 @@ use crate::jdi::protocol::{SidecarErrorPayload, SidecarMessage};
 
 type PendingMap = Arc<Mutex<HashMap<String, Sender<SidecarResponse>>>>;
 type EventQueueRef = Arc<EventQueue>;
+type EventSink = Arc<dyn Fn(SidecarEvent) + Send + Sync>;
 
 struct EventQueue {
     events: Mutex<VecDeque<SidecarEvent>>,
@@ -141,6 +142,7 @@ pub struct SidecarTransport {
     writer: Mutex<SidecarStream>,
     pending: PendingMap,
     events: EventQueueRef,
+    event_sink: Arc<Mutex<Option<EventSink>>>,
     ids: AtomicU64,
     _reader: JoinHandle<()>,
 }
@@ -153,11 +155,18 @@ impl SidecarTransport {
             events: Mutex::new(VecDeque::new()),
             ready: Condvar::new(),
         });
-        let reader = spawn_reader(reader_stream, Arc::clone(&pending), Arc::clone(&events));
+        let event_sink = Arc::new(Mutex::new(None));
+        let reader = spawn_reader(
+            reader_stream,
+            Arc::clone(&pending),
+            Arc::clone(&events),
+            Arc::clone(&event_sink),
+        );
         Ok(Self {
             writer: Mutex::new(stream),
             pending,
             events,
+            event_sink,
             ids: AtomicU64::new(1),
             _reader: reader,
         })
@@ -217,6 +226,12 @@ impl SidecarTransport {
         events.drain(..).collect()
     }
 
+    /// Register a lightweight callback invoked by the reader thread immediately after an
+    /// asynchronous sidecar event is queued. The queue remains available to command flows.
+    pub fn set_event_sink(&self, sink: impl Fn(SidecarEvent) + Send + Sync + 'static) {
+        *self.event_sink.lock().expect("event sink mutex poisoned") = Some(Arc::new(sink));
+    }
+
     fn next_id(&self) -> String {
         format!("r{}", self.ids.fetch_add(1, Ordering::Relaxed))
     }
@@ -240,10 +255,11 @@ fn spawn_reader(
     mut stream: SidecarStream,
     pending: PendingMap,
     events: EventQueueRef,
+    event_sink: Arc<Mutex<Option<EventSink>>>,
 ) -> JoinHandle<()> {
     std::thread::spawn(move || {
         while let Ok(msg) = read_framed_message(&mut stream) {
-            dispatch_incoming(msg, &pending, &events);
+            dispatch_incoming(msg, &pending, &events, &event_sink);
         }
         // The sidecar closed the connection (EOF) or the frame stream errored.
         // Drop every in-flight response sender so waiting callers observe
@@ -282,7 +298,12 @@ pub(crate) fn write_framed_message(
     Ok(())
 }
 
-fn dispatch_incoming(msg: SidecarMessage, pending: &PendingMap, events: &EventQueueRef) {
+fn dispatch_incoming(
+    msg: SidecarMessage,
+    pending: &PendingMap,
+    events: &EventQueueRef,
+    event_sink: &Arc<Mutex<Option<EventSink>>>,
+) {
     match msg {
         SidecarMessage::Response { id, result, error } => {
             if let Some(tx) = pending.lock().expect("pending mutex poisoned").remove(&id) {
@@ -295,17 +316,25 @@ fn dispatch_incoming(msg: SidecarMessage, pending: &PendingMap, events: &EventQu
             event,
             payload,
         } => {
+            let event = SidecarEvent {
+                session,
+                seq,
+                event,
+                payload,
+            };
             events
                 .events
                 .lock()
                 .expect("events mutex poisoned")
-                .push_back(SidecarEvent {
-                    session,
-                    seq,
-                    event,
-                    payload,
-                });
+                .push_back(event.clone());
             events.ready.notify_all();
+            let sink = event_sink
+                .lock()
+                .expect("event sink mutex poisoned")
+                .clone();
+            if let Some(sink) = sink {
+                sink(event);
+            }
         }
         SidecarMessage::Heartbeat { .. } | SidecarMessage::Request { .. } => {}
     }
@@ -477,6 +506,30 @@ mod tests {
 
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].event, "breakpoint");
+        server_thread.join().unwrap();
+    }
+
+    #[test]
+    fn event_sink_runs_immediately_without_consuming_event_queue() {
+        let (client_stream, server_thread) = connected_fake_server(|mut stream| {
+            write_test_message(
+                &mut stream,
+                &SidecarMessage::Event {
+                    session: "s1".into(),
+                    seq: 4,
+                    event: "breakpoint".into(),
+                    payload: json!({"event": "breakpoint"}),
+                },
+            );
+        });
+        let client = SidecarTransport::start(SidecarStream::tcp_for_tests(client_stream)).unwrap();
+        let (tx, rx) = mpsc::channel();
+        client.set_event_sink(move |event| tx.send(event).unwrap());
+
+        let observed = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+
+        assert_eq!(observed.event, "breakpoint");
+        assert_eq!(client.drain_events(), vec![observed]);
         server_thread.join().unwrap();
     }
 

@@ -52,6 +52,7 @@ fn render_result(result: &CommandResult) -> String {
             backend,
             state,
             last_event,
+            pending_stops,
             jdb_alive,
         } => {
             let evt = last_event
@@ -59,7 +60,7 @@ fn render_result(result: &CommandResult) -> String {
                 .map(|e| format!("{e:?}"))
                 .unwrap_or_else(|| "none".into());
             format!(
-                "Session {session}: backend={backend:?} state={state:?} jdb_alive={jdb_alive} last_event={evt}"
+                "Session {session}: backend={backend:?} state={state:?} pending_stops={pending_stops} jdb_alive={jdb_alive} last_event={evt}"
             )
         }
         CommandResult::BreakpointSet {

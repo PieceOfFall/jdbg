@@ -2097,8 +2097,15 @@ fn jdi_async_thread_method_breakpoint_is_visible_before_cont() {
             CommandResult::Status {
                 state: RunState::Suspended,
                 last_event: Some(Event::MethodEntry { thread, .. }),
+                pending_stops,
                 ..
-            } if thread == "external-trigger-worker" => break,
+            } if thread == "external-trigger-worker" => {
+                assert_eq!(
+                    pending_stops, 1,
+                    "an asynchronously observed stop must be visible to status before cont consumes it"
+                );
+                break;
+            }
             status if Instant::now() < deadline => {
                 let _ = status;
                 std::thread::sleep(Duration::from_millis(50));
@@ -2610,6 +2617,82 @@ fn jdi_method_both_stops_on_entry_then_exit() {
         ),
         "expected method exit second, got {:?}",
         exit.result
+    );
+
+    let _ = session.kill();
+}
+
+#[test]
+fn jdi_next_stays_on_current_thread_while_other_method_entries_fire() {
+    use java_agent_debugger::jdi::session::JdiSession;
+
+    let _guard = jdi_e2e_guard();
+    compile_java_fixture("StepIsolationTest.java");
+    let target = start_jdwp_fixture("StepIsolationTest");
+    let sourcepath = vec![fixture_dir().display().to_string()];
+    let session = JdiSession::attach(
+        "127.0.0.1",
+        target.port,
+        &sourcepath,
+        "jdi-step-thread-isolation".into(),
+        None,
+    )
+    .expect("JDI attach failed");
+    let target_line = fixture_line("StepIsolationTest.java", "STEP_ISOLATION_TARGET_BREAK");
+
+    session
+        .stop_at("StepIsolationTest", target_line, None, Some("thread"))
+        .expect("target thread breakpoint failed");
+    session
+        .break_in(
+            "StepIsolationTest",
+            "noise",
+            None,
+            MethodEventKind::Entry,
+            None,
+            Some("thread"),
+        )
+        .expect("noise method-entry breakpoint failed");
+
+    let first = session
+        .cont(Some(30))
+        .expect("target breakpoint cont failed");
+    assert!(
+        matches!(
+            first.result,
+            CommandResult::Stopped {
+                event: Event::Breakpoint { ref thread, .. },
+                ..
+            } if thread == "step-target"
+        ),
+        "expected the target thread breakpoint, got {:?}",
+        first.result
+    );
+
+    let first_step = session.next(Some(30)).expect("first next failed");
+    assert!(
+        matches!(
+            first_step.result,
+            CommandResult::Stopped {
+                event: Event::Step { ref thread, .. },
+                ..
+            } if thread == "step-target"
+        ),
+        "first next must stay on the target thread, got {:?}",
+        first_step.result
+    );
+
+    let second_step = session.next(Some(30)).expect("second next failed");
+    assert!(
+        matches!(
+            second_step.result,
+            CommandResult::Stopped {
+                event: Event::Step { ref thread, .. },
+                ..
+            } if thread == "step-target"
+        ),
+        "noise method entries must not steal next, got {:?}",
+        second_step.result
     );
 
     let _ = session.kill();

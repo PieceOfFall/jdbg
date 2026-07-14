@@ -5,6 +5,8 @@ import com.sun.jdi.Type;
 
 import java.io.IOException;
 import java.lang.reflect.Proxy;
+import java.nio.charset.Charset;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
@@ -30,6 +32,7 @@ public final class SidecarSelfTest {
         testSourceCandidatesSearchMavenRoots();
         testSourceCandidatesSearchOneLevelModuleRoots();
         testSourceRootsFromMavenClasspath();
+        testSourceLinesPreferUtf8AndFallBackToGbk();
         System.out.println("SidecarSelfTest passed");
     }
 
@@ -272,6 +275,17 @@ public final class SidecarSelfTest {
                 candidates.contains(expected),
                 "source candidates should include source path inferred from Maven classpath"
         );
+    }
+
+    private static void testSourceLinesPreferUtf8AndFallBackToGbk() throws IOException {
+        Path root = Files.createTempDirectory("jdbg-source-encoding");
+        Path utf8 = root.resolve("Utf8.java");
+        Path gbk = root.resolve("Gbk.java");
+        Files.write(utf8, "class Utf8 { String text = \"café\"; }\n".getBytes(StandardCharsets.UTF_8));
+        Files.write(gbk, "class Gbk { String text = \"中文\"; }\n".getBytes(Charset.forName("GBK")));
+
+        assertEquals("class Utf8 { String text = \"café\"; }", JdiService.readSourceLines(utf8).get(0), "UTF-8 source");
+        assertEquals("class Gbk { String text = \"中文\"; }", JdiService.readSourceLines(gbk).get(0), "GBK fallback source");
     }
 
     private static StringReference stringReference(final String value) {

@@ -4,7 +4,7 @@ description: "Use the jdbg CLI to debug Java programs interactively from Pi when
 compatibility: "Requires a JDK 8+ with jdb available through JAVA_HOME, PATH, or --jdb-path. Requires the jdbg CLI on PATH. Native on Windows, Linux, and macOS."
 allowed-tools: "Bash(jdbg:*), Bash(javac:*), Bash(java:*), Read"
 metadata:
-  version: "1.18"
+  version: "1.19"
 ---
 
 # jdbg CLI - interactive Java debugging for Pi
@@ -186,6 +186,10 @@ jdbg kill
 jdbg daemon stop
 ```
 
+For JDI, `status` changes to `suspended` as soon as the sidecar receives a stop. In JSON,
+`pending_stops > 0` means a stop is waiting for an execution-control command to consume it, rather than an
+idle running VM. JDI source snippets read UTF-8 first and fall back to GBK for legacy Chinese Java files.
+
 ## Breakpoints And Watchpoints
 
 Line breakpoint:
@@ -322,6 +326,9 @@ jdbg cont
 - `next` stays in the current frame.
 - `step-out` runs until the current method returns.
 - `cont` resumes until the next breakpoint, exception, step completion, VM exit, or timeout.
+
+On JDI, `step`, `next`, and `step-out` remain on the stopped thread; unrelated thread events are resumed while
+the step is active and cannot replace its result.
 
 If output says `TIMEOUT`, the debuggee is still alive. Inspect with `status`, `threads`, or stop it with `kill`.
 

@@ -2,7 +2,7 @@
 
 use std::collections::VecDeque;
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -38,7 +38,7 @@ pub struct JdiSession {
     pub meta: JdiSessionMeta,
     sidecar: LaunchedSidecar,
     command_lock: Mutex<()>,
-    inner: Mutex<JdiSessionInner>,
+    inner: Arc<Mutex<JdiSessionInner>>,
 }
 
 #[derive(Debug)]
@@ -90,6 +90,14 @@ impl JdiSession {
         });
         request(&sidecar, "attach", params, SIDECAR_REQUEST_TIMEOUT)?;
         let sidecar_pid = sidecar.pid();
+        let inner = Arc::new(Mutex::new(JdiSessionInner {
+            state: RunState::Running,
+            last_event: None,
+            delivered_stop: None,
+            delivered_stop_ids: VecDeque::new(),
+            pending_stops: VecDeque::new(),
+        }));
+        register_event_sink(&sidecar, Arc::clone(&inner), id.clone());
 
         Ok(Self {
             meta: JdiSessionMeta {
@@ -103,13 +111,7 @@ impl JdiSession {
             },
             sidecar,
             command_lock: Mutex::new(()),
-            inner: Mutex::new(JdiSessionInner {
-                state: RunState::Running,
-                last_event: None,
-                delivered_stop: None,
-                delivered_stop_ids: VecDeque::new(),
-                pending_stops: VecDeque::new(),
-            }),
+            inner,
         })
     }
 
@@ -147,6 +149,14 @@ impl JdiSession {
         });
         request(&sidecar, "launch", params, SIDECAR_REQUEST_TIMEOUT)?;
         let sidecar_pid = sidecar.pid();
+        let inner = Arc::new(Mutex::new(JdiSessionInner {
+            state: RunState::Loaded,
+            last_event: None,
+            delivered_stop: None,
+            delivered_stop_ids: VecDeque::new(),
+            pending_stops: VecDeque::new(),
+        }));
+        register_event_sink(&sidecar, Arc::clone(&inner), id.clone());
 
         Ok(Self {
             meta: JdiSessionMeta {
@@ -160,13 +170,7 @@ impl JdiSession {
             },
             sidecar,
             command_lock: Mutex::new(()),
-            inner: Mutex::new(JdiSessionInner {
-                state: RunState::Loaded,
-                last_event: None,
-                delivered_stop: None,
-                delivered_stop_ids: VecDeque::new(),
-                pending_stops: VecDeque::new(),
-            }),
+            inner,
         })
     }
 
@@ -183,6 +187,7 @@ impl JdiSession {
             backend: self.meta.backend,
             state: inner.state,
             last_event: inner.last_event.clone(),
+            pending_stops: inner.pending_stops.len(),
             jdb_alive: self.sidecar.is_alive(),
         }
     }
@@ -1441,6 +1446,17 @@ fn event_from_stop_payload(payload: &StopPayload) -> Result<(Event, RunState)> {
     }
 }
 
+fn register_event_sink(
+    sidecar: &LaunchedSidecar,
+    inner: Arc<Mutex<JdiSessionInner>>,
+    session_id: String,
+) {
+    sidecar.transport().set_event_sink(move |event| {
+        let mut inner = inner.lock().expect("jdi session mutex poisoned");
+        apply_sidecar_event(&mut inner, event, &session_id);
+    });
+}
+
 fn apply_sidecar_event(inner: &mut JdiSessionInner, event: SidecarEvent, session_id: &str) {
     if event.session != session_id {
         return;
@@ -1461,6 +1477,14 @@ fn apply_sidecar_event(inner: &mut JdiSessionInner, event: SidecarEvent, session
     let Ok((next_event, state)) = event_from_stop_payload(&payload) else {
         return;
     };
+    if !is_delivered_stop(inner, &payload, &next_event)
+        && !inner
+            .pending_stops
+            .iter()
+            .any(|pending| is_same_stop_payload(pending, &payload, &next_event))
+    {
+        inner.pending_stops.push_back(payload);
+    }
     inner.state = state;
     inner.last_event = Some(next_event);
 }
@@ -1472,20 +1496,6 @@ fn apply_sidecar_events(
     sidecar_alive: bool,
 ) {
     for event in events {
-        if event.session == session_id && is_stop_event(&event.event) {
-            if let Ok(payload) = serde_json::from_value::<StopPayload>(event.payload.clone()) {
-                if let Ok((next_event, _)) = event_from_stop_payload(&payload) {
-                    if !is_delivered_stop(inner, &payload, &next_event)
-                        && !inner
-                            .pending_stops
-                            .iter()
-                            .any(|pending| is_same_stop_payload(pending, &payload, &next_event))
-                    {
-                        inner.pending_stops.push_back(payload);
-                    }
-                }
-            }
-        }
         apply_sidecar_event(inner, event, session_id);
     }
     if !sidecar_alive && !matches!(inner.state, RunState::Dead | RunState::Exited) {
@@ -1915,6 +1925,11 @@ mod tests {
         );
 
         assert_eq!(inner.state, RunState::Suspended);
+        assert_eq!(
+            inner.pending_stops.len(),
+            1,
+            "an async stop must become pending as soon as the transport reader delivers it"
+        );
         match inner.last_event {
             Some(Event::Breakpoint { location, thread }) => {
                 assert_eq!(location.class, "HomeController");

@@ -137,6 +137,9 @@ pub enum CommandResult {
         backend: BackendKind,
         state: RunState,
         last_event: Option<Event>,
+        /// Stops received asynchronously but not yet returned by a blocking command.
+        #[serde(default)]
+        pending_stops: usize,
         jdb_alive: bool,
     },
 
